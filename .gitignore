@@ -1,0 +1,15 @@
+# Third-party media assets and installers — NOT for public distribution
+K1077-电视TV/
+
+# Local data — contains user credentials and personal data
+data/
+*.db
+*.db-journal
+
+# Local runtime directories
+config/
+media/
+telegram/
+
+# OS / editor noise
+.DS_Store
