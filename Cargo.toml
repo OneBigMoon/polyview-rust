@@ -1,0 +1,27 @@
+[package]
+name = "polyview"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "A self-hosted NAS media library and live TV hub"
+
+[dependencies]
+argon2 = "0.5.3"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+axum = "0.8.9"
+futures-util = "0.3.32"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+rusqlite = { version = "0.34.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["full"] }
+tower-http = { version = "0.6.8", features = ["fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+uuid = { version = "1.22.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

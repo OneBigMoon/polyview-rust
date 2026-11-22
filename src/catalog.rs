@@ -1,0 +1,954 @@
+use crate::{
+    AppError, Shared,
+    auth::{AuthUser, require_admin},
+};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::{delete, get},
+};
+use futures_util::{StreamExt, stream};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::time::Duration;
+use url::Url;
+
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS catalog_sources (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL UNIQUE,
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1))
+        );",
+    )?;
+    Ok(())
+}
+
+pub fn router() -> Router<Shared> {
+    Router::new()
+        .route("/api/sources", get(list_sources).post(create_source))
+        .route(
+            "/api/sources/{id}",
+            delete(delete_source).put(update_source),
+        )
+        .route("/api/catalog/search", get(search_handler))
+        .route("/api/catalog/discover", get(discover_handler))
+        .route("/api/catalog/{source_id}/detail", get(detail_handler))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Source {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    pub enabled: bool,
+}
+
+fn source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
+    Ok(Source {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        url: row.get(2)?,
+        enabled: row.get(3)?,
+    })
+}
+
+pub fn sources(state: &Shared) -> Result<Vec<Source>, AppError> {
+    let conn = state.conn()?;
+    let mut stmt = conn.prepare("SELECT id,name,url,enabled FROM catalog_sources ORDER BY id")?;
+    Ok(stmt.query_map([], source_row)?.collect::<Result<_, _>>()?)
+}
+
+async fn list_sources(
+    State(state): State<Shared>,
+    _user: AuthUser,
+) -> Result<Json<Vec<Source>>, AppError> {
+    sources(&state).map(Json)
+}
+
+#[derive(Deserialize)]
+struct SourceInput {
+    name: String,
+    url: String,
+    #[serde(default = "enabled_by_default")]
+    enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+fn http_url(raw: &str) -> Result<Url, AppError> {
+    if raw.len() > 4096 || raw.chars().any(char::is_control) {
+        return Err(AppError::bad_request(
+            "URL is too long or contains control characters",
+        ));
+    }
+    let url =
+        Url::parse(raw).map_err(|_| AppError::bad_request("Enter a valid HTTP or HTTPS URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(AppError::bad_request(
+            "Only HTTP and HTTPS URLs without embedded credentials are supported",
+        ));
+    }
+    Ok(url)
+}
+
+fn validate_source(input: &SourceInput) -> Result<(String, String), AppError> {
+    let name = input.name.trim();
+    if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
+        return Err(AppError::bad_request(
+            "Source name must contain 1–100 characters",
+        ));
+    }
+    let mut url = http_url(input.url.trim())?;
+    url.set_fragment(None);
+    Ok((name.to_owned(), url.to_string()))
+}
+
+fn source_write_error(error: rusqlite::Error) -> AppError {
+    match error {
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            AppError(
+                StatusCode::CONFLICT,
+                "This source URL is already configured".into(),
+            )
+        }
+        error => error.into(),
+    }
+}
+
+async fn create_source(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Json(input): Json<SourceInput>,
+) -> Result<(StatusCode, Json<Source>), AppError> {
+    require_admin(&user)?;
+    let (name, url) = validate_source(&input)?;
+    let conn = state.conn()?;
+    conn.execute(
+        "INSERT INTO catalog_sources(name,url,enabled) VALUES(?,?,?)",
+        params![name, url, input.enabled],
+    )
+    .map_err(source_write_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Source {
+            id: conn.last_insert_rowid(),
+            name,
+            url,
+            enabled: input.enabled,
+        }),
+    ))
+}
+
+async fn update_source(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(input): Json<SourceInput>,
+) -> Result<Json<Source>, AppError> {
+    require_admin(&user)?;
+    let (name, url) = validate_source(&input)?;
+    if state
+        .conn()?
+        .execute(
+            "UPDATE catalog_sources SET name=?,url=?,enabled=? WHERE id=?",
+            params![name, url, input.enabled, id],
+        )
+        .map_err(source_write_error)?
+        == 0
+    {
+        return Err(AppError::not_found("Source not found"));
+    }
+    Ok(Json(Source {
+        id,
+        name,
+        url,
+        enabled: input.enabled,
+    }))
+}
+
+async fn delete_source(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    require_admin(&user)?;
+    if state
+        .conn()?
+        .execute("DELETE FROM catalog_sources WHERE id=?", [id])
+        .map_err(|error| match error {
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                AppError(
+                    StatusCode::CONFLICT,
+                    "Cancel subscriptions using this source before removing it".into(),
+                )
+            }
+            error => error.into(),
+        })?
+        == 0
+    {
+        return Err(AppError::not_found("Source not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CatalogSummary {
+    pub id: String,
+    pub source_id: i64,
+    pub source_name: String,
+    pub title: String,
+    pub cover: String,
+    pub year: String,
+    pub remark: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SourceError {
+    pub source_id: i64,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub results: Vec<CatalogSummary>,
+    pub errors: Vec<SourceError>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiscoverResponse {
+    pub results: Vec<CatalogSummary>,
+    pub errors: Vec<SourceError>,
+    pub source_id: Option<i64>,
+    pub page: u32,
+    pub page_count: u64,
+    pub total: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Episode {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlayGroup {
+    pub name: String,
+    pub episodes: Vec<Episode>,
+    /// Every episode URL ends in a browser/TV-playable media extension rather
+    /// than a CMS share/parser page.
+    pub direct: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CatalogDetail {
+    pub id: String,
+    pub source_id: i64,
+    pub source_name: String,
+    pub title: String,
+    pub cover: String,
+    pub description: String,
+    pub year: String,
+    pub remark: String,
+    pub groups: Vec<PlayGroup>,
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+#[derive(Deserialize)]
+struct DetailQuery {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct DiscoverQuery {
+    source_id: Option<i64>,
+    #[serde(default = "first_page")]
+    page: u32,
+}
+
+fn first_page() -> u32 {
+    1
+}
+
+fn validate_text<'a>(raw: &'a str, label: &str, max: usize) -> Result<&'a str, AppError> {
+    let text = raw.trim();
+    if text.is_empty() || text.chars().count() > max || text.chars().any(char::is_control) {
+        return Err(AppError::bad_request(format!(
+            "{label} must contain 1–{max} characters"
+        )));
+    }
+    Ok(text)
+}
+
+async fn search_handler(
+    State(state): State<Shared>,
+    _user: AuthUser,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<SearchResponse>, AppError> {
+    search(&state, &query.q).await.map(Json)
+}
+
+pub async fn search(state: &Shared, query: &str) -> Result<SearchResponse, AppError> {
+    let query = validate_text(query, "Search query", 100)?;
+    let active = sources(state)?.into_iter().filter(|source| source.enabled);
+    let mut responses = stream::iter(active.map(|source| async move {
+        let result = fetch_items(state, &source, &[("ac", "detail"), ("wd", query)]).await;
+        (source, result)
+    }))
+    .buffer_unordered(6);
+    let mut response = SearchResponse {
+        results: Vec::new(),
+        errors: Vec::new(),
+    };
+    while let Some((source, result)) = responses.next().await {
+        match result {
+            Ok(page) => response.results.extend(
+                page.items
+                    .iter()
+                    .filter_map(|item| summary(&source, item))
+                    .take(1000),
+            ),
+            Err(message) => response.errors.push(SourceError {
+                source_id: source.id,
+                message,
+            }),
+        }
+    }
+    response
+        .results
+        .sort_by(|a, b| (a.source_id, &a.title, &a.id).cmp(&(b.source_id, &b.title, &b.id)));
+    response.errors.sort_by_key(|error| error.source_id);
+    Ok(response)
+}
+
+async fn discover_handler(
+    State(state): State<Shared>,
+    _user: AuthUser,
+    Query(query): Query<DiscoverQuery>,
+) -> Result<Json<DiscoverResponse>, AppError> {
+    discover(&state, query.source_id, query.page)
+        .await
+        .map(Json)
+}
+
+pub async fn discover(
+    state: &Shared,
+    source_id: Option<i64>,
+    page: u32,
+) -> Result<DiscoverResponse, AppError> {
+    if !(1..=10_000).contains(&page) {
+        return Err(AppError::bad_request("Page must be between 1 and 10000"));
+    }
+    let source = sources(state)?
+        .into_iter()
+        .find(|source| source.enabled && source_id.is_none_or(|id| source.id == id));
+    let mut result = DiscoverResponse {
+        results: Vec::new(),
+        errors: Vec::new(),
+        source_id: source.as_ref().map(|source| source.id),
+        page,
+        page_count: 0,
+        total: 0,
+    };
+    let Some(source) = source else {
+        if source_id.is_some() {
+            return Err(AppError::not_found("Source not found or disabled"));
+        }
+        return Ok(result);
+    };
+    match fetch_items(
+        state,
+        &source,
+        &[("ac", "detail"), ("pg", &page.to_string())],
+    )
+    .await
+    {
+        Ok(listing) => {
+            result.results = listing
+                .items
+                .iter()
+                .filter_map(|item| summary(&source, item))
+                .take(1000)
+                .collect();
+            result.page_count = listing.page_count;
+            result.total = listing.total;
+        }
+        Err(message) => result.errors.push(SourceError {
+            source_id: source.id,
+            message,
+        }),
+    }
+    Ok(result)
+}
+
+async fn detail_handler(
+    State(state): State<Shared>,
+    _user: AuthUser,
+    Path(source_id): Path<i64>,
+    Query(query): Query<DetailQuery>,
+) -> Result<Json<CatalogDetail>, AppError> {
+    detail(&state, source_id, &query.id).await.map(Json)
+}
+
+pub async fn detail(state: &Shared, source_id: i64, id: &str) -> Result<CatalogDetail, AppError> {
+    let id = validate_text(id, "Media ID", 256)?;
+    let source = state
+        .conn()?
+        .query_row(
+            "SELECT id,name,url,enabled FROM catalog_sources WHERE id=? AND enabled=1",
+            [source_id],
+            source_row,
+        )
+        .optional()?
+        .ok_or_else(|| AppError::not_found("Source not found or disabled"))?;
+    let page = fetch_items(state, &source, &[("ac", "detail"), ("ids", id)])
+        .await
+        .map_err(|message| AppError(StatusCode::BAD_GATEWAY, message))?;
+    let item = page
+        .items
+        .iter()
+        .find(|item| text(item, "vod_id") == id)
+        .ok_or_else(|| AppError::not_found("Media not found at this source"))?;
+    let summary = summary(&source, item).ok_or_else(|| {
+        AppError(
+            StatusCode::BAD_GATEWAY,
+            "Source returned incomplete media metadata".into(),
+        )
+    })?;
+    Ok(CatalogDetail {
+        id: summary.id,
+        source_id,
+        source_name: source.name,
+        title: summary.title,
+        cover: summary.cover,
+        description: text(item, "vod_content"),
+        year: summary.year,
+        remark: summary.remark,
+        groups: play_groups(&text(item, "vod_play_from"), &text(item, "vod_play_url")),
+    })
+}
+
+fn text(item: &Value, field: &str) -> String {
+    match item.get(field) {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn summary(source: &Source, item: &Value) -> Option<CatalogSummary> {
+    let id = text(item, "vod_id");
+    let title = text(item, "vod_name");
+    if id.is_empty() || title.trim().is_empty() {
+        return None;
+    }
+    let cover = text(item, "vod_pic");
+    let cover = Url::parse(&source.url)
+        .ok()
+        .and_then(|base| base.join(cover.trim()).ok())
+        .filter(|url| !cover.trim().is_empty() && http_url(url.as_str()).is_ok())
+        .map(|url| url.to_string())
+        .unwrap_or_default();
+    Some(CatalogSummary {
+        id,
+        source_id: source.id,
+        source_name: source.name.clone(),
+        title,
+        cover,
+        year: text(item, "vod_year"),
+        remark: text(item, "vod_remarks"),
+    })
+}
+
+fn play_groups(names: &str, playlists: &str) -> Vec<PlayGroup> {
+    let names: Vec<_> = names.split("$$$").collect();
+    playlists
+        .split("$$$")
+        .enumerate()
+        .filter_map(|(index, playlist)| {
+            let episodes = playlist
+                .split('#')
+                .filter_map(|episode| {
+                    let episode = episode.trim();
+                    let (name, raw_url) = episode.split_once('$').unwrap_or(("", episode));
+                    let url = http_url(raw_url.trim()).ok()?;
+                    Some(Episode {
+                        name: if name.trim().is_empty() {
+                            "播放".to_string()
+                        } else {
+                            name.trim().to_string()
+                        },
+                        url: url.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if episodes.is_empty() {
+                return None;
+            }
+            let name = names.get(index).map(|value| value.trim()).unwrap_or("");
+            Some(PlayGroup {
+                name: if name.is_empty() {
+                    format!("线路 {}", index + 1)
+                } else {
+                    name.to_string()
+                },
+                direct: episodes
+                    .iter()
+                    .all(|episode| is_direct_media_url(&episode.url)),
+                episodes,
+            })
+        })
+        .collect()
+}
+
+/// Known media containers that browsers, TV clients, or the download worker
+/// can fetch directly. CMS "share" or parser pages have no such suffix and
+/// need a spider/parser PolyView does not run.
+pub fn is_direct_media_url(url: &str) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        "m3u8", "mp4", "m4v", "webm", "mkv", "mov", "ts", "flv", "avi", "wmv",
+    ];
+    Url::parse(url).ok().is_some_and(|url| {
+        url.path()
+            .rsplit_once('.')
+            .map(|(_, extension)| {
+                EXTENSIONS
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[derive(Debug)]
+struct CmsPage {
+    items: Vec<Value>,
+    page_count: u64,
+    total: u64,
+}
+
+fn unsigned(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+async fn fetch_items(
+    state: &Shared,
+    source: &Source,
+    query: &[(&str, &str)],
+) -> Result<CmsPage, String> {
+    let value = fetch_cms_value(state, source, query).await?;
+    let items = value
+        .get("list")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "Source JSON does not contain a CMS list".to_owned())?;
+    Ok(CmsPage {
+        page_count: unsigned(value.get("pagecount")).unwrap_or(u64::from(!items.is_empty())),
+        total: unsigned(value.get("total")).unwrap_or(items.len() as u64),
+        items,
+    })
+}
+
+pub async fn cms_query(
+    state: &Shared,
+    source_id: i64,
+    parameters: &[(&str, &str)],
+) -> Result<Value, AppError> {
+    for (key, value) in parameters {
+        if !["ac", "t", "wd", "ids", "pg"].contains(key) {
+            return Err(AppError::bad_request("Unsupported CMS query parameter"));
+        }
+        validate_text(value, "CMS query value", 256)?;
+        if *key == "ac" && !["list", "detail"].contains(value) {
+            return Err(AppError::bad_request("Unsupported CMS action"));
+        }
+        if *key == "pg"
+            && !value
+                .parse::<u32>()
+                .is_ok_and(|page| (1..=10_000).contains(&page))
+        {
+            return Err(AppError::bad_request("Page must be between 1 and 10000"));
+        }
+    }
+    let source = state
+        .conn()?
+        .query_row(
+            "SELECT id,name,url,enabled FROM catalog_sources WHERE id=? AND enabled=1",
+            [source_id],
+            source_row,
+        )
+        .optional()?
+        .ok_or_else(|| AppError::not_found("Source not found or disabled"))?;
+    fetch_cms_value(state, &source, parameters)
+        .await
+        .map_err(|message| AppError(StatusCode::BAD_GATEWAY, message))
+}
+
+async fn fetch_cms_value(
+    state: &Shared,
+    source: &Source,
+    query: &[(&str, &str)],
+) -> Result<Value, String> {
+    let mut url = http_url(&source.url).map_err(|_| "Source URL is invalid".to_owned())?;
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| !["ac", "wd", "ids", "pg", "t"].contains(&key.as_ref()))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    pairs.extend(
+        query
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+    );
+    url.query_pairs_mut().clear().extend_pairs(pairs);
+    let fetch = async {
+        let response = state
+            .client
+            .get(url)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| "Source request failed".to_owned())?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Source returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err("Source response exceeds 8 MiB".to_owned());
+        }
+        let mut bytes = Vec::new();
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|_| "Could not read source response".to_owned())?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err("Source response exceeds 8 MiB".to_owned());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "Source did not return valid CMS JSON".to_owned())?;
+        if value.get("code").is_some_and(|code| {
+            code.as_i64().is_some_and(|code| code != 1)
+                || code.as_str().is_some_and(|code| code != "1")
+        }) {
+            return Err("Source reported an unsuccessful CMS response".to_owned());
+        }
+        if !value.get("list").is_some_and(Value::is_array)
+            && !value.get("class").is_some_and(Value::is_array)
+        {
+            return Err("Source JSON does not contain CMS lists or categories".to_owned());
+        }
+        Ok(value)
+    };
+    tokio::time::timeout(REQUEST_TIMEOUT, fetch)
+        .await
+        .map_err(|_| "Source timed out after 15 seconds".to_owned())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AppState;
+    use axum::routing::get;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    fn state() -> (TempDir, Shared) {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let state = Arc::new(AppState {
+            db: Mutex::new(conn),
+            media_dir: temp.path().to_path_buf(),
+            download_dir: temp.path().to_path_buf(),
+            client: reqwest::Client::new(),
+            secure_cookie: false,
+        });
+        (temp, state)
+    }
+
+    fn admin() -> AuthUser {
+        AuthUser {
+            id: 1,
+            username: "admin".into(),
+            role: "admin".into(),
+        }
+    }
+
+    async fn fixture() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/cms", get(|Query(query): Query<std::collections::HashMap<String,String>>| async move {
+                assert_eq!(query.get("key").map(String::as_str), Some("retained"));
+                assert_eq!(query.get("ac").map(String::as_str), Some("detail"));
+                if let Some(word) = query.get("wd") {
+                    assert_eq!(word, "中文 & A+B");
+                }
+                Json(json!({"code":1,"pagecount":"7","total":70,"list":[{
+                    "vod_id":42,"vod_name":"故事 <script>","vod_pic":"/poster.jpg",
+                    "vod_year":2026,"vod_remarks":"更新至2集","vod_content":"<p>简介</p>",
+                    "vod_play_from":"HLS$$$文件$$$无效",
+                    "vod_play_url":"第1集$https://media.example/1.m3u8?x=1&y=2#第2集$https://media.example/2.m3u8$$$电影$https://media.example/a.mp4$$$伪协议$javascript:alert(1)"
+                }]}))
+            }))
+            .route("/bad", get(|| async { (StatusCode::SERVICE_UNAVAILABLE,"offline") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn source_crud_requires_admin_validates_and_preserves_enabled() {
+        let (_temp, state) = state();
+        let viewer = AuthUser {
+            id: 2,
+            username: "viewer".into(),
+            role: "user".into(),
+        };
+        let input = || SourceInput {
+            name: "测试".into(),
+            url: "https://cms.example/api.php".into(),
+            enabled: true,
+        };
+        assert_eq!(
+            create_source(State(state.clone()), viewer, Json(input()))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let (_, Json(source)) = create_source(State(state.clone()), admin(), Json(input()))
+            .await
+            .unwrap();
+        assert!(source.enabled);
+        assert_eq!(
+            create_source(State(state.clone()), admin(), Json(input()))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        let Json(updated) = update_source(
+            State(state.clone()),
+            admin(),
+            Path(source.id),
+            Json(SourceInput {
+                enabled: false,
+                ..input()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!updated.enabled);
+        assert!(!sources(&state).unwrap()[0].enabled);
+        assert!(
+            validate_source(&SourceInput {
+                url: "file:///etc/passwd".into(),
+                ..input()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_source(&SourceInput {
+                url: "https://user:secret@cms.example/api".into(),
+                ..input()
+            })
+            .is_err()
+        );
+        delete_source(State(state.clone()), admin(), Path(source.id))
+            .await
+            .unwrap();
+        assert!(sources(&state).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_retains_query_encoding_and_returns_partial_success() {
+        let (_temp, state) = state();
+        let (base, task) = fixture().await;
+        for (name, path, enabled) in [
+            ("good", "/cms?key=retained&wd=old", true),
+            ("bad", "/bad", true),
+            ("disabled", "/missing", false),
+        ] {
+            state
+                .conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO catalog_sources(name,url,enabled) VALUES(?,?,?)",
+                    params![name, format!("{base}{path}"), enabled],
+                )
+                .unwrap();
+        }
+        let result = search(&state, "中文 & A+B").await.unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].id, "42");
+        assert_eq!(result.results[0].year, "2026");
+        assert_eq!(result.results[0].source_name, "good");
+        assert_eq!(result.results[0].cover, format!("{base}/poster.jpg"));
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].source_id, 2);
+        assert!(result.errors[0].message.contains("503"));
+        assert!(search(&state, " ").await.is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn detail_parses_episode_groups_and_rejects_unsupported_urls() {
+        let (_temp, state) = state();
+        let (base, task) = fixture().await;
+        state
+            .conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO catalog_sources(name,url) VALUES('cms',?)",
+                [format!("{base}/cms?key=retained")],
+            )
+            .unwrap();
+        let item = detail(&state, 1, "42").await.unwrap();
+        assert_eq!(item.title, "故事 <script>");
+        assert_eq!(item.description, "<p>简介</p>");
+        assert_eq!(item.groups.len(), 2);
+        assert_eq!(item.groups[0].name, "HLS");
+        assert_eq!(item.groups[0].episodes.len(), 2);
+        assert!(item.groups[0].direct);
+        assert_eq!(
+            item.groups[0].episodes[0].url,
+            "https://media.example/1.m3u8?x=1&y=2"
+        );
+        assert_eq!(item.groups[1].episodes[0].name, "电影");
+        assert_eq!(
+            detail(&state, 1, "999").await.unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        assert!(detail(&state, 1, "\n").await.is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn bounded_response_and_invalid_json_are_reported_without_source_secrets() {
+        let (_temp, state) = state();
+        let app = Router::new()
+            .route(
+                "/oversize",
+                get(|| async { vec![b'x'; MAX_RESPONSE_BYTES + 1] }),
+            )
+            .route("/html", get(|| async { "<html>not a CMS API</html>" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        for path in ["/oversize", "/html"] {
+            let source = Source {
+                id: 1,
+                name: "test".into(),
+                url: format!("{base}{path}?key=private"),
+                enabled: true,
+            };
+            let error = fetch_items(&state, &source, &[("ac", "detail")])
+                .await
+                .unwrap_err();
+            assert!(!error.contains("private"));
+            assert!(error.contains("8 MiB") || error.contains("valid CMS JSON"));
+        }
+        task.abort();
+    }
+
+    #[test]
+    fn bare_urls_and_missing_group_names_are_usable() {
+        let groups = play_groups(
+            "",
+            "https://media.example/movie.mp4#missing$file:///tmp/secret",
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "线路 1");
+        assert_eq!(groups[0].episodes.len(), 1);
+        assert_eq!(groups[0].episodes[0].name, "播放");
+    }
+
+    #[test]
+    fn play_groups_mark_parser_pages_as_non_direct() {
+        let groups = play_groups(
+            "share,ffm3u8",
+            "第1集$https://media.example/share/abc$$$第1集$https://media.example/1.m3u8?token=1",
+        );
+        assert_eq!(groups.len(), 2);
+        assert!(!groups[0].direct);
+        assert!(groups[1].direct);
+    }
+
+    #[tokio::test]
+    async fn source_used_by_a_subscription_is_retained_with_a_conflict() {
+        let (_temp, state) = state();
+        state.conn().unwrap().execute_batch(
+            "PRAGMA foreign_keys=ON;
+             INSERT INTO catalog_sources(id,name,url) VALUES(1,'source','https://source.example/api');
+             CREATE TABLE active_subscription(source_id INTEGER REFERENCES catalog_sources(id) ON DELETE RESTRICT);
+             INSERT INTO active_subscription VALUES(1);"
+        ).unwrap();
+        let error = delete_source(State(state.clone()), admin(), Path(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(sources(&state).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discover_lists_latest_titles_and_page_metadata() {
+        let (_temp, state) = state();
+        assert!(discover(&state, None, 1).await.unwrap().results.is_empty());
+        let (base, task) = fixture().await;
+        state
+            .conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO catalog_sources(name,url) VALUES('cms',?)",
+                [format!("{base}/cms?key=retained")],
+            )
+            .unwrap();
+        let page = discover(&state, None, 2).await.unwrap();
+        assert_eq!(page.source_id, Some(1));
+        assert_eq!(page.page, 2);
+        assert_eq!(page.page_count, 7);
+        assert_eq!(page.total, 70);
+        assert_eq!(page.results[0].title, "故事 <script>");
+        assert!(discover(&state, None, 0).await.is_err());
+        assert!(discover(&state, Some(999), 1).await.is_err());
+        let raw = cms_query(&state, 1, &[("ac", "detail")]).await.unwrap();
+        assert_eq!(raw["pagecount"], "7");
+        assert!(
+            cms_query(&state, 1, &[("url", "https://unconfigured.example")])
+                .await
+                .is_err()
+        );
+        task.abort();
+    }
+}

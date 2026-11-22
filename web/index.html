@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101110" />
+    <meta
+      name="description"
+      content="PolyView — 你自己的家庭影音空间。媒体库、直播、追剧与下载，一处相聚。"
+    />
+    <title>PolyView · 家庭影音空间</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%23eec477'/%3E%3Cpath d='M25 17 46 32 25 47Z' fill='%23151613'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/vendor/hls.min.js" defer></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">跳转到内容</a>
+    <div id="auth-screen" class="auth-screen" hidden>
+      <div class="auth-art" aria-hidden="true">
+        <span class="orbit orbit-one"></span
+        ><span class="orbit orbit-two"></span>
+        <div class="art-play">▶</div>
+        <span class="art-caption">GOOD STORIES.<br />YOUR OWN SPACE.</span>
+      </div>
+      <section class="auth-panel" aria-labelledby="auth-title">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">▶</span
+          ><span>polyview<span class="brand-dot">.</span></span>
+        </div>
+        <p class="eyebrow">YOUR PERSONAL SCREENING ROOM</p>
+        <h1 id="auth-title">欢迎回家。</h1>
+        <p id="auth-description" class="muted">登录，继续你的下一段精彩。</p>
+        <form id="auth-form" class="stack">
+          <label
+            >用户名<input
+              id="auth-username"
+              name="username"
+              required
+              minlength="1"
+              maxlength="128"
+              autocomplete="username"
+              placeholder="输入已有用户名"
+          /></label>
+          <label
+            >密码<input
+              id="auth-password"
+              name="password"
+              type="password"
+              required
+              maxlength="128"
+              autocomplete="current-password"
+              placeholder="输入密码"
+          /></label>
+          <p id="auth-error" class="form-error" role="alert" hidden></p>
+          <button id="auth-submit" class="button primary" type="submit">
+            进入影音空间 <span aria-hidden="true">→</span>
+          </button>
+        </form>
+        <p class="auth-footer">
+          <span class="status-dot"></span> 私人媒体 · 本地存储 · 自己掌控
+        </p>
+      </section>
+    </div>
+
+    <div id="app-shell" class="app-shell" hidden>
+      <aside class="sidebar" aria-label="主导航">
+        <a class="brand brand-home" href="#online"
+          ><span class="brand-mark" aria-hidden="true">▶</span
+          ><span>polyview<span class="brand-dot">.</span></span></a
+        >
+        <p class="nav-label">你的影音空间</p>
+        <nav id="navigation">
+          <button
+            class="nav-item active"
+            data-view="online"
+            aria-current="page"
+          >
+            <span class="nav-icon" aria-hidden="true">◈</span>影视发现
+          </button>
+          <button class="nav-item" data-view="library">
+            <span class="nav-icon" aria-hidden="true">▦</span>媒体库
+          </button>
+          <button class="nav-item" data-view="live">
+            <span class="nav-icon" aria-hidden="true">◉</span>电视直播<span
+              class="live-dot"
+              aria-hidden="true"
+            ></span>
+          </button>
+          <button class="nav-item" data-view="series">
+            <span class="nav-icon" aria-hidden="true">▤</span>追剧清单
+          </button>
+          <button class="nav-item" data-view="downloads">
+            <span class="nav-icon" aria-hidden="true">↓</span>下载任务
+          </button>
+          <button class="nav-item mobile-settings" data-view="settings">
+            <span class="nav-icon" aria-hidden="true">⚙</span>设置
+          </button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="local-card">
+            <span class="status-dot"></span>
+            <div>
+              属于你的云端
+              <p>在家，也在身边</p>
+            </div>
+            <span aria-hidden="true">⌂</span>
+          </div>
+          <button class="nav-item" data-view="settings">
+            <span class="nav-icon" aria-hidden="true">⚙</span>账户与设置
+          </button>
+          <div class="profile">
+            <span id="profile-avatar" class="avatar" aria-hidden="true">P</span>
+            <div>
+              <span id="profile-name">我的账户</span
+              ><small id="profile-role">家庭成员</small>
+            </div>
+            <button
+              id="logout-button"
+              class="icon-button"
+              aria-label="退出登录"
+              title="退出登录"
+            >
+              ↪
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <span id="breadcrumb" class="breadcrumb"
+            >影音空间 <span aria-hidden="true">/</span> 媒体库</span
+          >
+          <label class="search-field"
+            ><span aria-hidden="true">⌕</span
+            ><input
+              id="search-input"
+              type="search"
+              placeholder="搜索你的影音世界"
+              aria-label="搜索当前页面"
+              autocomplete="off"
+            /><kbd aria-hidden="true">/</kbd></label
+          >
+          <button
+            id="mobile-logout"
+            class="icon-button mobile-logout"
+            aria-label="退出登录"
+            title="退出登录"
+          >
+            ↪
+          </button>
+          <button
+            id="help-button"
+            class="icon-button help-button"
+            aria-label="使用帮助"
+            title="使用帮助"
+          >
+            ?
+          </button>
+        </header>
+        <main id="content" tabindex="-1" aria-busy="true">
+          <div class="loading-state">
+            <span class="spinner" aria-hidden="true"></span>
+            <p>正在打开你的影音空间…</p>
+          </div>
+        </main>
+        <footer class="workspace-footer">
+          <span>POLYVIEW <span class="footer-dot">•</span> 为每一段好时光</span
+          ><span>你的媒体，你的主场。</span>
+        </footer>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <dialog
+      id="player-dialog"
+      class="player-dialog"
+      aria-labelledby="player-title"
+    >
+      <div class="dialog-top">
+        <div>
+          <p id="player-kind" class="eyebrow">NOW PLAYING</p>
+          <h2 id="player-title">正在播放</h2>
+        </div>
+        <button id="player-close" class="icon-button" aria-label="关闭播放器">
+          ✕
+        </button>
+      </div>
+      <video id="video-player" controls playsinline preload="metadata"></video>
+      <p id="player-message" class="player-message" role="status">
+        使用播放器控制开始播放。按 Esc 关闭。
+      </p>
+    </dialog>
+
+    <dialog id="help-dialog" class="info-dialog" aria-labelledby="help-title">
+      <div class="dialog-top">
+        <h2 id="help-title">把好故事，留给大屏幕。</h2>
+        <button id="help-close" class="icon-button" aria-label="关闭帮助">
+          ✕
+        </button>
+      </div>
+      <div class="help-body">
+        <p>
+          媒体库播放 NAS
+          媒体目录中的视频。管理员扫描后，所有成员都能观看；收藏、观看进度与追剧清单由每个账户独立保存。
+        </p>
+        <p>
+          剧集文件使用
+          <code>剧名 S01E01.mp4</code>
+          格式，可自动整理季度和集数。下载完成后会自动扫描入库。
+        </p>
+        <p>
+          直播支持导入 M3U 频道列表。直播地址需要浏览器能够访问；支持原生 HLS
+          或内置 HLS 播放器。跨域直播源需要允许跨域请求，视频编码仍需设备支持。
+        </p>
+        <p>
+          下载支持有权保存的 HTTP / HTTPS 视频文件直链和 HLS（.m3u8）地址。 HLS
+          使用服务器上的 FFmpeg 下载合并。磁力链接和 DRM 内容暂不支持。
+        </p>
+        <div class="keyboard-help">
+          <span><kbd>Tab</kbd> 移动焦点</span><span><kbd>Enter</kbd> 确认</span
+          ><span><kbd>/</kbd> 搜索</span><span><kbd>Esc</kbd> 关闭播放器</span>
+        </div>
+      </div>
+    </dialog>
+  </body>
+</html>

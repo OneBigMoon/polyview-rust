@@ -1,0 +1,722 @@
+//! Explicit, non-destructive import from the original PolyView database.
+use crate::{AppError, Shared, now};
+use argon2::PasswordHash;
+use axum::http::StatusCode;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{collections::BTreeMap, path::Path, time::Duration};
+use url::Url;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub already_imported: bool,
+    pub users_imported: usize,
+    pub users_matched: usize,
+    pub disabled_users_skipped: usize,
+    pub unsupported_passwords_skipped: usize,
+    pub sources_imported: usize,
+    pub sources_matched: usize,
+    pub sources_skipped: usize,
+    pub subscriptions_imported: usize,
+    pub subscriptions_skipped: usize,
+    pub auto_downloads_held: usize,
+    pub tv_tokens_imported: usize,
+    pub tv_tokens_skipped: usize,
+    pub legacy_jobs: i64,
+    pub legacy_unfinished_jobs: i64,
+    pub legacy_rows_retained: BTreeMap<String, i64>,
+    pub telegram_namespace: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone)]
+struct LegacySource {
+    key: String,
+    name: String,
+    kind: String,
+    url: String,
+    enabled: bool,
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, AppError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
+fn valid_url(raw: &str) -> Option<String> {
+    if raw.len() > 4096 || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let mut url = Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+fn supported_password(raw: &str) -> bool {
+    PasswordHash::new(raw).is_ok_and(|hash| {
+        matches!(hash.algorithm.as_str(), "argon2id" | "argon2i" | "argon2d")
+            && hash.salt.is_some()
+            && hash.hash.is_some()
+    })
+}
+
+fn config_sources(config: &Value) -> Vec<LegacySource> {
+    config
+        .get("sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|source| {
+            let text = |key: &str| {
+                source
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            LegacySource {
+                key: text("key"),
+                name: text("name"),
+                kind: source
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("cms")
+                    .into(),
+                url: text("api"),
+                enabled: !source
+                    .get("disabled")
+                    .and_then(|value| {
+                        value
+                            .as_bool()
+                            .or_else(|| value.as_i64().map(|value| value != 0))
+                    })
+                    .unwrap_or(false),
+            }
+        })
+        .collect()
+}
+
+fn init_import_schema(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS legacy_imports (
+            path TEXT PRIMARY KEY, imported_at INTEGER NOT NULL, report_json TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS legacy_user_map (
+            legacy_id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS legacy_source_map (
+            legacy_key TEXT PRIMARY KEY,
+            source_id INTEGER NOT NULL REFERENCES catalog_sources(id) ON DELETE CASCADE
+         );",
+    )?;
+    Ok(())
+}
+
+/// Imports once per canonical database path. The source is opened read-only and never modified.
+pub fn import_legacy(
+    state: &Shared,
+    db_path: &Path,
+    config_path: Option<&Path>,
+) -> Result<ImportReport, AppError> {
+    let path = std::fs::canonicalize(db_path)?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| AppError::bad_request("Legacy database path is not valid UTF-8"))?;
+    let mut conn = state.conn()?;
+    init_import_schema(&conn)?;
+    if let Some(raw) = conn
+        .query_row(
+            "SELECT report_json FROM legacy_imports WHERE path=?",
+            [path],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let mut report: ImportReport = serde_json::from_str(&raw)
+            .map_err(|_| AppError::internal("Legacy import report is invalid"))?;
+        report.already_imported = true;
+        return Ok(report);
+    }
+    if conn.query_row("SELECT EXISTS(SELECT 1 FROM legacy_imports)", [], |row| {
+        row.get::<_, bool>(0)
+    })? {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "A different legacy database was already imported".into(),
+        ));
+    }
+    let legacy = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    legacy.busy_timeout(Duration::from_secs(5))?;
+    legacy.execute_batch("BEGIN")?;
+    if !table_exists(&legacy, "users")? || !table_exists(&legacy, "source_config")? {
+        return Err(AppError::bad_request(
+            "This is not an original PolyView database",
+        ));
+    }
+    let config = match config_path {
+        Some(path) => {
+            let file = std::fs::read(path)?;
+            if file.len() > 8 * 1024 * 1024 {
+                return Err(AppError::bad_request("Legacy config exceeds 8 MiB"));
+            }
+            serde_json::from_slice::<Value>(&file)
+                .map_err(|_| AppError::bad_request("Legacy config is not valid JSON"))?
+        }
+        None => Value::Null,
+    };
+    let mut report = ImportReport::default();
+    let tx = conn.transaction()?;
+    import_users(&legacy, &tx, &mut report)?;
+    import_sources(&legacy, &tx, &config, &mut report)?;
+    import_subscriptions(&legacy, &tx, &mut report)?;
+    import_tokens(&legacy, &tx, &mut report)?;
+    for table in [
+        "play_progress",
+        "favorites",
+        "live_favorites",
+        "skip_configs",
+        "search_history",
+        "sessions",
+    ] {
+        if table_exists(&legacy, table)? {
+            let count: i64 =
+                legacy.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            report.legacy_rows_retained.insert(table.into(), count);
+        }
+    }
+    if table_exists(&legacy, "download_jobs")? {
+        report.legacy_jobs =
+            legacy.query_row("SELECT COUNT(*) FROM download_jobs", [], |row| row.get(0))?;
+        report.legacy_unfinished_jobs = legacy.query_row(
+            "SELECT COUNT(*) FROM download_jobs WHERE status NOT IN ('completed','cancelled')",
+            [],
+            |row| row.get(0),
+        )?;
+    }
+    report.telegram_namespace = config
+        .get("downloads")
+        .and_then(|downloads| downloads.get("telegram_namespace"))
+        .and_then(Value::as_str)
+        .filter(|namespace| {
+            !namespace.is_empty()
+                && namespace.len() <= 100
+                && namespace
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+        })
+        .map(str::to_owned);
+    report.warnings.push("Original database, completed media files, and Telegram storage are retained; this import does not move or delete them.".into());
+    if report.auto_downloads_held > 0 {
+        report.warnings.push("Imported automatic downloads are held off to avoid redownloading existing episodes; review each subscription before enabling.".into());
+    }
+    if report.legacy_jobs > 0 {
+        report.warnings.push("Legacy download job history remains in the original database; unfinished jobs are not automatically resumed by this importer.".into());
+    }
+    if report.legacy_rows_retained.values().any(|count| *count > 0) {
+        report.warnings.push("Legacy favorites, playback history and sessions remain in the original database; they are not reinterpreted as local media IDs.".into());
+    }
+    let encoded = serde_json::to_string(&report)
+        .map_err(|_| AppError::internal("Could not save legacy import report"))?;
+    tx.execute(
+        "INSERT INTO legacy_imports(path,imported_at,report_json) VALUES(?,?,?)",
+        params![path, now(), encoded],
+    )?;
+    tx.commit()?;
+    Ok(report)
+}
+
+fn import_users(
+    legacy: &Connection,
+    tx: &Transaction<'_>,
+    report: &mut ImportReport,
+) -> Result<(), AppError> {
+    let mut users =
+        legacy.prepare("SELECT id,username,password_hash,role,disabled FROM users ORDER BY id")?;
+    let rows = users.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, bool>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (legacy_id, username, hash, role, disabled) = row?;
+        if disabled {
+            report.disabled_users_skipped += 1;
+            continue;
+        }
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM users WHERE username=?",
+                [&username],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let user_id = if let Some(id) = existing {
+            report.users_matched += 1;
+            id
+        } else {
+            if !supported_password(&hash) {
+                report.unsupported_passwords_skipped += 1;
+                continue;
+            }
+            if username.is_empty()
+                || username.chars().count() > 128
+                || username.chars().any(char::is_control)
+            {
+                report.warnings.push(format!("Legacy user {legacy_id} has an invalid username and was retained only in the original database."));
+                continue;
+            }
+            let role = if role == "admin" { "admin" } else { "user" };
+            let occupied: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id=?)",
+                [legacy_id],
+                |row| row.get(0),
+            )?;
+            if legacy_id > 0 && !occupied {
+                tx.execute("INSERT INTO users(id,username,password_hash,role,created_at) VALUES(?,?,?,?,?)", params![legacy_id,username,hash,role,now()])?;
+            } else {
+                tx.execute(
+                    "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
+                    params![username, hash, role, now()],
+                )?;
+            }
+            report.users_imported += 1;
+            tx.last_insert_rowid()
+        };
+        tx.execute(
+            "INSERT INTO legacy_user_map(legacy_id,user_id) VALUES(?,?)",
+            params![legacy_id, user_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn import_sources(
+    legacy: &Connection,
+    tx: &Transaction<'_>,
+    config: &Value,
+    report: &mut ImportReport,
+) -> Result<(), AppError> {
+    let mut sources: BTreeMap<String, LegacySource> = config_sources(config)
+        .into_iter()
+        .map(|source| (source.key.clone(), source))
+        .collect();
+    let mut stored = legacy.prepare("SELECT key,name,COALESCE(kind,'cms'),COALESCE(api,''),COALESCE(disabled,0) FROM source_config ORDER BY priority,key")?;
+    for row in stored.query_map([], |row| {
+        Ok(LegacySource {
+            key: row.get(0)?,
+            name: row.get(1)?,
+            kind: row.get(2)?,
+            url: row.get(3)?,
+            enabled: !row.get::<_, bool>(4)?,
+        })
+    })? {
+        let mut source = row?;
+        if let Some(configured) = sources.get(&source.key) {
+            if source.url.trim().is_empty() {
+                source.url.clone_from(&configured.url);
+            }
+            if source.name.trim().is_empty() {
+                source.name.clone_from(&configured.name);
+            }
+            if source.kind.trim().is_empty() {
+                source.kind.clone_from(&configured.kind);
+            }
+        }
+        sources.insert(source.key.clone(), source);
+    }
+    for (_, source) in sources {
+        let Some(url) = valid_url(&source.url) else {
+            report.sources_skipped += 1;
+            continue;
+        };
+        if (!source.kind.trim().is_empty() && !source.kind.trim().eq_ignore_ascii_case("cms"))
+            || source.key.is_empty()
+            || source.key.len() > 256
+            || source.key.chars().any(char::is_control)
+        {
+            report.sources_skipped += 1;
+            continue;
+        }
+        let name = if source.name.trim().is_empty() {
+            &source.key
+        } else {
+            &source.name
+        };
+        let inserted = tx.execute("INSERT INTO catalog_sources(name,url,enabled) VALUES(?,?,?) ON CONFLICT(url) DO NOTHING",params![name,url,source.enabled])?;
+        if inserted > 0 {
+            report.sources_imported += 1;
+        } else {
+            report.sources_matched += 1;
+        }
+        let id: i64 = tx.query_row("SELECT id FROM catalog_sources WHERE url=?", [url], |row| {
+            row.get(0)
+        })?;
+        tx.execute(
+            "INSERT INTO legacy_source_map(legacy_key,source_id) VALUES(?,?)",
+            params![source.key, id],
+        )?;
+    }
+    Ok(())
+}
+
+fn import_subscriptions(
+    legacy: &Connection,
+    tx: &Transaction<'_>,
+    report: &mut ImportReport,
+) -> Result<(), AppError> {
+    if !table_exists(legacy, "subscriptions")? {
+        return Ok(());
+    }
+    let automatic = if table_exists(legacy, "download_subscriptions")? {
+        "COALESCE((SELECT enabled FROM download_subscriptions ds WHERE ds.subscription_id=s.id),0)"
+    } else {
+        "0"
+    };
+    let mut stmt=legacy.prepare(&format!("SELECT id,user_id,title,COALESCE(source_key,''),COALESCE(media_id,''),COALESCE(total_eps,0),COALESCE(watched_eps,0),COALESCE(last_found_eps,0),COALESCE(state,0),{automatic} FROM subscriptions s ORDER BY id"))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, bool>(9)?,
+        ))
+    })?;
+    for row in rows {
+        let (
+            _legacy_id,
+            owner,
+            title,
+            mut key,
+            mut media,
+            total,
+            watched,
+            found,
+            status,
+            automatic,
+        ) = row?;
+        if key.is_empty() {
+            if let Some((prefix, id)) = media.split_once(':') {
+                key = prefix.to_owned();
+                media = id.to_owned();
+            }
+        } else if let Some(id) = media.strip_prefix(&format!("{key}:")) {
+            media = id.to_owned();
+        }
+        let mapped:Option<(i64,i64)>=tx.query_row("SELECT u.user_id,s.source_id FROM legacy_user_map u CROSS JOIN legacy_source_map s WHERE u.legacy_id=? AND s.legacy_key=?",params![owner,key],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let Some((user_id, source_id)) = mapped else {
+            report.subscriptions_skipped += 1;
+            continue;
+        };
+        if media.is_empty() || media.chars().count() > 256 || media.chars().any(char::is_control) {
+            report.subscriptions_skipped += 1;
+            continue;
+        }
+        let total = total.max(found).max(watched).max(0);
+        let error = if status == 3 {
+            Some("Imported paused subscription; automatic downloads remain disabled")
+        } else if automatic {
+            Some("Review imported episode history before enabling automatic downloads")
+        } else {
+            None
+        };
+        let inserted=tx.execute("INSERT INTO tracking_subscriptions(user_id,source_id,media_id,title,total_episodes,watched_episodes,auto_download,error) VALUES(?,?,?,?,?,?,0,?) ON CONFLICT(user_id,source_id,media_id) DO NOTHING",params![user_id,source_id,media,title,total,watched.max(0),error])?;
+        if inserted > 0 {
+            report.subscriptions_imported += 1;
+            if automatic {
+                report.auto_downloads_held += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn import_tokens(
+    legacy: &Connection,
+    tx: &Transaction<'_>,
+    report: &mut ImportReport,
+) -> Result<(), AppError> {
+    if !table_exists(legacy, "library_tokens")? {
+        return Ok(());
+    }
+    let mut stmt = legacy.prepare("SELECT user_id,token FROM library_tokens")?;
+    for row in stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (old_user, token) = row?;
+        let mapped: Option<i64> = tx
+            .query_row(
+                "SELECT user_id FROM legacy_user_map WHERE legacy_id=?",
+                [old_user],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(user) = mapped else {
+            report.tv_tokens_skipped += 1;
+            continue;
+        };
+        if token.len() != 64 || !token.bytes().all(|c| c.is_ascii_hexdigit()) {
+            report.tv_tokens_skipped += 1;
+            continue;
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO tvbox_tokens(user_id,token) VALUES(?,?)",
+            params![user, token],
+        )?;
+        if inserted > 0 {
+            report.tv_tokens_imported += 1;
+        } else {
+            report.tv_tokens_skipped += 1;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AppState;
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    fn hash() -> String {
+        Argon2::default()
+            .hash_password(
+                b"legacy-password",
+                &SaltString::encode_b64(b"fixed-test-salt").unwrap(),
+            )
+            .unwrap()
+            .to_string()
+    }
+
+    fn state(root: &Path) -> Shared {
+        std::fs::create_dir_all(root.join("downloads")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_schema(&conn).unwrap();
+        Arc::new(AppState {
+            db: Mutex::new(conn),
+            media_dir: root.to_path_buf(),
+            download_dir: root.join("downloads"),
+            client: reqwest::Client::new(),
+            secure_cookie: false,
+        })
+    }
+
+    fn legacy(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT,password_hash TEXT,role TEXT,disabled INTEGER);CREATE TABLE source_config(key TEXT PRIMARY KEY,name TEXT,kind TEXT,api TEXT,disabled INTEGER,priority INTEGER);CREATE TABLE subscriptions(id INTEGER PRIMARY KEY,user_id INTEGER,title TEXT,source_key TEXT,media_id TEXT,total_eps INTEGER,watched_eps INTEGER,last_found_eps INTEGER,state INTEGER);CREATE TABLE download_subscriptions(subscription_id INTEGER,user_id INTEGER,enabled INTEGER);CREATE TABLE library_tokens(user_id INTEGER,token TEXT);CREATE TABLE download_jobs(id INTEGER,status TEXT);CREATE TABLE play_progress(user_id INTEGER,media_id TEXT);CREATE TABLE favorites(user_id INTEGER,media_id TEXT);").unwrap();
+        conn
+    }
+
+    #[test]
+    fn imports_accounts_sources_subscriptions_tokens_once_without_activating_downloads() {
+        let temp = TempDir::new().unwrap();
+        let state = state(temp.path());
+        let path = temp.path().join("legacy.db");
+        let old = legacy(&path);
+        let password = hash();
+        old.execute(
+            "INSERT INTO users VALUES(7,'oldadmin',?,'admin',0)",
+            [&password],
+        )
+        .unwrap();
+        old.execute("INSERT INTO source_config VALUES('cms','Saved CMS',' Cms ','https://example.org/cms',0,1)",[]).unwrap();
+        old.execute(
+            "INSERT INTO subscriptions VALUES(1,7,'Old series','cms','cms:42',12,4,8,0)",
+            [],
+        )
+        .unwrap();
+        old.execute("INSERT INTO download_subscriptions VALUES(1,7,1)", [])
+            .unwrap();
+        old.execute("INSERT INTO library_tokens VALUES(7,?)", ["a".repeat(64)])
+            .unwrap();
+        old.execute_batch("INSERT INTO download_jobs VALUES(1,'completed'),(2,'paused');INSERT INTO favorites VALUES(7,'cms:42');").unwrap();
+        let report = import_legacy(&state, &path, None).unwrap();
+        assert_eq!(report.users_imported, 1);
+        assert_eq!(report.sources_imported, 1);
+        assert_eq!(report.subscriptions_imported, 1);
+        assert_eq!(report.auto_downloads_held, 1);
+        assert_eq!(report.tv_tokens_imported, 1);
+        assert_eq!(report.legacy_jobs, 2);
+        assert_eq!(report.legacy_unfinished_jobs, 1);
+        assert_eq!(report.legacy_rows_retained["favorites"], 1);
+        let conn = state.conn().unwrap();
+        let user: (i64, String) = conn
+            .query_row(
+                "SELECT id,password_hash FROM users WHERE username='oldadmin'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(user, (7, password));
+        let tracking: (String, i64, bool) = conn
+            .query_row(
+                "SELECT media_id,watched_episodes,auto_download FROM tracking_subscriptions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(tracking, ("42".into(), 4, false));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM downloads", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(conn);
+        assert!(import_legacy(&state, &path, None).unwrap().already_imported);
+        assert_eq!(
+            old.query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            old.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='legacy_imports'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn existing_accounts_and_source_settings_survive_and_unsafe_accounts_stay_disabled() {
+        let temp = TempDir::new().unwrap();
+        let state = state(temp.path());
+        let path = temp.path().join("legacy.db");
+        let old = legacy(&path);
+        let password = hash();
+        old.execute(
+            "INSERT INTO users VALUES(1,'same',?,'admin',0)",
+            [&password],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO users VALUES(2,'disabled',?,'user',1)",
+            [&password],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO users VALUES(3,'unsupported','plain-password','user',0)",
+            [],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO users VALUES(4,'collision',?,'user',0)",
+            [&password],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO source_config VALUES('cms','','cms','',1,1)",
+            [],
+        )
+        .unwrap();
+        state.conn().unwrap().execute_batch("INSERT INTO users(id,username,password_hash,role,created_at) VALUES(9,'same','existing-hash','user',1),(4,'existing','other-hash','admin',1);INSERT INTO catalog_sources(name,url,enabled) VALUES('Unchanged','https://example.org/cms',0);").unwrap();
+        let config = temp.path().join("config.json");
+        std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"sources":[{"key":"cms","name":"Import must not overwrite","api":"https://example.org/cms"},{"key":"alist","kind":"alist","api":"https://files.example.org"},{"key":"bad","api":"file:///private"}],"downloads":{"telegram_namespace":"polyview"}})).unwrap()).unwrap();
+        let report = import_legacy(&state, &path, Some(&config)).unwrap();
+        assert_eq!(report.users_matched, 1);
+        assert_eq!(report.users_imported, 1);
+        assert_eq!(report.disabled_users_skipped, 1);
+        assert_eq!(report.unsupported_passwords_skipped, 1);
+        assert_eq!(report.sources_matched, 1);
+        assert_eq!(report.sources_skipped, 2);
+        assert_eq!(report.telegram_namespace.as_deref(), Some("polyview"));
+        let conn = state.conn().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT password_hash FROM users WHERE username='same'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "existing-hash"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT user_id FROM legacy_user_map WHERE legacy_id=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            9
+        );
+        assert_ne!(
+            conn.query_row(
+                "SELECT user_id FROM legacy_user_map WHERE legacy_id=4",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            4
+        );
+        assert!(
+            !conn
+                .query_row(
+                    "SELECT enabled FROM catalog_sources WHERE url='https://example.org/cms'",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_config_or_wrong_schema_does_not_partially_import_users() {
+        let temp = TempDir::new().unwrap();
+        let state = state(temp.path());
+        let path = temp.path().join("legacy.db");
+        let old = legacy(&path);
+        old.execute("INSERT INTO users VALUES(1,'admin',?,'admin',0)", [hash()])
+            .unwrap();
+        let config = temp.path().join("bad.json");
+        std::fs::write(&config, b"{").unwrap();
+        assert!(import_legacy(&state, &path, Some(&config)).is_err());
+        assert_eq!(
+            state
+                .conn()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            state
+                .conn()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM legacy_imports", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
