@@ -104,8 +104,14 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     pause() {
       this.paused = true;
     }
-    focus() {}
-    remove() {}
+    requestFullscreen() {
+      document.fullscreenElement = this;
+      document.dispatchEvent("fullscreenchange");
+      return Promise.resolve();
+    }
+    dispatchEvent(type, event = {}) {
+      (this.listeners?.[type] ?? []).forEach((cb) => cb(event));
+    }
   }
   for (const id of [
     "content",
@@ -200,6 +206,11 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     },
     dispatchEvent(type) {
       (this.listeners?.[type] ?? []).forEach((cb) => cb({ type }));
+    },
+    exitFullscreen() {
+      this.fullscreenElement = null;
+      this.dispatchEvent("fullscreenchange");
+      return Promise.resolve();
     },
   };
   const storage = {};
@@ -554,6 +565,34 @@ test("Esc that exits fullscreen does not close the live player", () => {
   cancel.call(dialog, event);
   assert.equal(dialog.open, true);
   assert.ok(app.state.player);
+});
+test("double-clicking the video uses our fullscreen instead of the browser's", () => {
+  const app = environment();
+  app.play({ id: 1, name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
+  const video = app.elements.get("video-player");
+  const dblclick = video.listeners.dblclick[0];
+  let prevented = false;
+  dblclick.call(video, { preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(app.document.fullscreenElement, app.elements.get("player-stage"));
+  assert.equal(app.elements.get("player-fullscreen").getAttribute("aria-label"), "退出全屏");
+});
+
+test("rapid fullscreen clicks request once while a request is pending", async () => {
+  const app = environment();
+  app.play({ id: 1, name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
+  const button = app.elements.get("player-fullscreen");
+  const click = button.listeners.click[0];
+  const stage = app.elements.get("player-stage");
+  let requests = 0;
+  stage.requestFullscreen = () => {
+    requests += 1;
+    app.document.fullscreenElement = stage;
+    return new Promise(() => {});
+  };
+  click.call(button);
+  click.call(button);
+  assert.equal(requests, 1);
 });
 
 test("native live HLS starts playback without a separate play click", () => {

@@ -2441,13 +2441,28 @@
     video.muted = !video.muted;
     updatePlayerControls();
   });
-  $("player-fullscreen").addEventListener("click", () => {
+  let fullscreenPending = false;
+  function toggleFullscreen() {
+    if (fullscreenPending) return;
     const stage = $("player-stage");
-    if (document.fullscreenElement) document.exitFullscreen?.();
-    else
-      stage.requestFullscreen?.().catch(() =>
-        toast("当前浏览器无法进入全屏。", true),
-      );
+    if (document.fullscreenElement) {
+      document.exitFullscreen?.();
+      return;
+    }
+    fullscreenPending = true;
+    const request = stage.requestFullscreen?.();
+    if (request?.finally)
+      request
+        .catch(() => toast("当前浏览器无法进入全屏。", true))
+        .finally(() => {
+          fullscreenPending = false;
+        });
+    else fullscreenPending = false;
+  }
+  $("player-fullscreen").addEventListener("click", toggleFullscreen);
+  $("video-player").addEventListener("dblclick", (event) => {
+    event.preventDefault();
+    toggleFullscreen();
   });
   document.addEventListener("fullscreenchange", () => {
     const full = document.fullscreenElement === $("player-stage");
