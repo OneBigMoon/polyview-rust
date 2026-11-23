@@ -1214,6 +1214,14 @@ textarea {
   gap: 20px;
   align-items: flex-start;
 }
+.player-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.player-actions [hidden] {
+  display: none;
+}
 .dialog-top h2 {
   margin: 0;
 }

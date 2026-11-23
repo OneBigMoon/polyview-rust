@@ -111,6 +111,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "help-button",
     "help-close",
     "player-close",
+    "player-source",
     "player-dialog",
     "player-title",
     "player-kind",
@@ -198,7 +199,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode};\n})();",
+      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource};\n})();",
     ),
     context,
   );
@@ -238,6 +239,55 @@ test("native HLS playback is used only when the browser reports it can play", ()
   assert.equal(
     app.elements.get("video-player").src,
     "/api/playback?url=https%3A%2F%2Fsource.example%2Flive.m3u8",
+  );
+});
+
+test("live channels fail over to the next source when HLS dies", () => {
+  const app = environment();
+  app.play(
+    {
+      name: "CCTV-1",
+      sources: [
+        { url: "https://a.example/1.m3u8" },
+        { url: "https://b.example/1.m3u8" },
+      ],
+    },
+    true,
+  );
+  const button = app.elements.get("player-source");
+  assert.equal(button.hidden, false);
+  assert.equal(button.textContent, "线路 1/2 · 切换");
+  app.hlsInstances[0].emit("error", { fatal: true });
+  assert.equal(app.hlsInstances.length, 2);
+  assert.equal(
+    app.hlsInstances[1].source,
+    "/api/playback?url=https%3A%2F%2Fb.example%2F1.m3u8",
+  );
+  assert.equal(button.textContent, "线路 2/2 · 切换");
+});
+
+test("the source button switches live channels manually", () => {
+  const app = environment();
+  app.play(
+    {
+      name: "CCTV-1",
+      sources: [
+        { url: "https://a.example/1.m3u8" },
+        { url: "https://b.example/1.m3u8" },
+      ],
+    },
+    true,
+  );
+  app.switchLiveSource(1);
+  assert.equal(app.hlsInstances.length, 2);
+  assert.equal(
+    app.hlsInstances[1].source,
+    "/api/playback?url=https%3A%2F%2Fb.example%2F1.m3u8",
+  );
+  app.switchLiveSource(1);
+  assert.equal(
+    app.hlsInstances[2].source,
+    "/api/playback?url=https%3A%2F%2Fa.example%2F1.m3u8",
   );
 });
 

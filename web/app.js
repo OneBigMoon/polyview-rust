@@ -308,49 +308,99 @@
       state.hls = null;
     }
   }
-  function play(item, live = false) {
-    if (state.player) closePlayer();
+  function liveSources(item) {
+    const sources = (item.sources || [])
+      .map((source) => (typeof source === "string" ? source : source.url))
+      .filter(Boolean);
+    return sources.length ? sources : item.url ? [item.url] : [];
+  }
+  function updateSourceButton() {
+    const player = state.player;
+    const button = $("player-source");
+    if (!player?.live || player.sources.length < 2) {
+      button.hidden = true;
+      return;
+    }
+    button.hidden = false;
+    button.textContent = `线路 ${player.sourceIndex + 1}/${player.sources.length} · 切换`;
+  }
+  function failLiveSource() {
+    const player = state.player;
+    if (!player?.live) return;
+    player.failed.add(player.sourceIndex);
+    const next = Array.from(
+      { length: player.sources.length },
+      (_, offset) =>
+        (player.sourceIndex + offset + 1) % player.sources.length,
+    ).find((index) => !player.failed.has(index));
+    if (next === undefined) {
+      $("player-message").textContent =
+        "所有线路都无法播放，请检查频道地址或稍后重试。";
+      destroyHls();
+      updateSourceButton();
+      return;
+    }
+    player.sourceIndex = next;
+    $("player-message").textContent = `正在切换线路 ${next + 1}/${player.sources.length}…`;
+    attachPlayerSource();
+  }
+  function switchLiveSource(delta) {
+    const player = state.player;
+    if (!player?.live || player.sources.length < 2) return;
+    player.failed = new Set();
+    player.sourceIndex =
+      (player.sourceIndex + delta + player.sources.length) %
+      player.sources.length;
+    attachPlayerSource();
+  }
+  function attachPlayerSource() {
+    const player = state.player;
+    if (!player) return;
     const video = $("video-player");
-    state.player = {
-      item,
-      live,
-      lastSaved: 0,
-      lastPayload: "",
-      errorShown: false,
-    };
-    $("player-title").textContent = item.title || item.name || "正在播放";
-    $("player-kind").textContent = live
-      ? "LIVE NOW"
-      : item.series || "NOW PLAYING";
-    $("player-message").textContent = live
-      ? "直播由服务器转发，请确认服务器能访问频道地址。"
-      : "使用播放器控制开始播放。按 Esc 关闭。";
-    video.onloadedmetadata = null;
-    video.onerror = () => {
-      $("player-message").textContent = live
-        ? "直播无法播放，请确认服务器能访问频道地址，或浏览器支持该视频编码。"
-        : "视频无法播放，请检查文件格式或媒体目录权限。";
-    };
+    const attempt = ++player.attempt;
+    const current = () => state.player === player && player.attempt === attempt;
     destroyHls();
-    const upstream = item.remote_url || (live ? item.url : "");
+    video.pause();
+    video.onloadedmetadata = null;
+    video.onplaying = null;
+    video.onerror = null;
+    video.removeAttribute("src");
+    video.load();
+    updateSourceButton();
+    $("player-message").textContent = player.live
+      ? player.sources.length > 1
+        ? `正在连接线路 ${player.sourceIndex + 1}/${player.sources.length}…`
+        : "直播由服务器转发，请确认服务器能访问频道地址。"
+      : "使用播放器控制开始播放。按 Esc 关闭。";
+    const upstream = player.live
+      ? player.sources[player.sourceIndex]
+      : player.item.remote_url;
     const source = upstream
       ? `/api/playback?url=${encodeURIComponent(upstream)}`
-      : `/api/library/${encodeURIComponent(item.id)}/stream`;
+      : `/api/library/${encodeURIComponent(player.item.id)}/stream`;
     const hlsSource = /\.m3u8(?:[?#]|$)/i.test(upstream || source);
     const nativeHls =
       video.canPlayType("application/vnd.apple.mpegurl") === "probably";
     const startLive = () => {
-      if (!live) return;
-      const attempt = video.play();
-      if (attempt?.catch)
-        attempt.catch(() => {
-          $("player-message").textContent =
-            "浏览器阻止了自动播放，请点击播放器开始直播。";
+      if (!player.live || !current()) return;
+      const result = video.play();
+      if (result?.catch)
+        result.catch(() => {
+          if (current())
+            $("player-message").textContent =
+              "浏览器阻止了自动播放，请点击播放器开始直播。";
         });
     };
-    if (live)
+    video.onerror = () => {
+      if (!current()) return;
+      if (player.live) failLiveSource();
+      else
+        $("player-message").textContent =
+          "视频无法播放，请检查文件格式或媒体目录权限。";
+    };
+    if (player.live)
       video.onplaying = () => {
-        $("player-message").textContent = "正在直播。";
+        if (current()) $("player-message").textContent = "正在直播。";
       };
     if (hlsSource && !nativeHls && window.Hls?.isSupported()) {
       const hls = new window.Hls({
@@ -359,7 +409,9 @@
       });
       state.hls = hls;
       hls.on(window.Hls.Events.ERROR, (_, data) => {
-        if (data.fatal) {
+        if (!data.fatal || !current()) return;
+        if (player.live) failLiveSource();
+        else {
           $("player-message").textContent =
             "HLS 连接失败，请确认服务器能访问媒体地址或视频编码受支持。";
           destroyHls();
@@ -371,17 +423,40 @@
     } else {
       video.src = source;
       video.load();
-      if (live) {
+      if (player.live) {
         video.onloadedmetadata = startLive;
         startLive();
       }
     }
-    if (!live)
+    if (!player.live)
       video.onloadedmetadata = () => {
-        if (n(item.position) > 0 && n(item.position) < video.duration - 1)
-          video.currentTime = item.position;
+        if (!current()) return;
+        if (
+          n(player.item.position) > 0 &&
+          n(player.item.position) < video.duration - 1
+        )
+          video.currentTime = player.item.position;
       };
+  }
+  function play(item, live = false) {
+    if (state.player) closePlayer();
+    state.player = {
+      item,
+      live,
+      sources: live ? liveSources(item) : [],
+      sourceIndex: 0,
+      failed: new Set(),
+      attempt: 0,
+      lastSaved: 0,
+      lastPayload: "",
+      errorShown: false,
+    };
+    $("player-title").textContent = item.title || item.name || "正在播放";
+    $("player-kind").textContent = live
+      ? "LIVE NOW"
+      : item.series || "NOW PLAYING";
     $("player-dialog").showModal();
+    attachPlayerSource();
   }
   async function saveProgress(force = false, keepalive = false) {
     const current = state.player,
@@ -460,6 +535,7 @@
         render();
     });
     state.player = null;
+    $("player-source").hidden = true;
     const video = $("video-player");
     video.pause();
     destroyHls();
@@ -1927,6 +2003,7 @@
   );
   $("help-close").addEventListener("click", () => $("help-dialog").close());
   $("player-close").addEventListener("click", closePlayer);
+  $("player-source").addEventListener("click", () => switchLiveSource(1));
   $("player-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
     closePlayer();

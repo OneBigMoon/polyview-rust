@@ -23,6 +23,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
             id INTEGER PRIMARY KEY, name TEXT NOT NULL, group_name TEXT NOT NULL,
             logo TEXT NOT NULL, url TEXT NOT NULL UNIQUE
         );
+        CREATE TABLE IF NOT EXISTS channel_sources (
+            id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            url TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',
+            position INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(channel_id, url)
+        );
+        CREATE INDEX IF NOT EXISTS channel_sources_channel
+            ON channel_sources(channel_id, position);
+        INSERT OR IGNORE INTO channel_sources(channel_id, url, label, position)
+            SELECT id, url, '', 0 FROM channels;
         CREATE TABLE IF NOT EXISTS downloads (
             id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             title TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
@@ -45,8 +56,23 @@ pub fn router() -> Router<Shared> {
 }
 
 #[derive(Debug, Serialize)]
+struct ChannelSource {
+    url: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
 struct Channel {
     id: i64,
+    name: String,
+    group_name: String,
+    logo: String,
+    url: String,
+    sources: Vec<ChannelSource>,
+}
+
+#[derive(Debug)]
+struct PlaylistChannel {
     name: String,
     group_name: String,
     logo: String,
@@ -60,7 +86,7 @@ async fn list_channels(
     let conn = state.conn()?;
     let mut query = conn
         .prepare("SELECT id,name,group_name,logo,url FROM channels ORDER BY group_name,name,id")?;
-    let rows = query
+    let mut channels = query
         .query_map([], |row| {
             Ok(Channel {
                 id: row.get(0)?,
@@ -68,10 +94,30 @@ async fn list_channels(
                 group_name: row.get(2)?,
                 logo: row.get(3)?,
                 url: row.get(4)?,
+                sources: Vec::new(),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(rows))
+    let mut sources = conn.prepare(
+        "SELECT url,label FROM channel_sources WHERE channel_id=?1 ORDER BY position,id",
+    )?;
+    for channel in &mut channels {
+        channel.sources = sources
+            .query_map([channel.id], |row| {
+                Ok(ChannelSource {
+                    url: row.get(0)?,
+                    label: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if channel.sources.is_empty() {
+            channel.sources.push(ChannelSource {
+                url: channel.url.clone(),
+                label: String::new(),
+            });
+        }
+    }
+    Ok(Json(channels))
 }
 
 #[derive(Deserialize)]
@@ -88,13 +134,56 @@ async fn import_channels(
     let channels = parse_playlist(&input.playlist)?;
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
+    let mut new_channels = 0;
     for channel in &channels {
-        tx.execute("INSERT INTO channels(name,group_name,logo,url) VALUES (?1,?2,?3,?4)
-            ON CONFLICT(url) DO UPDATE SET name=excluded.name,group_name=excluded.group_name,logo=excluded.logo",
-            params![channel.name, channel.group_name, channel.logo, channel.url])?;
+        let existing = tx
+            .query_row(
+                "SELECT id FROM channels WHERE url=?1",
+                [&channel.url],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let id = if let Some(id) = existing {
+            tx.execute(
+                "UPDATE channels SET name=?1,group_name=?2,logo=?3 WHERE id=?4",
+                params![channel.name, channel.group_name, channel.logo, id],
+            )?;
+            id
+        } else if let Some(id) = tx
+            .query_row(
+                "SELECT id FROM channels WHERE name=?1 AND group_name=?2 ORDER BY id LIMIT 1",
+                params![channel.name, channel.group_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            tx.execute(
+                "UPDATE channels SET logo=CASE WHEN logo='' THEN ?1 ELSE logo END WHERE id=?2",
+                params![channel.logo, id],
+            )?;
+            id
+        } else {
+            tx.execute(
+                "INSERT INTO channels(name,group_name,logo,url) VALUES (?1,?2,?3,?4)",
+                params![channel.name, channel.group_name, channel.logo, channel.url],
+            )?;
+            new_channels += 1;
+            tx.last_insert_rowid()
+        };
+        let position: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position),-1)+1 FROM channel_sources WHERE channel_id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO channel_sources(channel_id,url,label,position) VALUES (?1,?2,'',?3)",
+            params![id, channel.url, position],
+        )?;
     }
     tx.commit()?;
-    Ok(Json(json!({"imported": channels.len()})))
+    Ok(Json(
+        json!({"imported": channels.len(), "new_channels": new_channels}),
+    ))
 }
 
 async fn delete_channel(
@@ -140,7 +229,7 @@ fn attribute(info: &str, key: &str) -> String {
     String::new()
 }
 
-fn parse_playlist(text: &str) -> Result<Vec<Channel>, AppError> {
+fn parse_playlist(text: &str) -> Result<Vec<PlaylistChannel>, AppError> {
     let mut channels = Vec::new();
     let mut pending: Option<(String, String, String)> = None;
     let mut saw_header = false;
@@ -199,9 +288,11 @@ fn parse_playlist(text: &str) -> Result<Vec<Channel>, AppError> {
                 ))
             })?;
             let url = http_url(line)?.to_string();
-            if !channels.iter().any(|channel: &Channel| channel.url == url) {
-                channels.push(Channel {
-                    id: 0,
+            if !channels
+                .iter()
+                .any(|channel: &PlaylistChannel| channel.url == url)
+            {
+                channels.push(PlaylistChannel {
                     name,
                     group_name,
                     logo,
@@ -860,6 +951,37 @@ mod tests {
         assert!(parse_playlist("#EXTM3U\n#EXTINF:-1,No URL").is_err());
         assert!(parse_playlist("#EXTM3U\n#EXTINF:-1,Private\nfile:///etc/passwd").is_err());
         assert!(parse_playlist("#EXTM3U\nhttps://example.com/a.mp4").is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_import_keeps_multiple_sources_for_one_name() {
+        let (_temp, state) = state();
+        let admin = AuthUser {
+            id: 1,
+            username: "admin".into(),
+            role: "admin".into(),
+        };
+        let playlist = "#EXTM3U\n#EXTINF:-1 group-title=\"央视\",CCTV-1\nhttps://a.example/1.m3u8\n#EXTINF:-1 group-title=\"央视\",CCTV-1\nhttps://b.example/1.m3u8\n#EXTINF:-1 group-title=\"央视\",CCTV-2\nhttps://c.example/2.m3u8\n";
+        for _ in 0..2 {
+            let _ = import_channels(
+                State(state.clone()),
+                admin.clone(),
+                Json(PlaylistInput {
+                    playlist: playlist.into(),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let Json(channels) = list_channels(State(state.clone()), admin).await.unwrap();
+        assert_eq!(channels.len(), 2);
+        let cctv1 = channels
+            .iter()
+            .find(|channel| channel.name == "CCTV-1")
+            .unwrap();
+        assert_eq!(cctv1.sources.len(), 2);
+        assert_eq!(cctv1.sources[0].url, "https://a.example/1.m3u8");
+        assert_eq!(cctv1.sources[1].url, "https://b.example/1.m3u8");
     }
 
     #[test]

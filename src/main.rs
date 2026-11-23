@@ -49,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         download_dir,
         secure_cookie,
         client: reqwest::Client::builder()
-            .user_agent("Mozilla/5.0")
+            // Public IPTV gateways commonly serve HLS only to mobile players.
+            .user_agent(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            )
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()?,

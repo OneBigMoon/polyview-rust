@@ -187,9 +187,17 @@
           <p id="player-kind" class="eyebrow">NOW PLAYING</p>
           <h2 id="player-title">正在播放</h2>
         </div>
-        <button id="player-close" class="icon-button" aria-label="关闭播放器">
-          ✕
-        </button>
+        <div class="player-actions">
+          <button
+            id="player-source"
+            class="button subtle small-button"
+            type="button"
+            hidden
+          ></button>
+          <button id="player-close" class="icon-button" aria-label="关闭播放器">
+            ✕
+          </button>
+        </div>
       </div>
       <video id="video-player" controls playsinline preload="metadata"></video>
       <p id="player-message" class="player-message" role="status">
