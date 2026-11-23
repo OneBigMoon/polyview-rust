@@ -2444,13 +2444,12 @@
   let fullscreenPending = false;
   function toggleFullscreen() {
     if (fullscreenPending) return;
-    const stage = $("player-stage");
     if (document.fullscreenElement) {
       document.exitFullscreen?.();
       return;
     }
     fullscreenPending = true;
-    const request = stage.requestFullscreen?.();
+    const request = document.documentElement.requestFullscreen?.();
     if (request?.finally)
       request
         .catch(() => toast("当前浏览器无法进入全屏。", true))
@@ -2465,7 +2464,7 @@
     toggleFullscreen();
   });
   document.addEventListener("fullscreenchange", () => {
-    const full = document.fullscreenElement === $("player-stage");
+    const full = !!document.fullscreenElement;
     if (!full) fullscreenExitedAt = Date.now();
     $("player-fullscreen").setAttribute(
       "aria-label",

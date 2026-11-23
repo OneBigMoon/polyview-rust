@@ -1711,15 +1711,30 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.player-dialog.live-mode .player-stage:fullscreen {
+:root:fullscreen .app-shell,
+:root:fullscreen #auth-screen {
+  display: none;
+}
+:root:fullscreen .player-dialog {
   width: 100vw;
   height: 100vh;
-  padding: 18px;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  border: 0;
   border-radius: 0;
   background: var(--bg);
 }
-.player-dialog.live-mode .player-stage:fullscreen video,
-.player-dialog.live-mode .player-stage:fullscreen .player-guide {
+:root:fullscreen .player-dialog::backdrop {
+  background: var(--bg);
+}
+:root:fullscreen .player-dialog video {
+  max-height: calc(100vh - 190px);
+}
+:root:fullscreen .player-dialog.live-mode .player-stage video {
+  max-height: calc(100vh - 190px);
+}
+:root:fullscreen .player-dialog.live-mode .player-guide {
   max-height: calc(100vh - 190px);
 }
 .help-body {

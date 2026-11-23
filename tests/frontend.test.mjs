@@ -195,15 +195,15 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     activeElement: null,
     documentElement: new Element("html"),
     body: new Element("body"),
+    addEventListener(event, callback) {
+      (this.listeners ??= {})[event] ??= [];
+      this.listeners[event].push(callback);
+    },
     getElementById: (id) => elements.get(id) ?? null,
     createElement: (tag) => new Element(tag),
     createTextNode: (text) => ({ nodeType: 3, textContent: text }),
     querySelector: () => null,
     querySelectorAll: () => [],
-    addEventListener(event, callback) {
-      (this.listeners ??= {})[event] ??= [];
-      this.listeners[event].push(callback);
-    },
     dispatchEvent(type) {
       (this.listeners?.[type] ?? []).forEach((cb) => cb({ type }));
     },
@@ -556,7 +556,7 @@ test("Esc that exits fullscreen does not close the live player", () => {
   const dialog = app.elements.get("player-dialog");
   const cancel = dialog.listeners.cancel[0];
   const event = { preventDefault() { event.defaultPrevented = true; } };
-  app.document.fullscreenElement = app.elements.get("player-stage");
+  app.document.fullscreenElement = app.document.documentElement;
   cancel.call(dialog, event);
   assert.equal(event.defaultPrevented, true);
   assert.equal(dialog.open, true);
@@ -574,7 +574,7 @@ test("double-clicking the video uses our fullscreen instead of the browser's", (
   let prevented = false;
   dblclick.call(video, { preventDefault() { prevented = true; } });
   assert.equal(prevented, true);
-  assert.equal(app.document.fullscreenElement, app.elements.get("player-stage"));
+  assert.equal(app.document.fullscreenElement, app.document.documentElement);
   assert.equal(app.elements.get("player-fullscreen").getAttribute("aria-label"), "退出全屏");
 });
 
@@ -583,7 +583,7 @@ test("rapid fullscreen clicks request once while a request is pending", async ()
   app.play({ id: 1, name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
   const button = app.elements.get("player-fullscreen");
   const click = button.listeners.click[0];
-  const stage = app.elements.get("player-stage");
+  const stage = app.document.documentElement;
   let requests = 0;
   stage.requestFullscreen = () => {
     requests += 1;
