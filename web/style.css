@@ -853,6 +853,24 @@ main:focus {
 .catalog-art .poster-name {
   font-size: 17px;
 }
+.source-badge {
+  position: absolute;
+  z-index: 3;
+  top: 10px;
+  left: 10px;
+  padding: 5px 9px;
+  border: 1px solid rgba(141, 81, 249, 0.32);
+  border-radius: 8px;
+  background: rgba(141, 81, 249, 0.92);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  backdrop-filter: blur(8px);
+}
+.source-badge[hidden] {
+  display: none;
+}
 .poster-label,
 .poster-name {
   position: relative;
@@ -1801,6 +1819,23 @@ textarea {
 }
 .import-dialog textarea {
   min-height: 220px;
+}
+.catalog-source-switch {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--muted-bg);
+}
+.catalog-source-switch .discover-filter-chips {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
 .catalog-dialog {
   width: min(760px, calc(100% - 32px));

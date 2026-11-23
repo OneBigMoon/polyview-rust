@@ -944,12 +944,69 @@
     }
     dialog.showModal();
   }
+  const catalogGroupKey = (item) => {
+    const title = String(item.title ?? "")
+      .normalize("NFKC")
+      .trim()
+      .toLocaleLowerCase()
+      .replace(/\s+/g, " ");
+    const year = String(item.year ?? "").trim();
+    return title
+      ? `${title}|${year}`
+      : `id:${item.source_id}:${item.id ?? item.media_id}`;
+  };
+  const mergeCatalogGroups = (items, groups) => {
+    const changed = new Set();
+    items.forEach((item) => {
+      const key = catalogGroupKey(item);
+      let group = groups.get(key);
+      if (!group) {
+        group = { ...item, sources: [] };
+        groups.set(key, group);
+      }
+      if (!group.cover && item.cover) group.cover = item.cover;
+      if (!group.year && item.year) group.year = item.year;
+      if (!group.remark && item.remark) group.remark = item.remark;
+      const source = {
+        source_id: item.source_id,
+        id: item.id ?? item.media_id,
+        source_name: item.source_name,
+        remark: item.remark,
+      };
+      const existing = group.sources.find(
+        (entry) => String(entry.source_id) === String(source.source_id),
+      );
+      if (!existing) {
+        group.sources.push(source);
+        changed.add(key);
+      }
+    });
+    return changed;
+  };
+  const updateCatalogCard = (card, item) => {
+    const count = item.sources?.length || 1;
+    card._sourceBadge.hidden = count < 2;
+    card._sourceBadge.textContent = `聚合 ${count} 源`;
+    card._meta.textContent = [
+      item.year,
+      count > 1 ? `${count} 个影视源` : item.remark,
+      count > 1 ? "点击切换" : item.source_name,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  };
   function catalogCard(item, index) {
     const art = make(
       "div",
       { class: `poster-art catalog-art tone-${index % 6}` },
       [make("span", { class: "poster-name", text: item.title })],
     );
+    const badge = make("span", {
+      class: "source-badge",
+      hidden: true,
+      "aria-hidden": "true",
+    });
+    art.append(badge);
     if (item.cover) {
       const image = make("img", {
         src: item.cover,
@@ -960,7 +1017,8 @@
       image.addEventListener("error", () => image.remove());
       art.prepend(image);
     }
-    return make("article", { class: "media-card" }, [
+    const meta = make("div", { class: "media-meta" });
+    const card = make("article", { class: "media-card" }, [
       make(
         "button",
         {
@@ -971,13 +1029,12 @@
         },
         art,
       ),
-      make("div", {
-        class: "media-meta",
-        text: [item.year, item.remark, item.source_name]
-          .filter(Boolean)
-          .join(" · "),
-      }),
+      meta,
     ]);
+    card._sourceBadge = badge;
+    card._meta = meta;
+    updateCatalogCard(card, item);
+    return card;
   }
   async function online() {
     const sequence = renderSequence;
@@ -1006,6 +1063,7 @@
       return root;
     }
     let result;
+    const groups = new Map();
     const paramsFor = (page) => {
       const params = new URLSearchParams({ page: String(page) });
       if (state.onlineSource !== "all")
@@ -1018,11 +1076,12 @@
       result = await api(
         `/api/catalog/search?q=${encodeURIComponent(state.query)}`,
       );
+      mergeCatalogGroups(result.results, groups);
       root.append(
         sectionTitle(
           `“${state.query}” 的搜索结果`,
-          result.results.length,
-          "聚合已启用的影视源",
+          groups.size,
+          "同名影片已聚合，点击可切换影视源",
         ),
       );
     } else {
@@ -1105,6 +1164,7 @@
         `/api/catalog/discover?${paramsFor(state.onlinePage)}`,
       );
       state.onlinePage = result.page || state.onlinePage;
+      mergeCatalogGroups(result.results, groups);
     }
     if (result.errors?.length)
       root.append(
@@ -1119,11 +1179,20 @@
         ),
       );
     const grid = make("div", { class: "media-grid" });
-    let cardCount = result.results.length;
-    result.results.forEach((item, index) =>
-      grid.append(catalogCard(item, index)),
-    );
-    if (!result.results.length)
+    const cards = new Map();
+    const appendGroup = (group) => {
+      const key = catalogGroupKey(group);
+      let card = cards.get(key);
+      if (!card) {
+        card = catalogCard(group, cards.size);
+        cards.set(key, card);
+        grid.append(card);
+      } else {
+        updateCatalogCard(card, group);
+      }
+    };
+    groups.forEach(appendGroup);
+    if (!cards.size)
       grid.append(
         empty(
           "⌕",
@@ -1135,7 +1204,7 @@
     if (!state.query) {
       summary = make("div", {
         class: "discover-summary",
-        text: `已显示 ${cardCount} / ${n(result.total, cardCount)} 部影片`,
+        text: `已显示 ${cards.size} 组影片`,
       });
       root.append(summary);
     }
@@ -1164,11 +1233,9 @@
           );
           if (sequence !== renderSequence) return;
           state.onlinePage += 1;
-          page.results.forEach((item) =>
-            grid.append(catalogCard(item, cardCount++)),
-          );
-          summary.textContent =
-            `已显示 ${cardCount} / ${n(page.total, cardCount)} 部影片`;
+          const changed = mergeCatalogGroups(page.results, groups);
+          changed.forEach((key) => appendGroup(groups.get(key)));
+          summary.textContent = `已显示 ${cards.size} 组影片`;
           if (state.onlinePage >= page.page_count) {
             state.onlineObserver?.disconnect();
             state.onlineObserver = null;
@@ -1215,12 +1282,50 @@
     }
     const sequence = n(dialog.dataset.sequence) + 1;
     dialog.dataset.sequence = String(sequence);
+    const sources = item.sources?.length
+      ? item.sources
+      : [{ source_id: item.source_id, id: item.id ?? item.media_id, source_name: item.source_name }];
+    const sourceBar =
+      sources.length > 1
+        ? make("div", { class: "catalog-source-switch" }, [
+            make("span", { class: "discover-filter-label", text: "影视源" }),
+            make(
+              "div",
+              { class: "discover-filter-chips" },
+              sources.map((source) => {
+                const sourceId = source.id ?? source.media_id;
+                const active =
+                  String(source.source_id) === String(item.source_id) &&
+                  String(sourceId) === String(item.id ?? item.media_id);
+                return make("button", {
+                  type: "button",
+                  class: `filter-chip${active ? " active" : ""}`,
+                  "aria-pressed": String(active),
+                  text: source.source_name || `影视源 ${source.source_id}`,
+                  on: {
+                    click: () =>
+                      openCatalogDetail({
+                        ...item,
+                        source_id: source.source_id,
+                        id: sourceId,
+                        source_name: source.source_name,
+                        sources,
+                      }),
+                  },
+                });
+              }),
+            ),
+          ])
+        : null;
     dialog.replaceChildren(
-      make("div", { class: "dialog-top" }, [
-        make("h2", { id: "catalog-detail-title", text: item.title }),
-        icon("✕", "关闭影片详情", () => dialog.close()),
-      ]),
-      make("p", { class: "hint", text: "正在读取影片信息…" }),
+      ...[
+        make("div", { class: "dialog-top" }, [
+          make("h2", { id: "catalog-detail-title", text: item.title }),
+          icon("✕", "关闭影片详情", () => dialog.close()),
+        ]),
+        sourceBar,
+        make("p", { class: "hint", text: "正在读取影片信息…" }),
+      ].filter(Boolean),
     );
     if (!dialog.open) dialog.showModal();
     try {

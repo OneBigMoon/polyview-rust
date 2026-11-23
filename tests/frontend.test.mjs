@@ -753,17 +753,183 @@ test("discover appends the next page from the load-more sentinel", async () => {
   const more = flatten(page).find(
     (node) => node.className === "discover-more",
   );
-  assert.equal(summary.textContent, "已显示 1 / 2 部影片");
+  assert.equal(summary.textContent, "已显示 1 组影片");
   assert.ok(more, "missing load-more sentinel");
   await more.listeners.click[0]();
   assert.equal(
     flatten(page).filter((node) => node.className === "media-card").length,
     2,
   );
-  assert.equal(summary.textContent, "已显示 2 / 2 部影片");
+  assert.equal(summary.textContent, "已显示 2 组影片");
   assert.equal(
     flatten(page).find((node) => node.className === "discover-end")
       .textContent,
     "已经到底了",
+  );
+});
+test("discover merges the same media from multiple sources into one card", async () => {
+  const app = environment({
+    "/api/sources": [
+      { id: 1, name: "甲源", enabled: true },
+      { id: 2, name: "乙源", enabled: true },
+    ],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": {
+      results: [
+        {
+          id: "11",
+          source_id: 1,
+          source_name: "甲源",
+          title: "同一部电影",
+          year: "2025",
+          remark: "正片",
+        },
+        {
+          id: "22",
+          source_id: 2,
+          source_name: "乙源",
+          title: "同一部电影",
+          year: "2025",
+          remark: "高清",
+        },
+        {
+          id: "33",
+          source_id: 1,
+          source_name: "甲源",
+          title: "另一部电影",
+          year: "2024",
+        },
+      ],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 3,
+    },
+  });
+  const page = await app.online();
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const cards = flatten(page).filter(
+    (node) => node.className === "media-card",
+  );
+  assert.equal(cards.length, 2);
+  const merged = cards.find((card) => card._sourceBadge.hidden === false);
+  assert.ok(merged, "same media should show an aggregation badge");
+  assert.equal(merged._sourceBadge.textContent, "聚合 2 源");
+  assert.match(merged._meta.textContent, /2 个影视源 · 点击切换/);
+  assert.equal(
+    cards.find((card) => card._sourceBadge.hidden === true)._meta.textContent,
+    "2024 · 甲源",
+  );
+});
+test("a later discover page adds its source to an existing group", async () => {
+  const app = environment({
+    "/api/sources": [
+      { id: 1, name: "甲源", enabled: true },
+      { id: 2, name: "乙源", enabled: true },
+    ],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": {
+      results: [
+        {
+          id: "11",
+          source_id: 1,
+          source_name: "甲源",
+          title: "同一部电影",
+          year: "2025",
+        },
+      ],
+      errors: [],
+      page: 1,
+      page_count: 2,
+      total: 2,
+    },
+    "/api/catalog/discover?page=2": {
+      results: [
+        {
+          id: "22",
+          source_id: 2,
+          source_name: "乙源",
+          title: "同一部电影",
+          year: "2025",
+        },
+      ],
+      errors: [],
+      page: 2,
+      page_count: 2,
+      total: 2,
+    },
+  });
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const page = await app.online();
+  const more = flatten(page).find(
+    (node) => node.className === "discover-more",
+  );
+  await more.listeners.click[0]();
+  const cards = flatten(page).filter(
+    (node) => node.className === "media-card",
+  );
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0]._sourceBadge.textContent, "聚合 2 源");
+  assert.equal(cards[0]._sourceBadge.hidden, false);
+  assert.match(cards[0]._meta.textContent, /2 个影视源 · 点击切换/);
+  assert.equal(
+    flatten(page).find((node) => node.className === "discover-summary")
+      .textContent,
+    "已显示 1 组影片",
+  );
+});
+
+test("aggregated details switch between sources", async () => {
+  const detail = (sourceId, id) => ({
+    id,
+    source_id: sourceId,
+    title: "同一部电影",
+    source_name: sourceId === 1 ? "甲源" : "乙源",
+    description: "",
+    groups: [],
+  });
+  const app = environment({
+    "/api/catalog/1/detail?id=11": detail(1, "11"),
+    "/api/catalog/2/detail?id=22": detail(2, "22"),
+    "/api/tracking": [],
+  });
+  await app.openCatalogDetail({
+    id: "11",
+    source_id: 1,
+    title: "同一部电影",
+    sources: [
+      { source_id: 1, id: "11", source_name: "甲源" },
+      { source_id: 2, id: "22", source_name: "乙源" },
+    ],
+  });
+  const dialog = app.elements.get("catalog-dialog");
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const chips = flatten(dialog).filter(
+    (node) => node.className === "filter-chip active",
+  );
+  assert.deepEqual(
+    chips.map((chip) => chip.textContent),
+    ["甲源"],
+  );
+  const second = flatten(dialog).find(
+    (node) => node.className === "filter-chip" && node.textContent === "乙源",
+  );
+  assert.ok(second, "details expose the second source");
+  await second.listeners.click[0]();
+  assert.ok(
+    app.calls.some(
+      (call) => call.url === "/api/catalog/2/detail?id=22",
+    ),
+    "switching sources loads the other source's detail",
+  );
+  const active = flatten(dialog).filter(
+    (node) => node.className === "filter-chip active",
+  );
+  assert.deepEqual(
+    active.map((chip) => chip.textContent),
+    ["乙源"],
   );
 });
