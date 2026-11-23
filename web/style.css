@@ -1400,19 +1400,10 @@ textarea {
   padding: 13px 16px;
   border-bottom: 1px solid var(--line);
 }
-.epg-day-nav,
 .epg-meta {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-.epg-day-nav strong {
-  min-width: 130px;
-  font-size: 13px;
-  font-weight: 600;
-  text-align: center;
-}
-.epg-meta {
   color: var(--faint);
   font-size: 11.5px;
 }
@@ -1563,9 +1554,6 @@ textarea {
 .epg-program.current small {
   color: var(--accent);
   opacity: 0.72;
-}
-.epg-program.past {
-  opacity: 0.5;
 }
 .epg-nodata {
   position: absolute;

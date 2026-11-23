@@ -7,8 +7,6 @@
     user: null,
     page: "online",
     query: "",
-    liveGroup: "all",
-    liveDay: 0,
     epg: null,
     filter: "all",
     library: [],
@@ -549,35 +547,23 @@
     if ($("player-dialog").open) $("player-dialog").close();
   }
   const EPG_MINUTE_PX = 2;
-  function liveDayStart(offset = 0) {
-    const date = new Date();
-    date.setHours(0, 0, 0, 0);
-    return Math.floor(date.getTime() / 1000) + offset * 86400;
+  function guideStart(now = Date.now() / 1000) {
+    return Math.floor(now / 300) * 300;
   }
   function clockTime(timestamp) {
     const date = new Date(timestamp * 1000);
     return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
   }
-  function liveDayLabel(start, offset) {
-    const date = new Date(start * 1000);
-    const name = offset === 0 ? "今天" : offset === -1 ? "昨天" : offset === 1 ? "明天" : "";
-    return `${date.getMonth() + 1}月${date.getDate()}日 ${name}`.trim();
-  }
   async function refreshEpg() {
     try {
       const result = await api("/api/epg/refresh", { method: "POST" });
       toast(`节目单已更新：${result.matched_channels} 个频道`);
-      state.liveDay = 0;
       await render();
     } catch (error) {
       toast(error.message, true);
     }
   }
-  async function changeLiveDay(delta) {
-    state.liveDay += delta;
-    await render();
-  }
-  function guideView(start, end) {
+  function guideView(start, end, now = Math.floor(Date.now() / 1000)) {
     const guide = state.epg || {};
     const programs = Array.isArray(guide.programs) ? guide.programs : [];
     const byChannel = new Map();
@@ -604,7 +590,7 @@
         `subtle small-button${state.liveGroup === "all" ? " active" : ""}`,
         () => {
           state.liveGroup = "all";
-          $("live-guide").replaceChildren(guideView(start, end));
+          $("live-guide").replaceChildren(guideView(start, end, now));
         },
       ),
       ...groups.map((group) =>
@@ -613,28 +599,20 @@
           `subtle small-button${state.liveGroup === group ? " active" : ""}`,
           () => {
             state.liveGroup = group;
-            $("live-guide").replaceChildren(guideView(start, end));
+            $("live-guide").replaceChildren(guideView(start, end, now));
           },
         ),
       ),
     ]);
-    const now = Math.floor(Date.now() / 1000);
     const updated = Number(guide.updated_at) || 0;
     const toolbar = make("div", { class: "epg-toolbar" }, [
-      make("div", { class: "epg-day-nav" }, [
-        button("‹", "subtle small-button", () => changeLiveDay(-1), {
-          "aria-label": "前一天",
-        }),
-        make("strong", { text: liveDayLabel(start, state.liveDay) }),
-        button("›", "subtle small-button", () => changeLiveDay(1), {
-          "aria-label": "后一天",
-        }),
-      ]),
       make("div", { class: "epg-meta" }, [
         make("span", {
-          text: updated
-            ? `节目单更新于 ${clockTime(updated)} · ${guide.matched_channels || 0} 个频道`
-            : "尚未更新节目单",
+          text: `从当前节目开始 · ${
+            updated
+              ? `节目单更新于 ${clockTime(updated)} · ${guide.matched_channels || 0} 个频道`
+              : "尚未更新节目单"
+          }`,
         }),
         admin() ? button("刷新节目单", "subtle small-button", refreshEpg) : null,
       ]),
@@ -650,12 +628,16 @@
       class: "epg-track epg-ruler",
       style: `width:${1440 * EPG_MINUTE_PX}px`,
     });
-    for (let hour = 0; hour < 24; hour += 1) {
+    for (
+      let hour = Math.ceil(start / 3600) * 3600;
+      hour < end;
+      hour += 3600
+    ) {
       ruler.append(
         make("span", {
           class: "epg-hour",
-          style: `left:${hour * 60 * EPG_MINUTE_PX}px`,
-          text: `${String(hour).padStart(2, "0")}:00`,
+          style: `left:${((hour - start) / 60) * EPG_MINUTE_PX}px`,
+          text: clockTime(hour),
         }),
       );
     }
@@ -689,7 +671,9 @@
         class: "epg-track",
         style: `width:${1440 * EPG_MINUTE_PX}px`,
       });
-      const items = byChannel.get(channel.id) || [];
+      const items = (byChannel.get(channel.id) || []).filter(
+        (program) => program.stop > now,
+      );
       if (!items.length) {
         track.append(make("span", { class: "epg-nodata", text: "暂无节目单" }));
       }
@@ -703,7 +687,6 @@
         const classes = [
           "epg-program",
           now >= program.start && now < program.stop ? "current" : "",
-          program.stop <= now ? "past" : "",
         ]
           .filter(Boolean)
           .join(" ");
@@ -751,10 +734,11 @@
   async function live() {
     const result = await api("/api/channels");
     state.channels = Array.isArray(result) ? result : result?.channels || [];
-    const start = liveDayStart(state.liveDay);
+    const now = Math.floor(Date.now() / 1000);
+    const start = guideStart(now);
     const end = start + 86400;
     try {
-      state.epg = await api(`/api/epg?start=${start}&end=${end}`);
+      state.epg = await api(`/api/epg?start=${now - 6 * 3600}&end=${end}`);
     } catch (error) {
       state.epg = { programs: [], updated_at: 0, error: error.message };
     }
@@ -783,7 +767,7 @@
       return root;
     }
     const guide = make("div", { id: "live-guide" });
-    guide.append(guideView(start, end));
+    guide.append(guideView(start, end, now));
     root.append(guide);
     return root;
   }
@@ -1594,7 +1578,7 @@
       }),
     ]);
     let config = {
-      url: "http://epg.51zmt.top:8000/e.xml\nhttps://epg.112114.xyz/pp.xml",
+      url: "http://epg.51zmt.top:8000/e.xml\nhttps://epg.112114.xyz/pp.xml\nhttps://live.fanmingming.com/e.xml\nhttps://raw.githubusercontent.com/litiande03/epg/master/pl.xml.gz",
       programs: 0,
       updated_at: 0,
     };
@@ -1635,7 +1619,7 @@
             "XMLTV 地址（每行一个）",
             make("textarea", {
               name: "url",
-              rows: "3",
+              rows: "4",
               required: true,
               maxlength: 4096,
               placeholder: "http://epg.51zmt.top:8000/e.xml",
@@ -2055,16 +2039,6 @@
                   : await settings();
       if (sequence !== renderSequence) return;
       main.replaceChildren(page);
-      if (pageName === "live" && state.liveDay === 0) {
-        const scroller = main.querySelector(".epg-scroll");
-        if (scroller) {
-          const start = liveDayStart(0);
-          scroller.scrollLeft = Math.max(
-            0,
-            ((Date.now() / 1000 - start) / 60) * EPG_MINUTE_PX - 240,
-          );
-        }
-      }
       if (pageName === "downloads")
         state.poll = setInterval(
           () => refreshDownloads().catch((e) => toast(e.message, true)),

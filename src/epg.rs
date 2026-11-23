@@ -8,15 +8,42 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
+use flate2::read::GzDecoder;
 use roxmltree::{Document, ParsingOptions};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Read,
+};
 
 const DEFAULT_EPG_URLS: &[&str] = &[
     "http://epg.51zmt.top:8000/e.xml",
     "https://epg.112114.xyz/pp.xml",
+    "https://live.fanmingming.com/e.xml",
+    "https://raw.githubusercontent.com/litiande03/epg/master/pl.xml.gz",
+];
+const CHANNEL_ALIASES: &[(&str, &str)] = &[
+    ("cctv世界地理", "世界地理"),
+    ("cctv兵器科技", "兵器科技"),
+    ("cctv卫生健康", "卫生健康"),
+    ("cctv女性时尚", "女性时尚"),
+    ("cctv风云音乐", "风云音乐"),
+    ("cctv9纪录", "CCTV9"),
+    ("东莞新闻综合", "东莞新闻"),
+    ("广州综合", "广州新闻"),
+    ("河北4k", "河北卫视"),
+    ("苏州4k", "苏州新闻综合"),
+    ("青岛qtv2", "青岛TV2"),
+    ("青岛qtv5", "青岛TV5"),
+    ("凤凰香港", "凤凰中文"),
+    ("cgtn西语", "CGTN西班牙语"),
+    ("人间卫视", "人間衛視"),
+    ("无线新闻", "無綫新聞台"),
+    ("好消息综合台", "好消息"),
+    ("cgtn阿语", "CGTN阿拉伯语"),
+    ("法国24", "France 24"),
 ];
 const EPG_STALE_SECONDS: i64 = 6 * 60 * 60;
 
@@ -269,11 +296,33 @@ async fn fetch_epg(client: &reqwest::Client, url: &str) -> Result<ParsedEpg, App
             format!("EPG source returned HTTP {}", response.status()),
         ));
     }
-    let body = response
-        .text()
+    let bytes = response
+        .bytes()
         .await
         .map_err(|error| AppError(axum::http::StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let body = decode_epg_body(&bytes)?;
     parse_xmltv(&body)
+}
+
+fn decode_epg_body(bytes: &[u8]) -> Result<String, AppError> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut decoded = String::new();
+        decoder.read_to_string(&mut decoded).map_err(|error| {
+            AppError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("Invalid gzipped EPG: {error}"),
+            )
+        })?;
+        Ok(decoded)
+    } else {
+        String::from_utf8(bytes.to_vec()).map_err(|error| {
+            AppError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("Invalid EPG encoding: {error}"),
+            )
+        })
+    }
 }
 
 fn setting(conn: &Connection, key: &str) -> Result<String, AppError> {
@@ -389,9 +438,15 @@ fn find_channel(
     aliases: &HashMap<String, String>,
     canonical_aliases: &HashMap<String, String>,
 ) -> Option<String> {
+    let key = normalize(name);
+    let key = CHANNEL_ALIASES
+        .iter()
+        .find(|(local, _)| *local == key)
+        .map(|(_, target)| normalize(target))
+        .unwrap_or(key);
     aliases
-        .get(&normalize(name))
-        .or_else(|| canonical_aliases.get(&canonical(name)))
+        .get(&key)
+        .or_else(|| canonical_aliases.get(&canonical(&key)))
         .cloned()
 }
 
@@ -480,6 +535,8 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
 
     #[test]
     fn xmltv_times_convert_to_utc() {
@@ -487,6 +544,14 @@ mod tests {
         assert_eq!(parse_xmltv_time("19700101080000 +0800"), Some(0));
         assert_eq!(parse_xmltv_time("19700101000000 Z"), Some(0));
         assert_eq!(parse_xmltv_time("bad"), None);
+    }
+    #[test]
+    fn gzipped_epg_bodies_are_decoded() {
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"<tv></tv>").unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert_eq!(decode_epg_body(&compressed).unwrap(), "<tv></tv>");
+        assert_eq!(decode_epg_body(b"<tv></tv>").unwrap(), "<tv></tv>");
     }
 
     #[test]
@@ -506,6 +571,28 @@ mod tests {
         assert_eq!(
             find_channel("东方卫视 4K", &aliases, &canonical),
             Some("2".into())
+        );
+    }
+    #[test]
+    fn curated_channel_aliases_match_xmltv_names() {
+        let body = r#"<?xml version="1.0"?>
+<tv>
+<channel id="1649"><display-name>世界地理</display-name></channel>
+<channel id="青岛tv2"><display-name>青岛TV2</display-name></channel>
+<channel id="CGTN西班牙语"><display-name>CGTN西班牙语</display-name></channel>
+</tv>"#;
+        let parsed = parse_xmltv(body).unwrap();
+        assert_eq!(
+            find_channel("CCTV 世界地理", &parsed.aliases, &parsed.canonical),
+            Some("1649".into())
+        );
+        assert_eq!(
+            find_channel("青岛 QTV-2", &parsed.aliases, &parsed.canonical),
+            Some("青岛tv2".into())
+        );
+        assert_eq!(
+            find_channel("CGTN 西语", &parsed.aliases, &parsed.canonical),
+            Some("CGTN西班牙语".into())
         );
     }
     #[test]

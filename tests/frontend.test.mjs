@@ -485,7 +485,7 @@ test("native live HLS starts playback without a separate play click", () => {
   app.closePlayer();
 });
 
-test("the guide lays programmes on a timeline and filters channels by group", () => {
+test("the guide starts at the current programme and hides past programmes", () => {
   const app = environment();
   app.state.channels = [
     { id: 1, name: "CCTV-1 综合", group_name: "央视", sources: [{ url: "https://a.example/1.m3u8" }] },
@@ -495,12 +495,17 @@ test("the guide lays programmes on a timeline and filters channels by group", ()
     updated_at: 0,
     matched_channels: 1,
     programs: [
+      { channel_id: 1, start: 0, stop: 3600, title: "已过期节目", description: "" },
       { channel_id: 1, start: 3600, stop: 7200, title: "新闻联播", description: "每日新闻" },
+      { channel_id: 1, start: 7200, stop: 10800, title: "后续节目", description: "" },
     ],
   };
-  const view = app.guideView(0, 86400);
+  const view = app.guideView(3600, 14400, 5400);
   assert.match(view.textContent, /CCTV-1 综合/);
   assert.match(view.textContent, /新闻联播/);
+  assert.match(view.textContent, /后续节目/);
+  assert.doesNotMatch(view.textContent, /已过期节目/);
+  assert.match(view.textContent, /从当前节目开始/);
   assert.match(view.textContent, /安徽卫视/);
   const programs = [];
   const walk = (node) => {
@@ -510,11 +515,13 @@ test("the guide lays programmes on a timeline and filters channels by group", ()
     });
   };
   walk(view);
-  assert.equal(programs.length, 1);
-  assert.equal(programs[0].style.cssText, "left:120px;width:120px");
-  assert.equal(programs[0].attributes.title, "新闻联播 09:00-10:00\n每日新闻");
+  assert.equal(programs.length, 2);
+  assert.equal(programs[0].className, "epg-program current");
+  assert.equal(programs[0].style.cssText, "left:0px;width:120px");
+  assert.match(programs[0].attributes.title, /^新闻联播 /);
+  assert.equal(programs[1].style.cssText, "left:120px;width:120px");
   app.state.liveGroup = "央视";
-  const filtered = app.guideView(0, 86400);
+  const filtered = app.guideView(3600, 14400, 5400);
   assert.match(filtered.textContent, /CCTV-1 综合/);
   assert.doesNotMatch(filtered.textContent, /安徽卫视/);
 });
