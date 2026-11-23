@@ -17,12 +17,25 @@
     poll: null,
     onlinePage: 1,
     onlineSource: "all",
+    onlineKind: "",
     onlineCategory: "",
     onlineYear: "",
     categories: null,
     onlineObserver: null,
   };
   const esc = (v) => String(v ?? "");
+  const mediaKinds = [
+    ["", "全部"],
+    ["movie", "电影"],
+    ["series", "电视剧"],
+    ["variety", "综艺"],
+    ["anime", "动漫"],
+    ["other", "其他"],
+  ];
+  const kindLabel = (kind) =>
+    mediaKinds.find(([value]) => value === kind)?.[1] || "其他";
+  const matchesKind = (item) =>
+    !state.onlineKind || (item.kind || "other") === state.onlineKind;
   const n = (v, fallback = 0) =>
     Number.isFinite(Number(v)) ? Number(v) : fallback;
   const admin = () => state.user?.role === "admin";
@@ -952,12 +965,12 @@
       .replace(/\s+/g, " ");
     const year = String(item.year ?? "").trim();
     return title
-      ? `${title}|${year}`
+      ? `${item.kind || "other"}|${title}|${year}`
       : `id:${item.source_id}:${item.id ?? item.media_id}`;
   };
   const mergeCatalogGroups = (items, groups) => {
     const changed = new Set();
-    items.forEach((item) => {
+    items.filter(matchesKind).forEach((item) => {
       const key = catalogGroupKey(item);
       let group = groups.get(key);
       if (!group) {
@@ -987,6 +1000,7 @@
     const count = item.sources?.length || 1;
     card._sourceBadge.hidden = count < 2;
     card._sourceBadge.textContent = `聚合 ${count} 源`;
+    card._kindBadge.textContent = kindLabel(item.kind);
     card._meta.textContent = [
       item.year,
       count > 1 ? `${count} 个影视源` : item.remark,
@@ -1006,7 +1020,11 @@
       hidden: true,
       "aria-hidden": "true",
     });
-    art.append(badge);
+    const kindBadge = make("span", {
+      class: "kind-badge",
+      text: kindLabel(item.kind),
+    });
+    art.append(badge, kindBadge);
     if (item.cover) {
       const image = make("img", {
         src: item.cover,
@@ -1032,6 +1050,7 @@
       meta,
     ]);
     card._sourceBadge = badge;
+    card._kindBadge = kindBadge;
     card._meta = meta;
     updateCatalogCard(card, item);
     return card;
@@ -1072,11 +1091,39 @@
       if (state.onlineYear) params.set("year", state.onlineYear);
       return params;
     };
+    const chipRow = (label, values, current, apply) =>
+      make("div", { class: "discover-filter-row" }, [
+        make("span", { class: "discover-filter-label", text: label }),
+        make(
+          "div",
+          { class: "discover-filter-chips" },
+          values.map(([value, text]) =>
+            make("button", {
+              type: "button",
+              class: `filter-chip${value === current ? " active" : ""}`,
+              "aria-pressed": String(value === current),
+              text,
+              on: {
+                click: () => {
+                  apply(value);
+                  state.onlinePage = 1;
+                  render();
+                },
+              },
+            }),
+          ),
+        ),
+      ]);
     if (state.query) {
       result = await api(
         `/api/catalog/search?q=${encodeURIComponent(state.query)}`,
       );
       mergeCatalogGroups(result.results, groups);
+      root.append(
+        make("div", { class: "discover-filter-bar" }, [
+          chipRow("类型", mediaKinds, state.onlineKind, (value) => (state.onlineKind = value)),
+        ]),
+      );
       root.append(
         sectionTitle(
           `“${state.query}” 的搜索结果`,
@@ -1102,32 +1149,10 @@
         !state.categories.includes(state.onlineCategory)
       )
         state.onlineCategory = "";
-      const chipRow = (label, values, current, apply) =>
-        make("div", { class: "discover-filter-row" }, [
-          make("span", { class: "discover-filter-label", text: label }),
-          make(
-            "div",
-            { class: "discover-filter-chips" },
-            values.map(([value, text]) =>
-              make("button", {
-                type: "button",
-                class: `filter-chip${value === current ? " active" : ""}`,
-                "aria-pressed": String(value === current),
-                text,
-                on: {
-                  click: () => {
-                    apply(value);
-                    state.onlinePage = 1;
-                    render();
-                  },
-                },
-              }),
-            ),
-          ),
-        ]);
       const year = new Date().getFullYear();
       root.append(
         make("div", { class: "discover-filter-bar" }, [
+          chipRow("类型", mediaKinds, state.onlineKind, (value) => (state.onlineKind = value)),
           chipRow(
             "影视源",
             [
@@ -1138,9 +1163,9 @@
             (value) => (state.onlineSource = value),
           ),
           chipRow(
-            "类型",
+            "分类",
             [
-              ["", "全部类型"],
+              ["", "全部分类"],
               ...state.categories.map((category) => [category, category]),
             ],
             state.onlineCategory,

@@ -228,6 +228,7 @@ pub struct CatalogSummary {
     pub cover: String,
     pub year: String,
     pub remark: String,
+    pub kind: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -615,6 +616,21 @@ fn text(item: &Value, field: &str) -> String {
     }
 }
 
+fn media_kind(type_name: &str) -> &'static str {
+    let name = type_name.trim();
+    if name.contains("电影") || name.ends_with('片') {
+        "movie"
+    } else if name.contains("综艺") || name.contains("晚会") || name.contains("脱口秀") {
+        "variety"
+    } else if name.contains("动漫") || name.contains("动画") || name.contains("漫剧") {
+        "anime"
+    } else if name.contains('剧') {
+        "series"
+    } else {
+        "other"
+    }
+}
+
 fn summary(source: &Source, item: &Value) -> Option<CatalogSummary> {
     let id = text(item, "vod_id");
     let title = text(item, "vod_name");
@@ -636,6 +652,7 @@ fn summary(source: &Source, item: &Value) -> Option<CatalogSummary> {
         cover,
         year: text(item, "vod_year"),
         remark: text(item, "vod_remarks"),
+        kind: media_kind(&text(item, "type_name")).to_owned(),
     })
 }
 
@@ -859,6 +876,17 @@ mod tests {
             role: "admin".into(),
         }
     }
+    #[test]
+    fn media_kind_follows_cms_type_names() {
+        assert_eq!(media_kind("国产剧"), "series");
+        assert_eq!(media_kind("爽文短剧"), "series");
+        assert_eq!(media_kind("剧情片"), "movie");
+        assert_eq!(media_kind("动漫电影"), "movie");
+        assert_eq!(media_kind("国产动漫"), "anime");
+        assert_eq!(media_kind("大陆综艺"), "variety");
+        assert_eq!(media_kind("篮球"), "other");
+        assert_eq!(media_kind(""), "other");
+    }
 
     async fn fixture() -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new()
@@ -978,6 +1006,7 @@ mod tests {
         assert_eq!(result.results[0].id, "42");
         assert_eq!(result.results[0].year, "2026");
         assert_eq!(result.results[0].source_name, "good");
+        assert_eq!(result.results[0].kind, "series");
         assert_eq!(result.results[0].cover, format!("{base}/poster.jpg"));
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].source_id, 2);

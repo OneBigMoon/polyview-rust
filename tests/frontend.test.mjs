@@ -693,15 +693,16 @@ test("discover aggregates sources and offers type and year filters", async () =>
   );
   assert.deepEqual(
     rows.map((row) => row.children[0].textContent),
-    ["影视源", "类型", "年份"],
+    ["类型", "影视源", "分类", "年份"],
   );
   const chips = rows.flatMap((row) => row.children[1].children);
   const labels = chips
     .filter((node) => node.tagName === "BUTTON")
     .map((node) => node.textContent);
-  assert.ok(labels.includes("全部影视源"), JSON.stringify(labels));
-  assert.ok(labels.includes("甲源"), JSON.stringify(labels));
-  assert.ok(labels.includes("全部类型"), JSON.stringify(labels));
+  assert.ok(labels.includes("全部"), JSON.stringify(labels));
+  assert.ok(labels.includes("电影"), JSON.stringify(labels));
+  assert.ok(labels.includes("电视剧"), JSON.stringify(labels));
+  assert.ok(labels.includes("全部分类"), JSON.stringify(labels));
   assert.ok(labels.includes("全部年份"), JSON.stringify(labels));
   assert.equal(
     chips.find((chip) => chip.textContent === "全部影视源").attributes[
@@ -821,6 +822,51 @@ test("discover merges the same media from multiple sources into one card", async
     cards.find((card) => card._sourceBadge.hidden === true)._meta.textContent,
     "2024 · 甲源",
   );
+});
+test("movie and series with the same title and year stay separate", async () => {
+  const results = [
+    {
+      id: "11",
+      source_id: 1,
+      source_name: "甲源",
+      title: "同一部电影",
+      year: "2025",
+      kind: "movie",
+    },
+    {
+      id: "22",
+      source_id: 2,
+      source_name: "乙源",
+      title: "同一部电影",
+      year: "2025",
+      kind: "series",
+    },
+  ];
+  const app = environment({
+    "/api/sources": [
+      { id: 1, name: "甲源", enabled: true },
+      { id: 2, name: "乙源", enabled: true },
+    ],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": {
+      results,
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 2,
+    },
+  });
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const kinds = (page) =>
+    flatten(page)
+      .filter((node) => node.className === "media-card")
+      .map((card) => card._kindBadge.textContent);
+  assert.deepEqual(kinds(await app.online()), ["电影", "电视剧"]);
+  app.state.onlineKind = "movie";
+  assert.deepEqual(kinds(await app.online()), ["电影"]);
+  app.state.onlineKind = "series";
+  assert.deepEqual(kinds(await app.online()), ["电视剧"]);
 });
 test("a later discover page adds its source to an existing group", async () => {
   const app = environment({
