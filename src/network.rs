@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{future::Future, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, future::Future, path::PathBuf, time::Duration};
 use tokio::{io::AsyncWriteExt, task::JoinHandle};
 use url::Url;
 
@@ -134,51 +134,75 @@ async fn import_channels(
     let channels = parse_playlist(&input.playlist)?;
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
-    let mut new_channels = 0;
+    let mut groups: BTreeMap<(String, String), Vec<&PlaylistChannel>> = BTreeMap::new();
     for channel in &channels {
-        let existing = tx
+        groups
+            .entry((channel.name.clone(), channel.group_name.clone()))
+            .or_default()
+            .push(channel);
+    }
+    let mut new_channels = 0;
+    for ((name, group_name), entries) in groups {
+        let first = entries[0];
+        let mut id = tx
             .query_row(
-                "SELECT id FROM channels WHERE url=?1",
-                [&channel.url],
+                "SELECT id FROM channels WHERE name=?1 AND group_name=?2 ORDER BY id LIMIT 1",
+                params![name, group_name],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
-        let id = if let Some(id) = existing {
-            tx.execute(
-                "UPDATE channels SET name=?1,group_name=?2,logo=?3 WHERE id=?4",
-                params![channel.name, channel.group_name, channel.logo, id],
-            )?;
-            id
-        } else if let Some(id) = tx
-            .query_row(
-                "SELECT id FROM channels WHERE name=?1 AND group_name=?2 ORDER BY id LIMIT 1",
-                params![channel.name, channel.group_name],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        {
-            tx.execute(
-                "UPDATE channels SET logo=CASE WHEN logo='' THEN ?1 ELSE logo END WHERE id=?2",
-                params![channel.logo, id],
-            )?;
+        let mut migrate = false;
+        if id.is_none() {
+            for entry in &entries {
+                if let Some(found) = tx
+                    .query_row(
+                        "SELECT id FROM channels WHERE url=?1",
+                        [&entry.url],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                {
+                    id = Some(found);
+                    migrate = true;
+                    break;
+                }
+            }
+        }
+        let id = if let Some(id) = id {
+            if migrate {
+                tx.execute(
+                    "UPDATE channels SET name=?1,group_name=?2,logo=?3 WHERE id=?4",
+                    params![name, group_name, first.logo, id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE channels SET logo=CASE WHEN logo='' THEN ?1 ELSE logo END WHERE id=?2",
+                    params![first.logo, id],
+                )?;
+            }
             id
         } else {
             tx.execute(
                 "INSERT INTO channels(name,group_name,logo,url) VALUES (?1,?2,?3,?4)",
-                params![channel.name, channel.group_name, channel.logo, channel.url],
+                params![name, group_name, first.logo, first.url],
             )?;
             new_channels += 1;
             tx.last_insert_rowid()
         };
-        let position: i64 = tx.query_row(
+        let mut position: i64 = tx.query_row(
             "SELECT COALESCE(MAX(position),-1)+1 FROM channel_sources WHERE channel_id=?1",
             [id],
             |row| row.get(0),
         )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO channel_sources(channel_id,url,label,position) VALUES (?1,?2,'',?3)",
-            params![id, channel.url, position],
-        )?;
+        for entry in entries {
+            if tx.execute(
+                "INSERT OR IGNORE INTO channel_sources(channel_id,url,label,position) VALUES (?1,?2,'',?3)",
+                params![id, entry.url, position],
+            )? > 0
+            {
+                position += 1;
+            }
+        }
     }
     tx.commit()?;
     Ok(Json(
@@ -982,6 +1006,35 @@ mod tests {
         assert_eq!(cctv1.sources.len(), 2);
         assert_eq!(cctv1.sources[0].url, "https://a.example/1.m3u8");
         assert_eq!(cctv1.sources[1].url, "https://b.example/1.m3u8");
+    }
+
+    #[tokio::test]
+    async fn channel_import_merges_same_name_when_one_url_already_exists() {
+        let (_temp, state) = state();
+        let admin = AuthUser {
+            id: 1,
+            username: "admin".into(),
+            role: "admin".into(),
+        };
+        let import = |playlist: &'static str| {
+            import_channels(
+                State(state.clone()),
+                admin.clone(),
+                Json(PlaylistInput {
+                    playlist: playlist.into(),
+                }),
+            )
+        };
+        let _ = import("#EXTM3U\n#EXTINF:-1 group-title=\"旧\",旧频道\nhttps://a.example/1.m3u8\n")
+            .await
+            .unwrap();
+        let _ = import("#EXTM3U\n#EXTINF:-1 group-title=\"央视\",CCTV-1\nhttps://b.example/1.m3u8\n#EXTINF:-1 group-title=\"央视\",CCTV-1\nhttps://a.example/1.m3u8\n")
+            .await
+            .unwrap();
+        let Json(channels) = list_channels(State(state), admin).await.unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name, "CCTV-1");
+        assert_eq!(channels[0].sources.len(), 2);
     }
 
     #[test]
