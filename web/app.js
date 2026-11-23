@@ -563,6 +563,10 @@
       toast(error.message, true);
     }
   }
+  function channelsWithPrograms(channels = state.channels, programs = state.epg?.programs || []) {
+    const covered = new Set(programs.map((program) => program.channel_id));
+    return channels.filter((channel) => covered.has(channel.id));
+  }
   function guideView(start, end, now = Math.floor(Date.now() / 1000)) {
     const guide = state.epg || {};
     const programs = Array.isArray(guide.programs) ? guide.programs : [];
@@ -733,7 +737,8 @@
   }
   async function live() {
     const result = await api("/api/channels");
-    state.channels = Array.isArray(result) ? result : result?.channels || [];
+    const allChannels = Array.isArray(result) ? result : result?.channels || [];
+    state.channels = allChannels;
     const now = Math.floor(Date.now() / 1000);
     const start = guideStart(now);
     const end = start + 86400;
@@ -742,6 +747,7 @@
     } catch (error) {
       state.epg = { programs: [], updated_at: 0, error: error.message };
     }
+    state.channels = channelsWithPrograms();
     const root = make(
       "div",
       {},
@@ -754,14 +760,17 @@
       ),
     );
     if (!state.channels.length) {
+      const hasChannels = allChannels.length > 0;
       root.append(
         empty(
           "◉",
-          "还没有直播频道",
-          admin()
-            ? "导入一个 M3U 播放列表，把电视带回家。"
-            : "请让管理员导入 M3U 播放列表。",
-          admin() ? button("导入 M3U", "primary", importM3u) : null,
+          hasChannels ? "节目单暂不可用" : "还没有直播频道",
+          hasChannels
+            ? "当前频道还没有可显示的节目，请刷新节目单或稍后再试。"
+            : admin()
+              ? "导入一个 M3U 播放列表，把电视带回家。"
+              : "请让管理员导入 M3U 播放列表。",
+          admin() && !hasChannels ? button("导入 M3U", "primary", importM3u) : null,
         ),
       );
       return root;

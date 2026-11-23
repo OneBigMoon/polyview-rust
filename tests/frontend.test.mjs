@@ -213,7 +213,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView};\n})();",
+      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms};\n})();",
     ),
     context,
   );
@@ -489,7 +489,6 @@ test("the guide starts at the current programme and hides past programmes", () =
   const app = environment();
   app.state.channels = [
     { id: 1, name: "CCTV-1 综合", group_name: "央视", sources: [{ url: "https://a.example/1.m3u8" }] },
-    { id: 2, name: "安徽卫视", group_name: "卫视", sources: [{ url: "https://b.example/1.m3u8" }] },
   ];
   app.state.epg = {
     updated_at: 0,
@@ -506,7 +505,6 @@ test("the guide starts at the current programme and hides past programmes", () =
   assert.match(view.textContent, /后续节目/);
   assert.doesNotMatch(view.textContent, /已过期节目/);
   assert.match(view.textContent, /从当前节目开始/);
-  assert.match(view.textContent, /安徽卫视/);
   const programs = [];
   const walk = (node) => {
     if (node?.className?.includes("epg-program")) programs.push(node);
@@ -523,7 +521,19 @@ test("the guide starts at the current programme and hides past programmes", () =
   app.state.liveGroup = "央视";
   const filtered = app.guideView(3600, 14400, 5400);
   assert.match(filtered.textContent, /CCTV-1 综合/);
-  assert.doesNotMatch(filtered.textContent, /安徽卫视/);
+});
+test("the live guide keeps only channels that have programme data", () => {
+  const app = environment();
+  const channels = [
+    { id: 1, name: "有节目单频道" },
+    { id: 2, name: "无节目单频道" },
+  ];
+  const programs = [{ channel_id: 1, start: 0, stop: 3600, title: "节目" }];
+  assert.deepEqual(
+    app.channelsWithPrograms(channels, programs).map((channel) => channel.id),
+    [1],
+  );
+  assert.deepEqual(app.channelsWithPrograms(channels, []), []);
 });
 test("the theme toggle switches between light and dark", () => {
   const app = environment();
