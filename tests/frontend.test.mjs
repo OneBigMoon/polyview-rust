@@ -724,3 +724,46 @@ test("discover aggregates sources and offers type and year filters", async () =>
   assert.match(filtered.url, /category=%E5%9B%BD%E4%BA%A7%E5%89%A7/);
   assert.match(filtered.url, /year=2025/);
 });
+
+test("discover appends the next page from the load-more sentinel", async () => {
+  const app = environment({
+    "/api/sources": [{ id: 1, name: "甲源", enabled: true }],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": {
+      results: [{ title: "第一部", source_name: "甲源" }],
+      errors: [],
+      page: 1,
+      page_count: 2,
+      total: 2,
+    },
+    "/api/catalog/discover?page=2": {
+      results: [{ title: "第二部", source_name: "甲源" }],
+      errors: [],
+      page: 2,
+      page_count: 2,
+      total: 2,
+    },
+  });
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const page = await app.online();
+  const summary = flatten(page).find(
+    (node) => node.className === "discover-summary",
+  );
+  const more = flatten(page).find(
+    (node) => node.className === "discover-more",
+  );
+  assert.equal(summary.textContent, "已显示 1 / 2 部影片");
+  assert.ok(more, "missing load-more sentinel");
+  await more.listeners.click[0]();
+  assert.equal(
+    flatten(page).filter((node) => node.className === "media-card").length,
+    2,
+  );
+  assert.equal(summary.textContent, "已显示 2 / 2 部影片");
+  assert.equal(
+    flatten(page).find((node) => node.className === "discover-end")
+      .textContent,
+    "已经到底了",
+  );
+});

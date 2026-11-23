@@ -20,6 +20,7 @@
     onlineCategory: "",
     onlineYear: "",
     categories: null,
+    onlineObserver: null,
   };
   const esc = (v) => String(v ?? "");
   const n = (v, fallback = 0) =>
@@ -979,6 +980,9 @@
     ]);
   }
   async function online() {
+    const sequence = renderSequence;
+    state.onlineObserver?.disconnect();
+    state.onlineObserver = null;
     const configured = await api("/api/sources");
     const enabled = configured.filter((source) => source.enabled);
     const root = make(
@@ -1002,6 +1006,14 @@
       return root;
     }
     let result;
+    const paramsFor = (page) => {
+      const params = new URLSearchParams({ page: String(page) });
+      if (state.onlineSource !== "all")
+        params.set("source_id", state.onlineSource);
+      if (state.onlineCategory) params.set("category", state.onlineCategory);
+      if (state.onlineYear) params.set("year", state.onlineYear);
+      return params;
+    };
     if (state.query) {
       result = await api(
         `/api/catalog/search?q=${encodeURIComponent(state.query)}`,
@@ -1089,12 +1101,10 @@
           ),
         ]),
       );
-      const params = new URLSearchParams({ page: String(state.onlinePage) });
-      if (state.onlineSource !== "all")
-        params.set("source_id", state.onlineSource);
-      if (state.onlineCategory) params.set("category", state.onlineCategory);
-      if (state.onlineYear) params.set("year", state.onlineYear);
-      result = await api(`/api/catalog/discover?${params}`);
+      result = await api(
+        `/api/catalog/discover?${paramsFor(state.onlinePage)}`,
+      );
+      state.onlinePage = result.page || state.onlinePage;
     }
     if (result.errors?.length)
       root.append(
@@ -1109,6 +1119,7 @@
         ),
       );
     const grid = make("div", { class: "media-grid" });
+    let cardCount = result.results.length;
     result.results.forEach((item, index) =>
       grid.append(catalogCard(item, index)),
     );
@@ -1120,31 +1131,76 @@
           "可以更换影视源或搜索其他片名。",
         ),
       );
+    let summary = null;
+    if (!state.query) {
+      summary = make("div", {
+        class: "discover-summary",
+        text: `已显示 ${cardCount} / ${n(result.total, cardCount)} 部影片`,
+      });
+      root.append(summary);
+    }
     root.append(grid);
-    if (!state.query && result.page_count > 1)
-      root.append(
-        make("div", { class: "catalog-pagination" }, [
-          button(
-            "上一页",
-            "subtle",
-            () => {
-              state.onlinePage -= 1;
-              render();
-            },
-            { disabled: state.onlinePage <= 1 },
-          ),
-          make("span", { text: `${state.onlinePage} / ${result.page_count}` }),
-          button(
-            "下一页",
-            "subtle",
-            () => {
-              state.onlinePage += 1;
-              render();
-            },
-            { disabled: state.onlinePage >= result.page_count },
-          ),
-        ]),
+    if (state.query) return root;
+    if (result.page_count > state.onlinePage) {
+      const more = make(
+        "div",
+        { class: "discover-more", role: "status" },
+        [
+          make("span", { class: "spinner", "aria-hidden": "true" }),
+          make("span", { text: "继续加载…" }),
+        ],
       );
+      root.append(more);
+      let loading = false;
+      const moreText = more.children[more.children.length - 1];
+      const loadMore = async () => {
+        if (loading || sequence !== renderSequence) return;
+        loading = true;
+        more.classList.add("loading");
+        moreText.textContent = "正在加载…";
+        try {
+          const page = await api(
+            `/api/catalog/discover?${paramsFor(state.onlinePage + 1)}`,
+          );
+          if (sequence !== renderSequence) return;
+          state.onlinePage += 1;
+          page.results.forEach((item) =>
+            grid.append(catalogCard(item, cardCount++)),
+          );
+          summary.textContent =
+            `已显示 ${cardCount} / ${n(page.total, cardCount)} 部影片`;
+          if (state.onlinePage >= page.page_count) {
+            state.onlineObserver?.disconnect();
+            state.onlineObserver = null;
+            more.className = "discover-end";
+            more.replaceChildren(make("span", { text: "已经到底了" }));
+          } else {
+            more.classList.remove("loading");
+            moreText.textContent = "继续加载…";
+          }
+        } catch (e) {
+          if (sequence === renderSequence) {
+            more.classList.remove("loading");
+            moreText.textContent = "加载失败，点击重试";
+            toast(e.message, true);
+          }
+        } finally {
+          loading = false;
+        }
+      };
+      more.addEventListener("click", loadMore);
+      if (typeof IntersectionObserver === "function") {
+        state.onlineObserver = new IntersectionObserver(
+          (entries) => {
+            if (entries.some((entry) => entry.isIntersecting)) loadMore();
+          },
+          { rootMargin: "700px 0px" },
+        );
+        state.onlineObserver.observe(more);
+      }
+    } else {
+      root.append(make("p", { class: "discover-end", text: "已经到底了" }));
+    }
     return root;
   }
   async function openCatalogDetail(item) {
@@ -2160,6 +2216,8 @@
     const sequence = ++renderSequence,
       pageName = state.page;
     clearInterval(state.poll);
+    state.onlineObserver?.disconnect();
+    state.onlineObserver = null;
     main.setAttribute("aria-busy", "true");
     main.replaceChildren(
       make("div", { class: "loading-state" }, [

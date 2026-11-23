@@ -630,6 +630,37 @@ main:focus {
   background: var(--accent);
   color: #fff;
 }
+.discover-summary {
+  margin: -6px 2px 12px;
+  color: var(--faint);
+  font-size: 12px;
+}
+.discover-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 64px;
+  margin-top: 8px;
+  color: var(--faint);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.discover-more .spinner {
+  display: none;
+  width: 16px;
+  height: 16px;
+  border-width: 2px;
+}
+.discover-more.loading .spinner {
+  display: inline-block;
+}
+.discover-end {
+  margin: 18px 0 4px;
+  color: var(--faint);
+  font-size: 12px;
+  text-align: center;
+}
 .sort-note {
   margin-left: 8px;
   padding: 0 10px;
@@ -1350,8 +1381,7 @@ textarea {
   white-space: pre-wrap;
 }
 .catalog-actions,
-.catalog-play-controls,
-.catalog-pagination {
+.catalog-play-controls {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1398,16 +1428,7 @@ textarea {
 .episode-grid button {
   white-space: normal;
 }
-.catalog-pagination {
-  justify-content: center;
-  margin-top: 28px;
-}
-.catalog-pagination span {
-  min-width: 70px;
-  color: var(--muted);
-  font-size: 12px;
-  text-align: center;
-}
+
 
 /* Live guide */
 .live-guide {
