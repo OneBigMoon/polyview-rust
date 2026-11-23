@@ -592,29 +592,43 @@ main:focus {
   color: var(--accent);
   font-weight: 600;
 }
-.filter-label {
-  display: inline-flex;
+.discover-filter-bar {
+  margin-bottom: 22px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--muted-bg);
+}
+.discover-filter-row {
+  display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 0 8px 0 12px;
-  border-left: 1px solid var(--line);
-  color: var(--faint);
+  gap: 12px;
+  min-width: 0;
+}
+.discover-filter-row + .discover-filter-row {
+  margin-top: 4px;
+}
+.discover-filter-label {
+  flex: 0 0 40px;
+  color: var(--muted);
   font-size: 12px;
-  white-space: nowrap;
-}
-.filter-select {
-  min-height: 30px;
-  max-width: 132px;
-  border: 0;
-  background: transparent;
-  color: var(--ink);
-  font-size: 13px;
   font-weight: 600;
-  cursor: pointer;
 }
-.filter-select option {
-  background: var(--surface);
-  color: var(--ink);
+.discover-filter-chips {
+  display: flex;
+  flex: 1;
+  gap: 6px;
+  min-width: 0;
+  padding-bottom: 4px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.discover-filter-chips .filter-chip {
+  flex: 0 0 auto;
+}
+.discover-filter-chips .filter-chip.active {
+  background: var(--accent);
+  color: #fff;
 }
 .sort-note {
   margin-left: 8px;
@@ -2034,9 +2048,20 @@ textarea {
     grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
     gap: 20px 12px;
   }
-  .filters {
+  .filters,
+  .discover-filter-bar {
     display: flex;
     width: 100%;
+  }
+  .filters {
+    flex-wrap: wrap;
+  }
+  .discover-filter-bar {
+    flex-direction: column;
+    gap: 4px;
+  }
+  .discover-filter-label {
+    flex-basis: 34px;
   }
   .sort-note {
     display: none;

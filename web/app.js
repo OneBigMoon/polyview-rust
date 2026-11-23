@@ -1031,62 +1031,52 @@
         !state.categories.includes(state.onlineCategory)
       )
         state.onlineCategory = "";
-      const filterSelect = (label, value, options, apply) => {
-        const select = make(
-          "select",
-          {
-            class: "filter-select",
-            "aria-label": label,
-            on: {
-              change: (event) => {
-                apply(event.target.value);
-                state.onlinePage = 1;
-                render();
-              },
-            },
-          },
-          options.map(([optionValue, text]) =>
-            make("option", { value: optionValue, text }),
+      const chipRow = (label, values, current, apply) =>
+        make("div", { class: "discover-filter-row" }, [
+          make("span", { class: "discover-filter-label", text: label }),
+          make(
+            "div",
+            { class: "discover-filter-chips" },
+            values.map(([value, text]) =>
+              make("button", {
+                type: "button",
+                class: `filter-chip${value === current ? " active" : ""}`,
+                "aria-pressed": String(value === current),
+                text,
+                on: {
+                  click: () => {
+                    apply(value);
+                    state.onlinePage = 1;
+                    render();
+                  },
+                },
+              }),
+            ),
           ),
-        );
-        select.value = value;
-        return make("label", { class: "filter-label" }, [
-          make("span", { text: label }),
-          select,
         ]);
-      };
       const year = new Date().getFullYear();
       root.append(
-        make("div", { class: "filters" }, [
-          ...[
-            ["all", "全部影视源"],
-            ...enabled.map((source) => [String(source.id), source.name]),
-          ].map(([value, label]) =>
-            make("button", {
-              class: `filter-chip${value === state.onlineSource ? " active" : ""}`,
-              type: "button",
-              text: label,
-              on: {
-                click: () => {
-                  state.onlineSource = value;
-                  state.onlinePage = 1;
-                  render();
-                },
-              },
-            }),
+        make("div", { class: "discover-filter-bar" }, [
+          chipRow(
+            "影视源",
+            [
+              ["all", "全部影视源"],
+              ...enabled.map((source) => [String(source.id), source.name]),
+            ],
+            state.onlineSource,
+            (value) => (state.onlineSource = value),
           ),
-          filterSelect(
+          chipRow(
             "类型",
-            state.onlineCategory,
             [
               ["", "全部类型"],
               ...state.categories.map((category) => [category, category]),
             ],
+            state.onlineCategory,
             (value) => (state.onlineCategory = value),
           ),
-          filterSelect(
+          chipRow(
             "年份",
-            state.onlineYear,
             [
               ["", "全部年份"],
               ...Array.from({ length: 7 }, (_, index) => {
@@ -1094,6 +1084,7 @@
                 return [item, item];
               }),
             ],
+            state.onlineYear,
             (value) => (state.onlineYear = value),
           ),
         ]),

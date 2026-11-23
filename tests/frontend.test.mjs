@@ -688,11 +688,27 @@ test("discover aggregates sources and offers type and year filters", async () =>
   const page = await app.online();
   const flatten = (node) =>
     [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
-  const labels = flatten(page)
+  const rows = flatten(page).filter(
+    (node) => node.className === "discover-filter-row",
+  );
+  assert.deepEqual(
+    rows.map((row) => row.children[0].textContent),
+    ["影视源", "类型", "年份"],
+  );
+  const chips = rows.flatMap((row) => row.children[1].children);
+  const labels = chips
     .filter((node) => node.tagName === "BUTTON")
     .map((node) => node.textContent);
   assert.ok(labels.includes("全部影视源"), JSON.stringify(labels));
   assert.ok(labels.includes("甲源"), JSON.stringify(labels));
+  assert.ok(labels.includes("全部类型"), JSON.stringify(labels));
+  assert.ok(labels.includes("全部年份"), JSON.stringify(labels));
+  assert.equal(
+    chips.find((chip) => chip.textContent === "全部影视源").attributes[
+      "aria-pressed"
+    ],
+    "true",
+  );
   assert.deepEqual(Array.from(app.state.categories), ["国产剧", "动作片"]);
   const first = app.calls.find((call) =>
     call.url.startsWith("/api/catalog/discover"),
