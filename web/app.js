@@ -404,8 +404,9 @@
       if (!player.live || !current()) return;
       const result = video.play();
       if (result?.catch)
-        result.catch(() => {
-          if (current())
+        result.catch((error) => {
+          if (!current()) return;
+          if (error?.name === "NotAllowedError")
             $("player-message").textContent =
               "浏览器阻止了自动播放，请点击播放器开始直播。";
         });
@@ -424,7 +425,14 @@
     if (hlsSource && !nativeHls && window.Hls?.isSupported()) {
       const hls = new window.Hls({
         enableWorker: false,
-        liveSyncDurationCount: 1,
+        liveSyncDurationCount: 4,
+        liveMaxLatencyDurationCount: 12,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 90,
+        backBufferLength: 15,
+        manifestLoadingMaxRetry: 3,
+        levelLoadingMaxRetry: 5,
+        fragLoadingMaxRetry: 6,
       });
       state.hls = hls;
       hls.on(window.Hls.Events.ERROR, (_, data) => {
@@ -457,6 +465,50 @@
           video.currentTime = player.item.position;
       };
   }
+  function playerGuide(item) {
+    const box = $("player-guide");
+    box.replaceChildren();
+    if (!state.player?.live) {
+      box.hidden = true;
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const programs = (state.epg?.programs || [])
+      .filter(
+        (program) =>
+          Number(program.channel_id) === Number(item.id) &&
+          program.stop > now,
+      )
+      .sort((one, other) => one.start - other.start);
+    if (!programs.length) {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
+    box.append(
+      make(
+        "div",
+        { class: "player-guide-head" },
+        [
+          make("strong", { text: "接下来" }),
+          make("small", { text: `${programs.length} 条节目` }),
+        ],
+      ),
+    );
+    programs.slice(0, 14).forEach((program) => {
+      const current = now >= program.start && now < program.stop;
+      box.append(
+        make(
+          "div",
+          { class: `player-guide-item${current ? " current" : ""}` },
+          [
+            make("span", { class: "player-guide-time", text: clockTime(program.start) }),
+            make("strong", { text: program.title }),
+          ],
+        ),
+      );
+    });
+  }
   function play(item, live = false) {
     if (state.player) closePlayer();
     state.player = {
@@ -474,7 +526,9 @@
     $("player-kind").textContent = live
       ? "LIVE NOW"
       : item.series || "NOW PLAYING";
+    $("player-dialog").classList.toggle("live-mode", live);
     $("player-dialog").showModal();
+    playerGuide(item);
     updatePlayerControls();
      attachPlayerSource();
   }
@@ -557,6 +611,8 @@
     state.player = null;
     updatePlayerControls();
     $("player-source").hidden = true;
+    $("player-guide").hidden = true;
+    $("player-dialog").classList.remove("live-mode");
     const video = $("video-player");
     video.pause();
     destroyHls();
@@ -2363,8 +2419,11 @@
   $("help-close").addEventListener("click", () => $("help-dialog").close());
   $("player-close").addEventListener("click", closePlayer);
   $("player-source").addEventListener("click", () => switchLiveSource(1));
+  let fullscreenExitedAt = 0;
   $("player-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
+    if (document.fullscreenElement) return;
+    if (Date.now() - fullscreenExitedAt < 300) return;
     closePlayer();
   });
   $("player-toggle").addEventListener("click", () => {
@@ -2383,9 +2442,20 @@
     updatePlayerControls();
   });
   $("player-fullscreen").addEventListener("click", () => {
-    const dialog = $("player-dialog");
+    const stage = $("player-stage");
     if (document.fullscreenElement) document.exitFullscreen?.();
-    else dialog.requestFullscreen?.();
+    else
+      stage.requestFullscreen?.().catch(() =>
+        toast("当前浏览器无法进入全屏。", true),
+      );
+  });
+  document.addEventListener("fullscreenchange", () => {
+    const full = document.fullscreenElement === $("player-stage");
+    if (!full) fullscreenExitedAt = Date.now();
+    $("player-fullscreen").setAttribute(
+      "aria-label",
+      full ? "退出全屏" : "全屏",
+    );
   });
   for (const event of ["play", "pause", "volumechange"])
     $("video-player").addEventListener(event, updatePlayerControls);

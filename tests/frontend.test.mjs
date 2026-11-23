@@ -20,6 +20,16 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
       this.attributes = {};
       this.listeners = {};
       this.dataset = {};
+      this.classes = new Set();
+      this.classList = {
+        add: (name) => this.classes.add(name),
+        remove: (name) => this.classes.delete(name),
+        toggle: (name, on) => {
+          if (on) this.classes.add(name);
+          else this.classes.delete(name);
+          return this.classes.has(name);
+        },
+      };
       this.style = { cssText: "" };
       this.open = false;
       this.currentTime = 0;
@@ -121,6 +131,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "player-mute",
     "player-fullscreen",
     "player-source",
+    "player-guide",
+    "player-stage",
     "player-dialog",
     "player-title",
     "player-kind",
@@ -173,6 +185,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     }
   }
   const document = {
+    fullscreenElement: null,
+    activeElement: null,
     documentElement: new Element("html"),
     body: new Element("body"),
     getElementById: (id) => elements.get(id) ?? null,
@@ -180,7 +194,13 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     createTextNode: (text) => ({ nodeType: 3, textContent: text }),
     querySelector: () => null,
     querySelectorAll: () => [],
-    addEventListener() {},
+    addEventListener(event, callback) {
+      (this.listeners ??= {})[event] ??= [];
+      this.listeners[event].push(callback);
+    },
+    dispatchEvent(type) {
+      (this.listeners?.[type] ?? []).forEach((cb) => cb({ type }));
+    },
   };
   const storage = {};
   const context = vm.createContext({
@@ -225,6 +245,12 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     context,
   );
   return {
+    document,
+    elements,
+    calls,
+    order,
+    hlsInstances,
+    documentElement: document.documentElement,
     ...context.hooks,
     elements,
     calls,
@@ -488,6 +514,46 @@ test("clicking a live channel starts playback once the manifest is ready", () =>
   assert.equal(video.controls, true);
   assert.equal(app.elements.get("player-toggle").hidden, true);
 
+});
+test("the live player shows current and upcoming programmes on the right", () => {
+  const app = environment();
+  const now = Math.floor(Date.now() / 1000);
+  app.state.epg = {
+    updated_at: 0,
+    matched_channels: 1,
+    programs: [
+      { channel_id: 1, start: now - 7200, stop: now, title: "已过期节目" },
+      { channel_id: 1, start: now, stop: now + 7200, title: "正在播出" },
+      { channel_id: 1, start: now + 7200, stop: now + 14400, title: "下个节目" },
+      { channel_id: 2, start: now, stop: now + 7200, title: "别的频道" },
+    ],
+  };
+  app.play({ id: 1, name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
+  const guide = app.elements.get("player-guide");
+  assert.equal(guide.hidden, false);
+  assert.match(guide.textContent, /正在播出/);
+  assert.match(guide.textContent, /下个节目/);
+  assert.doesNotMatch(guide.textContent, /已过期节目/);
+  assert.doesNotMatch(guide.textContent, /别的频道/);
+  app.closePlayer();
+  assert.equal(guide.hidden, true);
+});
+
+test("Esc that exits fullscreen does not close the live player", () => {
+  const app = environment();
+  app.play({ id: 1, name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
+  const dialog = app.elements.get("player-dialog");
+  const cancel = dialog.listeners.cancel[0];
+  const event = { preventDefault() { event.defaultPrevented = true; } };
+  app.document.fullscreenElement = app.elements.get("player-stage");
+  cancel.call(dialog, event);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(dialog.open, true);
+  app.document.fullscreenElement = null;
+  app.document.dispatchEvent("fullscreenchange");
+  cancel.call(dialog, event);
+  assert.equal(dialog.open, true);
+  assert.ok(app.state.player);
 });
 
 test("native live HLS starts playback without a separate play click", () => {

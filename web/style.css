@@ -1645,6 +1645,83 @@ textarea {
   color: var(--faint);
   font-size: 12px;
 }
+.player-dialog.live-mode .player-stage {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 18px;
+}
+.player-dialog.live-mode .dialog-top {
+  grid-column: 1 / -1;
+}
+.player-dialog.live-mode .player-stage video {
+  grid-column: 1;
+  grid-row: 2;
+  width: 100%;
+  max-height: min(66vh, calc(100vh - 260px));
+  margin: 0;
+  border-radius: 14px;
+}
+.player-guide {
+  grid-column: 2;
+  grid-row: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(66vh, calc(100vh - 260px));
+  overflow: auto;
+  padding: 12px;
+  border-radius: 14px;
+  background: var(--muted);
+}
+.player-guide-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted-fg);
+}
+.player-guide-head small {
+  color: var(--faint);
+}
+.player-guide-item {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+.player-guide-item.current {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+.player-guide-time {
+  color: var(--faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.player-guide-item strong {
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.player-dialog.live-mode .player-stage:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  padding: 18px;
+  border-radius: 0;
+  background: var(--bg);
+}
+.player-dialog.live-mode .player-stage:fullscreen video,
+.player-dialog.live-mode .player-stage:fullscreen .player-guide {
+  max-height: calc(100vh - 190px);
+}
 .help-body {
   max-width: 700px;
   margin-top: 16px;
@@ -1885,6 +1962,23 @@ textarea {
   }
   .auth-panel {
     padding: 36px 28px;
+  }
+  .player-dialog.live-mode .player-stage {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .player-dialog.live-mode .player-stage video {
+    grid-column: 1;
+    grid-row: 2;
+    max-height: 48vh;
+  }
+  .player-guide {
+    grid-column: 1;
+    grid-row: 3;
+    max-height: 220px;
+  }
+  .player-dialog.live-mode .player-message {
+    grid-column: 1;
+    grid-row: 4;
   }
 }
 @media (max-width: 640px) {

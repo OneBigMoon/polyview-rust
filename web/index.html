@@ -187,6 +187,7 @@
       class="player-dialog"
       aria-labelledby="player-title"
     >
+      <div id="player-stage" class="player-stage">
       <div class="dialog-top">
         <div>
           <p id="player-kind" class="eyebrow">NOW PLAYING</p>
@@ -226,9 +227,11 @@
         </div>
       </div>
       <video id="video-player" controls playsinline preload="metadata"></video>
+      <aside id="player-guide" class="player-guide" hidden></aside>
       <p id="player-message" class="player-message" role="status">
         使用播放器控制开始播放。按 Esc 关闭。
       </p>
+      </div>
     </dialog>
 
     <dialog id="help-dialog" class="info-dialog" aria-labelledby="help-title">
