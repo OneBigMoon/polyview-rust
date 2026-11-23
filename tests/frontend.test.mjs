@@ -255,6 +255,7 @@ test("opening an episode closes details before showing the player", async () => 
     groups: [
       {
         name: "HLS",
+        direct: true,
         episodes: [{ name: "第1集", url: "https://source.example/1.m3u8" }],
       },
     ],
@@ -279,6 +280,42 @@ test("opening an episode closes details before showing the player", async () => 
     "open:player-dialog",
   ]);
   assert.equal(dialog.open, false);
+});
+
+test("non-direct parser pages are rejected before opening the player", async () => {
+  const detail = {
+    id: "43",
+    source_id: 3,
+    title: "解析页",
+    description: "",
+    groups: [
+      {
+        name: "share",
+        direct: false,
+        episodes: [
+          { name: "第1集", url: "https://source.example/share/abc" },
+        ],
+      },
+    ],
+  };
+  const app = environment({
+    "/api/catalog/3/detail?id=43": detail,
+    "/api/tracking": [],
+  });
+  await app.openCatalogDetail({ id: "43", source_id: 3, title: "解析页" });
+  const dialog = app.elements.get("catalog-dialog");
+  const find = (node) =>
+    node.tagName === "BUTTON" && node.textContent === "在线播放"
+      ? node
+      : (node.children || [])
+          .map((child) => (typeof child === "object" ? find(child) : null))
+          .find(Boolean);
+  const watch = find(dialog);
+  assert.ok(watch, "details expose a play action");
+  watch.listeners.click[0]();
+  assert.equal(dialog.open, true);
+  assert.equal(app.order.includes("open:player-dialog"), false);
+  assert.match(app.elements.get("toast").textContent, /非直链/);
 });
 
 test("imported Unicode usernames and short passwords reach login without relaxing setup", async () => {

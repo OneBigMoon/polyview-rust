@@ -881,7 +881,12 @@
       const selected = () =>
         detail.groups[n(groups.value)].episodes[n(episodes.value)];
       const watch = (index) => {
-        const episode = detail.groups[n(groups.value)].episodes[index];
+        const group = detail.groups[n(groups.value)];
+        if (group.direct === false) {
+          toast("该线路是非直链解析页，无法直接播放，请选择直链线路。", true);
+          return;
+        }
+        const episode = group.episodes[index];
         dialog.close();
         play({
           title: `${detail.title} · ${episode.name}`,
@@ -906,6 +911,10 @@
       groups.addEventListener("change", fillEpisodes);
       fillEpisodes();
       const download = button("下载本集", "subtle", async () => {
+        if (detail.groups[n(groups.value)].direct === false) {
+          toast("该线路是非直链解析页，无法直接下载，请选择直链线路。", true);
+          return;
+        }
         download.disabled = true;
         try {
           await api("/api/downloads", {

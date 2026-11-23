@@ -321,24 +321,48 @@ pub fn enqueue_in(
             "Give the download a title of 1 to 200 characters",
         ));
     }
-    let filename = format!(
-        "{}-{}.{}",
-        safe_title(title),
-        uuid::Uuid::new_v4(),
-        extension
-    );
-    let relative_path = state
-        .download_dir
-        .join(filename)
-        .strip_prefix(&state.media_dir)
-        .map_err(|_| AppError::internal("Download directory must be inside the media directory"))?
-        .to_string_lossy()
-        .into_owned();
+    let relative_path = unique_relative_path(conn, state, title, &extension)?;
     conn.execute(
         "INSERT INTO downloads(user_id,title,url,relative_path,created_at) VALUES (?1,?2,?3,?4,?5)",
         params![user_id, title, url.to_string(), relative_path, now()],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+fn unique_relative_path(
+    conn: &Connection,
+    state: &Shared,
+    title: &str,
+    extension: &str,
+) -> Result<String, AppError> {
+    let base = safe_title(title);
+    for index in 1..=10_000 {
+        let filename = if index == 1 {
+            format!("{base}.{extension}")
+        } else {
+            format!("{base} ({index}).{extension}")
+        };
+        let relative_path = state
+            .download_dir
+            .join(&filename)
+            .strip_prefix(&state.media_dir)
+            .map_err(|_| {
+                AppError::internal("Download directory must be inside the media directory")
+            })?
+            .to_string_lossy()
+            .into_owned();
+        let reserved: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM downloads WHERE relative_path=?1)",
+            [&relative_path],
+            |row| row.get(0),
+        )?;
+        if !reserved && !state.download_dir.join(&filename).exists() {
+            return Ok(relative_path);
+        }
+    }
+    Err(AppError::internal(
+        "Could not allocate a unique download filename",
+    ))
 }
 
 fn safe_title(title: &str) -> String {
@@ -855,6 +879,27 @@ mod tests {
         let (_temp, state) = state();
         assert!(download_paths(&state, "downloads/../../outside.mp4").is_err());
         assert!(download_paths(&state, "downloads/a.mp4").is_ok());
+    }
+
+    #[test]
+    fn downloads_get_clean_unique_filenames() {
+        let (_temp, state) = state();
+        let conn = state.conn().unwrap();
+        let first = enqueue_in(&conn, &state, 1, "第01集", "https://example.com/a.m3u8").unwrap();
+        let second = enqueue_in(&conn, &state, 1, "第01集", "https://example.com/b.m3u8").unwrap();
+        std::fs::write(state.download_dir.join("已存在.mp4"), b"").unwrap();
+        let third = enqueue_in(&conn, &state, 1, "已存在", "https://example.com/c.mp4").unwrap();
+        let path = |id: i64| -> String {
+            conn.query_row(
+                "SELECT relative_path FROM downloads WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(path(first), "downloads/第01集.mp4");
+        assert_eq!(path(second), "downloads/第01集 (2).mp4");
+        assert_eq!(path(third), "downloads/已存在 (2).mp4");
     }
 
     #[tokio::test]

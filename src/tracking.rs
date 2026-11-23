@@ -350,7 +350,7 @@ fn apply_detail(
                 continue;
             }
             let title = format!(
-                "{} S01E{ordinal:03}",
+                "{} S01E{ordinal:02}",
                 detail.title.chars().take(180).collect::<String>()
             );
             let download_id = network::enqueue_in(&tx, state, user_id, &title, &episode.url)?;
