@@ -339,8 +339,24 @@
     const hlsSource = /\.m3u8(?:[?#]|$)/i.test(upstream || source);
     const nativeHls =
       video.canPlayType("application/vnd.apple.mpegurl") === "probably";
+    const startLive = () => {
+      if (!live) return;
+      const attempt = video.play();
+      if (attempt?.catch)
+        attempt.catch(() => {
+          $("player-message").textContent =
+            "浏览器阻止了自动播放，请点击播放器开始直播。";
+        });
+    };
+    if (live)
+      video.onplaying = () => {
+        $("player-message").textContent = "正在直播。";
+      };
     if (hlsSource && !nativeHls && window.Hls?.isSupported()) {
-      const hls = new window.Hls({ enableWorker: false });
+      const hls = new window.Hls({
+        enableWorker: false,
+        liveSyncDurationCount: 1,
+      });
       state.hls = hls;
       hls.on(window.Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
@@ -349,11 +365,16 @@
           destroyHls();
         }
       });
+      hls.on(window.Hls.Events.MANIFEST_PARSED, startLive);
       hls.loadSource(source);
       hls.attachMedia(video);
     } else {
       video.src = source;
       video.load();
+      if (live) {
+        video.onloadedmetadata = startLive;
+        startLive();
+      }
     }
     if (!live)
       video.onloadedmetadata = () => {
@@ -443,6 +464,8 @@
     video.pause();
     destroyHls();
     video.onloadedmetadata = null;
+    video.onplaying = null;
+    video.onerror = null;
     video.removeAttribute("src");
     video.load();
     if ($("player-dialog").open) $("player-dialog").close();

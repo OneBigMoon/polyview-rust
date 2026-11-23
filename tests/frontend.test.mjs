@@ -24,6 +24,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
       this.open = false;
       this.currentTime = 0;
       this.duration = 100;
+      this.paused = true;
+      this.playCalls = 0;
     }
     append(...children) {
       this.children.push(...children);
@@ -78,7 +80,14 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
       return canPlayType(type);
     }
     load() {}
-    pause() {}
+    play() {
+      this.playCalls += 1;
+      this.paused = false;
+      return Promise.resolve();
+    }
+    pause() {
+      this.paused = true;
+    }
     focus() {}
     remove() {}
   }
@@ -128,14 +137,19 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   };
   const hlsInstances = [];
   class Hls {
-    static Events = { ERROR: "error" };
+    static Events = { ERROR: "error", MANIFEST_PARSED: "manifest_parsed" };
     static isSupported() {
       return true;
     }
     constructor() {
       hlsInstances.push(this);
     }
-    on() {}
+    on(event, callback) {
+      (this.listeners ??= {})[event] = callback;
+    }
+    emit(event, data) {
+      this.listeners?.[event]?.(event, data);
+    }
     loadSource(url) {
       this.source = url;
     }
@@ -377,5 +391,25 @@ test("live HLS channels are relayed through the playback proxy", () => {
     app.hlsInstances[0].source,
     `/api/playback?url=${encodeURIComponent(url)}`,
   );
+  app.closePlayer();
+});
+
+test("clicking a live channel starts playback once the manifest is ready", () => {
+  const app = environment();
+  const video = app.elements.get("video-player");
+  app.play({ name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
+  assert.equal(video.playCalls, 0);
+  app.hlsInstances[0].emit("manifest_parsed");
+  assert.equal(video.playCalls, 1);
+  assert.equal(video.paused, false);
+  app.closePlayer();
+});
+
+test("native live HLS starts playback without a separate play click", () => {
+  const app = environment({}, { canPlayType: () => "probably" });
+  const video = app.elements.get("video-player");
+  app.play({ name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
+  assert.equal(video.playCalls, 1);
+  assert.equal(video.paused, false);
   app.closePlayer();
 });
