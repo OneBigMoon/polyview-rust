@@ -147,6 +147,11 @@ fn binary_content_type(upstream: &HeaderMap) -> Result<HeaderValue, AppError> {
     if content_type == "text/plain" {
         return Ok(HeaderValue::from_static("application/octet-stream"));
     }
+    // Some HLS CDNs label MPEG-TS segments as JPEG; browsers ignore the
+    // segment type, so relay the bytes as opaque binary.
+    if content_type == "image/jpeg" {
+        return Ok(HeaderValue::from_static("application/octet-stream"));
+    }
     Err(source_error(
         "Source returned a document instead of playable media",
     ))
@@ -327,6 +332,16 @@ mod tests {
             request = request.header(header::COOKIE, "polyview_session=local-session");
         }
         request
+    }
+
+    #[test]
+    fn mislabeled_image_segments_are_relayed_as_binary() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+        assert_eq!(
+            binary_content_type(&headers).unwrap(),
+            "application/octet-stream"
+        );
     }
 
     #[test]

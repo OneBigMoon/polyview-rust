@@ -20,7 +20,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
       this.attributes = {};
       this.listeners = {};
       this.dataset = {};
-      this.classList = { toggle() {} };
+      this.style = { cssText: "" };
       this.open = false;
       this.currentTime = 0;
       this.duration = 100;
@@ -61,6 +61,9 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
       this.attributes[name] = String(value);
       if (name === "id") elements.set(value, this);
       if (name === "value") this.value = value;
+    }
+    getAttribute(name) {
+      return this.attributes[name] ?? null;
     }
     removeAttribute(name) {
       delete this.attributes[name];
@@ -118,6 +121,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "player-message",
     "video-player",
     "search-input",
+    "theme-toggle",
+    "nav-toggle",
     "toast",
   ]) {
     const element = new Element(
@@ -162,15 +167,24 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     }
   }
   const document = {
+    documentElement: new Element("html"),
     body: new Element("body"),
     getElementById: (id) => elements.get(id) ?? null,
     createElement: (tag) => new Element(tag),
     createTextNode: (text) => ({ nodeType: 3, textContent: text }),
+    querySelector: () => null,
     querySelectorAll: () => [],
     addEventListener() {},
   };
+  const storage = {};
   const context = vm.createContext({
     document,
+    localStorage: {
+      getItem: (key) => storage[key] ?? null,
+      setItem: (key, value) => {
+        storage[key] = String(value);
+      },
+    },
     window: { Hls, addEventListener() {}, confirm: () => true },
     DOMParser: class {
       parseFromString(text) {
@@ -199,11 +213,18 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource};\n})();",
+      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView};\n})();",
     ),
     context,
   );
-  return { ...context.hooks, elements, calls, order, hlsInstances };
+  return {
+    ...context.hooks,
+    elements,
+    calls,
+    order,
+    hlsInstances,
+    documentElement: document.documentElement,
+  };
 }
 
 test("remote HLS chooses the HLS player using the original URL and routes through the proxy", () => {
@@ -462,4 +483,48 @@ test("native live HLS starts playback without a separate play click", () => {
   assert.equal(video.playCalls, 1);
   assert.equal(video.paused, false);
   app.closePlayer();
+});
+
+test("the guide lays programmes on a timeline and filters channels by group", () => {
+  const app = environment();
+  app.state.channels = [
+    { id: 1, name: "CCTV-1 综合", group_name: "央视", sources: [{ url: "https://a.example/1.m3u8" }] },
+    { id: 2, name: "安徽卫视", group_name: "卫视", sources: [{ url: "https://b.example/1.m3u8" }] },
+  ];
+  app.state.epg = {
+    updated_at: 0,
+    matched_channels: 1,
+    programs: [
+      { channel_id: 1, start: 3600, stop: 7200, title: "新闻联播", description: "每日新闻" },
+    ],
+  };
+  const view = app.guideView(0, 86400);
+  assert.match(view.textContent, /CCTV-1 综合/);
+  assert.match(view.textContent, /新闻联播/);
+  assert.match(view.textContent, /安徽卫视/);
+  const programs = [];
+  const walk = (node) => {
+    if (node?.className?.includes("epg-program")) programs.push(node);
+    (node?.children || []).forEach((child) => {
+      if (typeof child === "object") walk(child);
+    });
+  };
+  walk(view);
+  assert.equal(programs.length, 1);
+  assert.equal(programs[0].style.cssText, "left:120px;width:120px");
+  assert.equal(programs[0].attributes.title, "新闻联播 09:00-10:00\n每日新闻");
+  app.state.liveGroup = "央视";
+  const filtered = app.guideView(0, 86400);
+  assert.match(filtered.textContent, /CCTV-1 综合/);
+  assert.doesNotMatch(filtered.textContent, /安徽卫视/);
+});
+test("the theme toggle switches between light and dark", () => {
+  const app = environment();
+  const toggle = app.elements.get("theme-toggle");
+  assert.equal(app.documentElement.dataset.theme, "light");
+  toggle.listeners.click[0]();
+  assert.equal(app.documentElement.dataset.theme, "dark");
+  assert.equal(toggle.getAttribute("aria-label"), "切换浅色模式");
+  toggle.listeners.click[0]();
+  assert.equal(app.documentElement.dataset.theme, "light");
 });

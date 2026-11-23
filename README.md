@@ -13,7 +13,7 @@ PolyView is a self-hosted media hub for a NAS: browse and watch from a desktop w
 - M3U text/file import, channel browsing, and HLS playback with locally bundled hls.js and native browser fallback.
 - Per-user TVBox / 影视仓 feeds for the local library, enabled online sources, and live channels. Feed tokens can be rotated to revoke previous links.
 - Argon2id password hashing, HttpOnly sessions, login throttling, and administrator/member roles.
-- Responsive Chinese web interface with keyboard focus states.
+- Responsive Chinese web interface with light and dark themes, a mobile navigation drawer, and keyboard focus states.
 
 Online CMS sources and media must be supplied by the administrator. PolyView does not execute APKs, TVBox spider/JAR adapters, or arbitrary source JavaScript.
 
@@ -103,6 +103,7 @@ Place videos in the configured media directory, then select **扫描媒体目录
 For episodes, use names such as `三体.S01E02.mp4`, or put videos under `三体/Season 1/`. Accounts share the library and channel list while keeping separate local progress, favorites, online subscriptions, and download queues. Removing an account revokes its sessions and feeds and removes its queued tasks; completed video files stay in the shared library.
 
 Channel imports accept a UTF-8 M3U playlist containing `#EXTM3U`, `#EXTINF` metadata, and HTTP(S) stream URLs. Re-importing the same name and group with a different URL adds a backup source to that channel instead of creating a duplicate; the player switches automatically when a source fails, and the **线路** button cycles sources manually. Browser live playback uses the same authenticated media proxy as online titles, so the server must be able to reach the channel and HLS playlists/segments are rewritten through PolyView; browser CORS and HTTPS mixed-content restrictions no longer apply to the channel itself. TV clients still fetch live URLs from the NAS address, which must be reachable by the device.
+The live page is a TV guide: channels stay pinned on the left while a 24-hour programme grid scrolls horizontally, with the current programme highlighted and a live-time marker. Group chips filter CCTV, satellite, local, and international channels; clicking a channel or programme starts playback. Programme data comes from XMLTV feeds (default `http://epg.51zmt.top:8000/e.xml` plus `https://epg.112114.xyz/pp.xml`), merged by channel with earlier feeds taking precedence; names are matched after normalizing CCTV aliases and `4K`/高清 suffixes. Administrators can edit up to four feed URLs, one per line, and refresh them from **账户与设置 → 电视节目单**; the result is cached in SQLite and shown until refreshed.
 
 PolyView serves original local media without transcoding. MP4 with H.264/AAC and supported WebM codecs work in common browsers; MKV, AVI, and other codecs depend on the browser or TV client.
 
@@ -126,6 +127,8 @@ Media, catalog, tracking, download, and TV-feed APIs require a login. Initial se
 | `GET/POST /api/tracking`, `PUT/DELETE /api/tracking/{id}`, `POST /api/tracking/check`       | Online subscriptions, watched counts, automatic download selection, and checks |
 | `GET/POST /api/downloads`, `DELETE /api/downloads/{id}`, `POST /api/downloads/{id}/retry`   | Queue, inspect, cancel, and retry downloads                                    |
 | `GET /api/tvbox`, `POST /api/tvbox/token`                                                   | Obtain or rotate the current account's TV feed                                 |
+| `GET/POST /api/channels`, `POST /api/channels/import`, `DELETE /api/channels/{id}`           | Live channel list, M3U import with backup sources, and removal                 |
+| `GET /api/epg`, `POST /api/epg/refresh`, `GET/PUT /api/epg/config`                          | TV guide data, XMLTV refresh, and feed configuration                           |
 | `GET /tvbox/{token}/config.json`, `/vod`, `/source/{source_id}`, `/live.m3u`, `/media/{id}` | Token-authenticated TV client endpoints under the same `/tvbox/{token}` prefix |
 
 ## Checks

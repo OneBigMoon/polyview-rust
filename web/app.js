@@ -7,6 +7,9 @@
     user: null,
     page: "online",
     query: "",
+    liveGroup: "all",
+    liveDay: 0,
+    epg: null,
     filter: "all",
     library: [],
     channels: [],
@@ -31,6 +34,7 @@
         Object.entries(value).forEach(([event, fn]) => {
           if (typeof fn === "function") el.addEventListener(event, fn);
         });
+      else if (key === "style") el.style.cssText = value;
       else if (key === "checked" || key === "disabled" || key === "hidden")
         el[key] = Boolean(value);
       else el.setAttribute(key, value === true ? "" : value);
@@ -113,7 +117,6 @@
       "div",
       { class: "page-head" },
       make("div", {}, [
-        make("p", { class: "eyebrow", text: "YOUR MEDIA, YOUR HOME" }),
         make("h1", { text: title }),
         make("p", { text: description }),
       ]),
@@ -197,7 +200,6 @@
     return make("article", { class: "media-card" }, [
       poster,
       fav,
-      make("h3", { text: item.title }),
       make("div", { class: "media-meta" }, [
         make("span", { text: meta }),
         item.watched
@@ -546,28 +548,229 @@
     video.load();
     if ($("player-dialog").open) $("player-dialog").close();
   }
+  const EPG_MINUTE_PX = 2;
+  function liveDayStart(offset = 0) {
+    const date = new Date();
+    date.setHours(0, 0, 0, 0);
+    return Math.floor(date.getTime() / 1000) + offset * 86400;
+  }
+  function clockTime(timestamp) {
+    const date = new Date(timestamp * 1000);
+    return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  }
+  function liveDayLabel(start, offset) {
+    const date = new Date(start * 1000);
+    const name = offset === 0 ? "今天" : offset === -1 ? "昨天" : offset === 1 ? "明天" : "";
+    return `${date.getMonth() + 1}月${date.getDate()}日 ${name}`.trim();
+  }
+  async function refreshEpg() {
+    try {
+      const result = await api("/api/epg/refresh", { method: "POST" });
+      toast(`节目单已更新：${result.matched_channels} 个频道`);
+      state.liveDay = 0;
+      await render();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }
+  async function changeLiveDay(delta) {
+    state.liveDay += delta;
+    await render();
+  }
+  function guideView(start, end) {
+    const guide = state.epg || {};
+    const programs = Array.isArray(guide.programs) ? guide.programs : [];
+    const byChannel = new Map();
+    programs.forEach((program) => {
+      if (!byChannel.has(program.channel_id)) byChannel.set(program.channel_id, []);
+      byChannel.get(program.channel_id).push(program);
+    });
+    const groups = [];
+    state.channels.forEach((channel) => {
+      const group = channel.group_name || "其他";
+      if (!groups.includes(group)) groups.push(group);
+    });
+    if (state.liveGroup !== "all" && !groups.includes(state.liveGroup))
+      state.liveGroup = "all";
+    const query = state.query.toLowerCase();
+    const channels = state.channels.filter(
+      (channel) =>
+        (state.liveGroup === "all" || (channel.group_name || "其他") === state.liveGroup) &&
+        (!query || `${channel.name} ${channel.group_name}`.toLowerCase().includes(query)),
+    );
+    const tabs = make("div", { class: "live-groups" }, [
+      button(
+        `全部 ${state.channels.length}`,
+        `subtle small-button${state.liveGroup === "all" ? " active" : ""}`,
+        () => {
+          state.liveGroup = "all";
+          $("live-guide").replaceChildren(guideView(start, end));
+        },
+      ),
+      ...groups.map((group) =>
+        button(
+          group,
+          `subtle small-button${state.liveGroup === group ? " active" : ""}`,
+          () => {
+            state.liveGroup = group;
+            $("live-guide").replaceChildren(guideView(start, end));
+          },
+        ),
+      ),
+    ]);
+    const now = Math.floor(Date.now() / 1000);
+    const updated = Number(guide.updated_at) || 0;
+    const toolbar = make("div", { class: "epg-toolbar" }, [
+      make("div", { class: "epg-day-nav" }, [
+        button("‹", "subtle small-button", () => changeLiveDay(-1), {
+          "aria-label": "前一天",
+        }),
+        make("strong", { text: liveDayLabel(start, state.liveDay) }),
+        button("›", "subtle small-button", () => changeLiveDay(1), {
+          "aria-label": "后一天",
+        }),
+      ]),
+      make("div", { class: "epg-meta" }, [
+        make("span", {
+          text: updated
+            ? `节目单更新于 ${clockTime(updated)} · ${guide.matched_channels || 0} 个频道`
+            : "尚未更新节目单",
+        }),
+        admin() ? button("刷新节目单", "subtle small-button", refreshEpg) : null,
+      ]),
+    ]);
+    const scroller = make("div", { class: "epg-scroll" });
+    const inner = make("div", {
+      class: "epg-inner",
+      style: `width:${170 + 1440 * EPG_MINUTE_PX}px`,
+    });
+    const rulerRow = make("div", { class: "epg-row epg-ruler-row" });
+    rulerRow.append(make("div", { class: "epg-channel epg-corner", text: "频道" }));
+    const ruler = make("div", {
+      class: "epg-track epg-ruler",
+      style: `width:${1440 * EPG_MINUTE_PX}px`,
+    });
+    for (let hour = 0; hour < 24; hour += 1) {
+      ruler.append(
+        make("span", {
+          class: "epg-hour",
+          style: `left:${hour * 60 * EPG_MINUTE_PX}px`,
+          text: `${String(hour).padStart(2, "0")}:00`,
+        }),
+      );
+    }
+    rulerRow.append(ruler);
+    inner.append(rulerRow);
+    channels.forEach((channel) => {
+      const row = make("div", { class: "epg-row" });
+      row.append(
+        make(
+          "button",
+          {
+            type: "button",
+            class: "epg-channel",
+            "aria-label": `播放 ${channel.name}`,
+            on: { click: () => play(channel, true) },
+          },
+          [
+            channel.logo
+              ? make("img", { class: "epg-logo", src: channel.logo, alt: "" })
+              : make("span", { class: "epg-logo", text: "◉" }),
+            make("span", { class: "epg-channel-copy" }, [
+              make("strong", { text: channel.name }),
+              make("small", {
+                text: `${channel.group_name || "直播"} · ${(channel.sources || []).length || 1} 线路`,
+              }),
+            ]),
+          ],
+        ),
+      );
+      const track = make("div", {
+        class: "epg-track",
+        style: `width:${1440 * EPG_MINUTE_PX}px`,
+      });
+      const items = byChannel.get(channel.id) || [];
+      if (!items.length) {
+        track.append(make("span", { class: "epg-nodata", text: "暂无节目单" }));
+      }
+      items.forEach((program) => {
+        const left = Math.max(0, ((program.start - start) / 60) * EPG_MINUTE_PX);
+        const right = Math.min(
+          1440 * EPG_MINUTE_PX,
+          ((program.stop - start) / 60) * EPG_MINUTE_PX,
+        );
+        if (right - left < 2) return;
+        const classes = [
+          "epg-program",
+          now >= program.start && now < program.stop ? "current" : "",
+          program.stop <= now ? "past" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        track.append(
+          make(
+            "button",
+            {
+              type: "button",
+              class: classes,
+              style: `left:${left}px;width:${right - left}px`,
+              title: `${program.title} ${clockTime(program.start)}-${clockTime(program.stop)}${
+                program.description ? `\n${program.description}` : ""
+              }`,
+              on: { click: () => play(channel, true) },
+            },
+            [
+              make("strong", { text: program.title }),
+              make("small", {
+                text: `${clockTime(program.start)} - ${clockTime(program.stop)}`,
+              }),
+            ],
+          ),
+        );
+      });
+      row.append(track);
+      inner.append(row);
+    });
+    if (now >= start && now < end) {
+      inner.append(
+        make("span", {
+          class: "epg-now",
+          style: `left:${170 + ((now - start) / 60) * EPG_MINUTE_PX}px`,
+        }),
+      );
+    }
+    scroller.append(inner);
+    return make("div", { class: "live-guide" }, [
+      toolbar,
+      tabs,
+      channels.length
+        ? scroller
+        : empty("◉", "没有匹配的频道", "换一个分组或搜索词试试。"),
+    ]);
+  }
   async function live() {
     const result = await api("/api/channels");
     state.channels = Array.isArray(result) ? result : result?.channels || [];
+    const start = liveDayStart(state.liveDay);
+    const end = start + 86400;
+    try {
+      state.epg = await api(`/api/epg?start=${start}&end=${end}`);
+    } catch (error) {
+      state.epg = { programs: [], updated_at: 0, error: error.message };
+    }
     const root = make(
       "div",
       {},
       head(
         "电视直播",
-        "把熟悉的频道，放进你的客厅。",
-        admin() ? button("导入 M3U", "primary", importM3u) : null,
+        "像翻节目单一样，挑一个正在播的节目。",
+        make("div", { class: "head-actions" }, [
+          admin() ? button("导入 M3U", "primary", importM3u) : null,
+        ]),
       ),
     );
-    const grid = make("div", { class: "live-grid" });
-    const channels = state.channels.filter(
-      (c) =>
-        !state.query ||
-        `${c.name} ${c.group_name}`
-          .toLowerCase()
-          .includes(state.query.toLowerCase()),
-    );
-    if (!channels.length)
-      grid.append(
+    if (!state.channels.length) {
+      root.append(
         empty(
           "◉",
           "还没有直播频道",
@@ -577,44 +780,11 @@
           admin() ? button("导入 M3U", "primary", importM3u) : null,
         ),
       );
-    channels.forEach((c) =>
-      grid.append(
-        make("article", { class: "channel-card" }, [
-          make(
-            "button",
-            {
-              type: "button",
-              class: "channel-play",
-              "aria-label": `播放 ${c.name}`,
-              on: { click: () => play(c, true) },
-            },
-            [
-              c.logo
-                ? make("img", { class: "channel-logo", src: c.logo, alt: "" })
-                : make("span", { class: "channel-logo", text: "◉" }),
-              make("span", { class: "channel-copy" }, [
-                make("strong", { text: c.name }),
-                make("small", { text: c.group_name || "直播频道" }),
-              ]),
-            ],
-          ),
-          admin()
-            ? icon("×", `删除 ${c.name}`, async () => {
-                try {
-                  await api(`/api/channels/${encodeURIComponent(c.id)}`, {
-                    method: "DELETE",
-                  });
-                  toast("频道已删除");
-                  render();
-                } catch (e) {
-                  toast(e.message, true);
-                }
-              })
-            : null,
-        ]),
-      ),
-    );
-    root.append(grid);
+      return root;
+    }
+    const guide = make("div", { id: "live-guide" });
+    guide.append(guideView(start, end));
+    root.append(guide);
     return root;
   }
   function importM3u() {
@@ -730,7 +900,6 @@
         },
         art,
       ),
-      make("h3", { text: item.title }),
       make("div", {
         class: "media-meta",
         text: [item.year, item.remark, item.source_name]
@@ -777,30 +946,23 @@
     } else {
       if (!enabled.some((source) => String(source.id) === state.onlineSource))
         state.onlineSource = String(enabled[0].id);
-      const selector = make(
-        "select",
-        {
-          "aria-label": "浏览影视源",
-          on: {
-            change: (event) => {
-              state.onlineSource = event.target.value;
-              state.onlinePage = 1;
-              render();
-            },
-          },
-        },
-        enabled.map((source) =>
-          make("option", {
-            value: source.id,
-            selected: String(source.id) === state.onlineSource,
-            text: source.name,
-          }),
-        ),
-      );
       root.append(
-        make("div", { class: "catalog-toolbar" }, [
-          make("label", {}, ["影视源", selector]),
-          make("p", { class: "muted", text: "最新内容由当前影视源提供" }),
+        make("div", { class: "filters" }, [
+          ...enabled.map((source) =>
+            make("button", {
+              class: `filter-chip${String(source.id) === state.onlineSource ? " active" : ""}`,
+              type: "button",
+              text: source.name,
+              on: {
+                click: () => {
+                  state.onlineSource = String(source.id);
+                  state.onlinePage = 1;
+                  render();
+                },
+              },
+            }),
+          ),
+          make("span", { class: "sort-note", text: "最新内容" }),
         ]),
       );
       result = await api(
@@ -1423,6 +1585,78 @@
     );
     return root;
   }
+  async function epgSettings() {
+    const panel = make("section", { class: "panel source-settings" }, [
+      make("h2", { text: "电视节目单" }),
+      make("p", {
+        class: "panel-description",
+        text: "每行一个 XMLTV 地址（最多 4 个），后面的地址只补充前面缺失的节目；电视直播页按频道名称自动匹配。",
+      }),
+    ]);
+    let config = {
+      url: "http://epg.51zmt.top:8000/e.xml\nhttps://epg.112114.xyz/pp.xml",
+      programs: 0,
+      updated_at: 0,
+    };
+    try {
+      config = await api("/api/epg/config");
+    } catch (error) {
+      panel.append(make("p", { class: "form-error", text: error.message }));
+      return panel;
+    }
+    panel.append(
+      make("p", {
+        class: "panel-description",
+        text: config.updated_at
+          ? `已收录 ${config.programs} 条节目 · 更新于 ${clockTime(config.updated_at)}`
+          : "尚未拉取节目单。",
+      }),
+      make(
+        "form",
+        {
+          class: "form-row",
+          on: {
+            submit: async (event) => {
+              event.preventDefault();
+              try {
+                await api("/api/epg/config", {
+                  method: "PUT",
+                  body: { url: event.currentTarget.elements.url.value.trim() },
+                });
+                toast("节目单地址已保存，点击“立即刷新”拉取节目。");
+              } catch (error) {
+                toast(error.message, true);
+              }
+            },
+          },
+        },
+        [
+          make("label", {}, [
+            "XMLTV 地址（每行一个）",
+            make("textarea", {
+              name: "url",
+              rows: "3",
+              required: true,
+              maxlength: 4096,
+              placeholder: "http://epg.51zmt.top:8000/e.xml",
+              text: config.url,
+            }),
+          ]),
+          button("保存地址", "primary", null, { type: "submit" }),
+          button("立即刷新", "subtle", async () => {
+            try {
+              const result = await api("/api/epg/refresh", { method: "POST" });
+              toast(`节目单已更新：${result.matched_channels} 个频道`);
+              await render();
+            } catch (error) {
+              toast(error.message, true);
+            }
+          }),
+        ],
+      ),
+    );
+    return panel;
+  }
   async function sourceSettings() {
     const panel = make("section", { class: "panel source-settings" }, [
       make("h2", { text: "在线影视源" }),
@@ -1791,6 +2025,7 @@
       grid.append(users);
     }
     root.append(grid, await tvboxSettings());
+    if (admin()) root.append(await epgSettings());
     if (admin()) root.append(await sourceSettings());
     return root;
   }
@@ -1820,6 +2055,16 @@
                   : await settings();
       if (sequence !== renderSequence) return;
       main.replaceChildren(page);
+      if (pageName === "live" && state.liveDay === 0) {
+        const scroller = main.querySelector(".epg-scroll");
+        if (scroller) {
+          const start = liveDayStart(0);
+          scroller.scrollLeft = Math.max(
+            0,
+            ((Date.now() / 1000 - start) / 60) * EPG_MINUTE_PX - 240,
+          );
+        }
+      }
       if (pageName === "downloads")
         state.poll = setInterval(
           () => refreshDownloads().catch((e) => toast(e.message, true)),
@@ -1996,6 +2241,50 @@
     .forEach((el) =>
       el.addEventListener("click", () => setNav(el.dataset.view)),
     );
+  function applyTheme(theme) {
+    const dark = theme === "dark";
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    document
+      .querySelector('meta[name="theme-color"]')
+      ?.setAttribute("content", dark ? "#0B1322" : "#F2F2F7");
+    const toggle = $("theme-toggle");
+    toggle.setAttribute("aria-label", dark ? "切换浅色模式" : "切换深色模式");
+    toggle.title = toggle.getAttribute("aria-label");
+    try {
+      localStorage.setItem("polyview-theme", dark ? "dark" : "light");
+    } catch (_) {}
+  }
+  let savedTheme = "light";
+  try {
+    savedTheme = localStorage.getItem("polyview-theme") || "light";
+  } catch (_) {}
+  applyTheme(savedTheme);
+  $("theme-toggle").addEventListener("click", () =>
+    applyTheme(
+      document.documentElement.dataset.theme === "dark" ? "light" : "dark",
+    ),
+  );
+  const setNavigation = (open) => {
+    document.body.classList.toggle("nav-open", open);
+    $("nav-toggle").setAttribute("aria-expanded", String(open));
+  };
+  $("nav-toggle").addEventListener("click", () =>
+    setNavigation(!document.body.classList.contains("nav-open")),
+  );
+  document
+    .querySelectorAll(".sidebar [data-view]")
+    .forEach((el) => el.addEventListener("click", () => setNavigation(false)));
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && document.body.classList.contains("nav-open"))
+      setNavigation(false);
+  });
+  document.addEventListener("click", (event) => {
+    if (
+      event.target === document.body &&
+      document.body.classList.contains("nav-open")
+    )
+      setNavigation(false);
+  });
   $("logout-button").addEventListener("click", logout);
   $("mobile-logout").addEventListener("click", logout);
   $("help-button").addEventListener("click", () =>

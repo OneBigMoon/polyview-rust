@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod catalog;
+pub mod epg;
 pub mod legacy;
 pub mod library;
 pub mod network;
@@ -102,6 +103,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     catalog::init_schema(conn)?;
     tracking::init_schema(conn)?;
     tvbox::init_schema(conn)?;
+    epg::init_schema(conn)?;
     Ok(())
 }
 
@@ -115,6 +117,7 @@ pub fn router(state: Shared) -> Router {
         .merge(auth::router())
         .merge(library::router())
         .merge(network::router())
+        .merge(epg::router())
         .merge(playback::router())
         .merge(catalog::router())
         .merge(tracking::router())
