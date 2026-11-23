@@ -12,6 +12,7 @@ use futures_util::{StreamExt, stream};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use url::Url;
 
@@ -27,6 +28,15 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
             enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1))
         );",
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS catalog_types (
+            source_id INTEGER NOT NULL REFERENCES catalog_sources(id) ON DELETE CASCADE,
+            type_id INTEGER NOT NULL,
+            type_name TEXT NOT NULL,
+            PRIMARY KEY(source_id, type_id)
+        );
+        CREATE INDEX IF NOT EXISTS catalog_types_name ON catalog_types(type_name);",
+    )?;
     Ok(())
 }
 
@@ -39,6 +49,7 @@ pub fn router() -> Router<Shared> {
         )
         .route("/api/catalog/search", get(search_handler))
         .route("/api/catalog/discover", get(discover_handler))
+        .route("/api/catalog/categories", get(categories_handler))
         .route("/api/catalog/{source_id}/detail", get(detail_handler))
 }
 
@@ -232,6 +243,11 @@ pub struct SearchResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CategoriesResponse {
+    pub categories: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DiscoverResponse {
     pub results: Vec<CatalogSummary>,
     pub errors: Vec<SourceError>,
@@ -284,6 +300,13 @@ struct DiscoverQuery {
     source_id: Option<i64>,
     #[serde(default = "first_page")]
     page: u32,
+    category: Option<String>,
+    year: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CategoriesQuery {
+    refresh: Option<bool>,
 }
 
 fn first_page() -> u32 {
@@ -321,6 +344,11 @@ pub async fn search(state: &Shared, query: &str) -> Result<SearchResponse, AppEr
         errors: Vec::new(),
     };
     while let Some((source, result)) = responses.next().await {
+        if let Ok(page) = &result
+            && let Ok(conn) = state.conn()
+        {
+            let _ = remember_types(&conn, source.id, &page.items);
+        }
         match result {
             Ok(page) => response.results.extend(
                 page.items
@@ -341,62 +369,193 @@ pub async fn search(state: &Shared, query: &str) -> Result<SearchResponse, AppEr
     Ok(response)
 }
 
+fn remember_types(conn: &Connection, source_id: i64, items: &[Value]) -> Result<(), AppError> {
+    let mut statement = conn.prepare_cached(
+        "INSERT OR REPLACE INTO catalog_types(source_id,type_id,type_name) VALUES(?1,?2,?3)",
+    )?;
+    for item in items {
+        let Some(type_id) = item.get("type_id").and_then(Value::as_u64) else {
+            continue;
+        };
+        let name = text(item, "type_name");
+        if name.trim().is_empty() {
+            continue;
+        }
+        statement.execute(params![source_id, type_id as i64, name.trim()])?;
+    }
+    Ok(())
+}
+
+async fn refresh_categories(state: &Shared) -> Result<(), AppError> {
+    let active: Vec<Source> = sources(state)?
+        .into_iter()
+        .filter(|source| source.enabled)
+        .collect();
+    let mut jobs = Vec::new();
+    for source in &active {
+        for page in 1..=4 {
+            jobs.push((source.clone(), page));
+        }
+    }
+    let listings = stream::iter(jobs.into_iter().map(|(source, page)| async move {
+        let page = page.to_string();
+        let result = fetch_items(state, &source, &[("ac", "detail"), ("pg", &page)]).await;
+        (source.id, result)
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    let conn = state.conn()?;
+    for (source_id, result) in listings {
+        if let Ok(listing) = result
+            && remember_types(&conn, source_id, &listing.items).is_err()
+        {
+            continue;
+        }
+    }
+    Ok(())
+}
+
+async fn categories_handler(
+    State(state): State<Shared>,
+    _user: AuthUser,
+    Query(query): Query<CategoriesQuery>,
+) -> Result<Json<CategoriesResponse>, AppError> {
+    let existing = state
+        .conn()?
+        .query_row("SELECT COUNT(*) FROM catalog_types", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+    if query.refresh.unwrap_or(false) || existing == 0 {
+        refresh_categories(&state).await?;
+    }
+    let conn = state.conn()?;
+    let mut statement =
+        conn.prepare("SELECT DISTINCT type_name FROM catalog_types ORDER BY type_name")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut categories = BTreeSet::new();
+    for row in rows {
+        categories.insert(row?);
+    }
+    Ok(Json(CategoriesResponse {
+        categories: categories.into_iter().collect(),
+    }))
+}
+
 async fn discover_handler(
     State(state): State<Shared>,
     _user: AuthUser,
     Query(query): Query<DiscoverQuery>,
 ) -> Result<Json<DiscoverResponse>, AppError> {
-    discover(&state, query.source_id, query.page)
+    let category = query.category.as_deref().and_then(validate_filter);
+    let year = query.year.as_deref().and_then(validate_filter);
+    discover(&state, query.source_id, query.page, category, year)
         .await
         .map(Json)
+}
+
+fn validate_filter(raw: &str) -> Option<&str> {
+    let value = raw.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 pub async fn discover(
     state: &Shared,
     source_id: Option<i64>,
     page: u32,
+    category: Option<&str>,
+    year: Option<&str>,
 ) -> Result<DiscoverResponse, AppError> {
     if !(1..=10_000).contains(&page) {
         return Err(AppError::bad_request("Page must be between 1 and 10000"));
     }
-    let source = sources(state)?
+    if let Some(value) = category {
+        validate_text(value, "Category", 100)?;
+    }
+    if let Some(value) = year {
+        validate_text(value, "Year", 4)?;
+        let parsed: u16 = value
+            .parse()
+            .map_err(|_| AppError::bad_request("Year must be four digits"))?;
+        if !(1900..=2100).contains(&parsed) {
+            return Err(AppError::bad_request("Year must be between 1900 and 2100"));
+        }
+    }
+    let mut type_ids = BTreeMap::new();
+    if let Some(category) = category {
+        let conn = state.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT source_id,type_id FROM catalog_types WHERE type_name=?1 ORDER BY source_id,type_id",
+        )?;
+        let rows = statement.query_map([category], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (source_id, type_id) = row?;
+            type_ids.entry(source_id).or_insert(type_id);
+        }
+    }
+    let active: Vec<Source> = sources(state)?
         .into_iter()
-        .find(|source| source.enabled && source_id.is_none_or(|id| source.id == id));
+        .filter(|source| source.enabled && source_id.is_none_or(|id| source.id == id))
+        .filter(|source| category.is_none() || type_ids.contains_key(&source.id))
+        .collect();
+    if source_id.is_some() && active.is_empty() {
+        return Err(AppError::not_found("Source not found or disabled"));
+    }
+    let page_string = page.to_string();
+    let mut responses = stream::iter(active.into_iter().map(|source| {
+        let page_string = page_string.clone();
+        let type_string = type_ids.get(&source.id).map(ToString::to_string);
+        async move {
+            let mut query = vec![("ac", "detail"), ("pg", page_string.as_str())];
+            if let Some(type_id) = type_string.as_deref() {
+                query.push(("t", type_id));
+            }
+            if let Some(year) = year {
+                query.push(("year", year));
+            }
+            let result = fetch_items(state, &source, &query).await;
+            (source, result)
+        }
+    }))
+    .buffer_unordered(6);
+    let mut fetched = Vec::new();
+    while let Some((source, result)) = responses.next().await {
+        if let Ok(listing) = &result
+            && let Ok(conn) = state.conn()
+        {
+            let _ = remember_types(&conn, source.id, &listing.items);
+        }
+        fetched.push((source, result));
+    }
+    fetched.sort_by_key(|(source, _)| source.id);
     let mut result = DiscoverResponse {
         results: Vec::new(),
         errors: Vec::new(),
-        source_id: source.as_ref().map(|source| source.id),
+        source_id,
         page,
         page_count: 0,
         total: 0,
     };
-    let Some(source) = source else {
-        if source_id.is_some() {
-            return Err(AppError::not_found("Source not found or disabled"));
+    for (source, fetch) in fetched {
+        match fetch {
+            Ok(listing) => {
+                result.results.extend(
+                    listing
+                        .items
+                        .iter()
+                        .filter_map(|item| summary(&source, item))
+                        .take(1000),
+                );
+                result.page_count = result.page_count.max(listing.page_count);
+                result.total = result.total.saturating_add(listing.total);
+            }
+            Err(message) => result.errors.push(SourceError {
+                source_id: source.id,
+                message,
+            }),
         }
-        return Ok(result);
-    };
-    match fetch_items(
-        state,
-        &source,
-        &[("ac", "detail"), ("pg", &page.to_string())],
-    )
-    .await
-    {
-        Ok(listing) => {
-            result.results = listing
-                .items
-                .iter()
-                .filter_map(|item| summary(&source, item))
-                .take(1000)
-                .collect();
-            result.page_count = listing.page_count;
-            result.total = listing.total;
-        }
-        Err(message) => result.errors.push(SourceError {
-            source_id: source.id,
-            message,
-        }),
     }
     Ok(result)
 }
@@ -709,9 +868,16 @@ mod tests {
                 if let Some(word) = query.get("wd") {
                     assert_eq!(word, "中文 & A+B");
                 }
+                if let Some(kind) = query.get("t") {
+                    assert_eq!(kind, "13");
+                }
+                if let Some(year) = query.get("year") {
+                    assert_eq!(year, "2026");
+                }
                 Json(json!({"code":1,"pagecount":"7","total":70,"list":[{
                     "vod_id":42,"vod_name":"故事 <script>","vod_pic":"/poster.jpg",
                     "vod_year":2026,"vod_remarks":"更新至2集","vod_content":"<p>简介</p>",
+                    "type_id":13,"type_name":"国产剧",
                     "vod_play_from":"HLS$$$文件$$$无效",
                     "vod_play_url":"第1集$https://media.example/1.m3u8?x=1&y=2#第2集$https://media.example/2.m3u8$$$电影$https://media.example/a.mp4$$$伪协议$javascript:alert(1)"
                 }]}))
@@ -924,7 +1090,13 @@ mod tests {
     #[tokio::test]
     async fn discover_lists_latest_titles_and_page_metadata() {
         let (_temp, state) = state();
-        assert!(discover(&state, None, 1).await.unwrap().results.is_empty());
+        assert!(
+            discover(&state, None, 1, None, None)
+                .await
+                .unwrap()
+                .results
+                .is_empty()
+        );
         let (base, task) = fixture().await;
         state
             .conn()
@@ -934,14 +1106,14 @@ mod tests {
                 [format!("{base}/cms?key=retained")],
             )
             .unwrap();
-        let page = discover(&state, None, 2).await.unwrap();
-        assert_eq!(page.source_id, Some(1));
+        let page = discover(&state, None, 2, None, None).await.unwrap();
+        assert_eq!(page.source_id, None);
         assert_eq!(page.page, 2);
         assert_eq!(page.page_count, 7);
         assert_eq!(page.total, 70);
         assert_eq!(page.results[0].title, "故事 <script>");
-        assert!(discover(&state, None, 0).await.is_err());
-        assert!(discover(&state, Some(999), 1).await.is_err());
+        assert!(discover(&state, None, 0, None, None).await.is_err());
+        assert!(discover(&state, Some(999), 1, None, None).await.is_err());
         let raw = cms_query(&state, 1, &[("ac", "detail")]).await.unwrap();
         assert_eq!(raw["pagecount"], "7");
         assert!(
@@ -949,6 +1121,54 @@ mod tests {
                 .await
                 .is_err()
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn discover_aggregates_sources_and_applies_filters() {
+        let (_temp, state) = state();
+        let (base, task) = fixture().await;
+        {
+            let conn = state.conn().unwrap();
+            for side in ["a", "b"] {
+                conn.execute(
+                    "INSERT INTO catalog_sources(name,url) VALUES(?1,?2)",
+                    params![
+                        format!("CMS {side}"),
+                        format!("{base}/cms?key=retained&side={side}")
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let all = discover(&state, None, 1, None, None).await.unwrap();
+        assert_eq!(all.results.len(), 2);
+        assert_eq!(all.total, 140);
+        assert_eq!(all.page_count, 7);
+        let filtered = discover(&state, None, 1, Some("国产剧"), Some("2026"))
+            .await
+            .unwrap();
+        assert_eq!(filtered.results.len(), 2);
+        assert_eq!(filtered.total, 140);
+        let ids: Vec<i64> = state
+            .conn()
+            .unwrap()
+            .prepare("SELECT id FROM catalog_sources ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let one = discover(&state, Some(ids[0]), 1, None, None).await.unwrap();
+        assert_eq!(one.results.len(), 1);
+        assert_eq!(one.source_id, Some(ids[0]));
+        assert_eq!(one.total, 70);
+        assert!(
+            discover(&state, Some(ids[0]), 1, Some("不存在"), None)
+                .await
+                .is_err()
+        );
+        assert!(discover(&state, None, 1, None, Some("20x0")).await.is_err());
         task.abort();
     }
 }

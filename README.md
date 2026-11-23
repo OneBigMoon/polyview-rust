@@ -90,6 +90,8 @@ Media files are not moved or deleted. The original service remains the place to 
 
 An administrator adds a MacCMS-compatible HTTP(S) JSON API in the source settings. Source URLs must not contain embedded username/password credentials. Enabled sources appear in online browsing, search, and the TV feed. Disabled sources are unavailable for lookup and tracking; an in-use source can be disabled while its subscriptions are retained.
 
+Online browsing aggregates all enabled sources by default. Type and year filters are translated to each source's own numeric category IDs where available; selecting a single source remains possible.
+
 Choose a title, playback line, and episode to watch. The browser fetches online media through the authenticated playback proxy, which resolves relative HLS URLs without relying on the source's browser CORS settings. Source reachability, authorization, video codecs, and any source restrictions still apply.
 
 Add an online title to the tracking list to retain its current episode count and your watched count. Checks run after adding it, manually from the tracking page, and every ten minutes while PolyView is running. Automatic downloads are off by default. When enabled, the first play line whose episodes all end in a media extension (`.m3u8`, `.mp4`, and similar) supplies episodes after the watched count that have not already been queued for that subscription. Lines made of CMS share/parser pages are labelled **非直链** and skipped, because PolyView does not run source spiders. Failed or cancelled download jobs can be retried on the downloads page.
@@ -122,7 +124,7 @@ Media, catalog, tracking, download, and TV-feed APIs require a login. Initial se
 | Endpoint                                                                                    | Purpose                                                                        |
 | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | `GET/POST /api/sources`, `PUT/DELETE /api/sources/{id}`                                     | List and manage CMS sources                                                    |
-| `GET /api/catalog/discover`, `/api/catalog/search`, `/api/catalog/{source_id}/detail`       | Online browsing, search, and title details                                     |
+| `GET /api/catalog/discover`, `/api/catalog/categories`, `/api/catalog/search`, `/api/catalog/{source_id}/detail` | Multi-source browsing with filters, search, and title details |
 | `GET /api/playback?url=...`                                                                 | Authenticated HLS/video playback proxy                                         |
 | `GET/POST /api/tracking`, `PUT/DELETE /api/tracking/{id}`, `POST /api/tracking/check`       | Online subscriptions, watched counts, automatic download selection, and checks |
 | `GET/POST /api/downloads`, `DELETE /api/downloads/{id}`, `POST /api/downloads/{id}/retry`   | Queue, inspect, cancel, and retry downloads                                    |

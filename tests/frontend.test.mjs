@@ -25,6 +25,9 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
       this.currentTime = 0;
       this.duration = 100;
       this.paused = true;
+      this.controls = true;
+      this.muted = false;
+      this.volume = 1;
       this.playCalls = 0;
     }
     append(...children) {
@@ -114,6 +117,9 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "help-button",
     "help-close",
     "player-close",
+    "player-toggle",
+    "player-mute",
+    "player-fullscreen",
     "player-source",
     "player-dialog",
     "player-title",
@@ -198,6 +204,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     },
     console,
     URL,
+    URLSearchParams,
     Date,
     setTimeout: () => 1,
     clearTimeout() {},
@@ -213,7 +220,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms};\n})();",
+      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, online};\n})();",
     ),
     context,
   );
@@ -473,7 +480,14 @@ test("clicking a live channel starts playback once the manifest is ready", () =>
   app.hlsInstances[0].emit("manifest_parsed");
   assert.equal(video.playCalls, 1);
   assert.equal(video.paused, false);
-  app.closePlayer();
+  assert.equal(video.controls, false);
+  assert.equal(app.elements.get("player-toggle").hidden, false);
+  assert.equal(app.elements.get("player-mute").hidden, false);
+  assert.equal(app.elements.get("player-fullscreen").hidden, false);
+   app.closePlayer();
+  assert.equal(video.controls, true);
+  assert.equal(app.elements.get("player-toggle").hidden, true);
+
 });
 
 test("native live HLS starts playback without a separate play click", () => {
@@ -544,4 +558,48 @@ test("the theme toggle switches between light and dark", () => {
   assert.equal(toggle.getAttribute("aria-label"), "切换浅色模式");
   toggle.listeners.click[0]();
   assert.equal(app.documentElement.dataset.theme, "light");
+});
+
+test("discover aggregates sources and offers type and year filters", async () => {
+  const app = environment({
+    "/api/sources": [
+      { id: 1, name: "甲源", enabled: true },
+      { id: 2, name: "乙源", enabled: true },
+    ],
+    "/api/catalog/categories": { categories: ["国产剧", "动作片"] },
+    "/api/catalog/discover?page=1": {
+      results: [],
+      errors: [],
+      page_count: 1,
+      total: 0,
+    },
+    "/api/catalog/discover?page=1&category=%E5%9B%BD%E4%BA%A7%E5%89%A7&year=2025": {
+      results: [],
+      errors: [],
+      page_count: 1,
+      total: 0,
+    },
+  });
+  const page = await app.online();
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const labels = flatten(page)
+    .filter((node) => node.tagName === "BUTTON")
+    .map((node) => node.textContent);
+  assert.ok(labels.includes("全部影视源"), JSON.stringify(labels));
+  assert.ok(labels.includes("甲源"), JSON.stringify(labels));
+  assert.deepEqual(Array.from(app.state.categories), ["国产剧", "动作片"]);
+  const first = app.calls.find((call) =>
+    call.url.startsWith("/api/catalog/discover"),
+  );
+  assert.ok(first, JSON.stringify(app.calls.map((call) => call.url)));
+  app.calls.length = 0;
+  app.state.onlineCategory = "国产剧";
+  app.state.onlineYear = "2025";
+  await app.online();
+  const filtered = app.calls.find((call) =>
+    call.url.startsWith("/api/catalog/discover"),
+  );
+  assert.match(filtered.url, /category=%E5%9B%BD%E4%BA%A7%E5%89%A7/);
+  assert.match(filtered.url, /year=2025/);
 });

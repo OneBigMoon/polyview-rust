@@ -16,7 +16,10 @@
     player: null,
     poll: null,
     onlinePage: 1,
-    onlineSource: "",
+    onlineSource: "all",
+    onlineCategory: "",
+    onlineYear: "",
+    categories: null,
   };
   const esc = (v) => String(v ?? "");
   const n = (v, fallback = 0) =>
@@ -324,6 +327,22 @@
     button.hidden = false;
     button.textContent = `线路 ${player.sourceIndex + 1}/${player.sources.length} · 切换`;
   }
+  function updatePlayerControls() {
+    const player = state.player;
+    const video = $("video-player");
+    const live = Boolean(player?.live);
+    for (const id of ["player-toggle", "player-mute", "player-fullscreen"])
+      $(id).hidden = !live;
+    video.controls = !live;
+    if (!live) return;
+    $("player-toggle").textContent = video.paused ? "▶" : "❚❚";
+    $("player-toggle").setAttribute("aria-label", video.paused ? "播放" : "暂停");
+    $("player-mute").textContent = video.muted || video.volume === 0 ? "🔇" : "🔊";
+    $("player-mute").setAttribute(
+      "aria-label",
+      video.muted || video.volume === 0 ? "取消静音" : "静音",
+    );
+  }
   function failLiveSource() {
     const player = state.player;
     if (!player?.live) return;
@@ -456,7 +475,8 @@
       ? "LIVE NOW"
       : item.series || "NOW PLAYING";
     $("player-dialog").showModal();
-    attachPlayerSource();
+    updatePlayerControls();
+     attachPlayerSource();
   }
   async function saveProgress(force = false, keepalive = false) {
     const current = state.player,
@@ -535,6 +555,7 @@
         render();
     });
     state.player = null;
+    updatePlayerControls();
     $("player-source").hidden = true;
     const video = $("video-player");
     video.pause();
@@ -937,30 +958,96 @@
         ),
       );
     } else {
-      if (!enabled.some((source) => String(source.id) === state.onlineSource))
-        state.onlineSource = String(enabled[0].id);
+      if (
+        state.onlineSource !== "all" &&
+        !enabled.some((source) => String(source.id) === state.onlineSource)
+      )
+        state.onlineSource = "all";
+      if (!state.categories) {
+        try {
+          state.categories = (await api("/api/catalog/categories")).categories || [];
+        } catch {
+          state.categories = [];
+        }
+      }
+      if (
+        state.onlineCategory &&
+        !state.categories.includes(state.onlineCategory)
+      )
+        state.onlineCategory = "";
+      const filterSelect = (label, value, options, apply) => {
+        const select = make(
+          "select",
+          {
+            class: "filter-select",
+            "aria-label": label,
+            on: {
+              change: (event) => {
+                apply(event.target.value);
+                state.onlinePage = 1;
+                render();
+              },
+            },
+          },
+          options.map(([optionValue, text]) =>
+            make("option", { value: optionValue, text }),
+          ),
+        );
+        select.value = value;
+        return make("label", { class: "filter-label" }, [
+          make("span", { text: label }),
+          select,
+        ]);
+      };
+      const year = new Date().getFullYear();
       root.append(
         make("div", { class: "filters" }, [
-          ...enabled.map((source) =>
+          ...[
+            ["all", "全部影视源"],
+            ...enabled.map((source) => [String(source.id), source.name]),
+          ].map(([value, label]) =>
             make("button", {
-              class: `filter-chip${String(source.id) === state.onlineSource ? " active" : ""}`,
+              class: `filter-chip${value === state.onlineSource ? " active" : ""}`,
               type: "button",
-              text: source.name,
+              text: label,
               on: {
                 click: () => {
-                  state.onlineSource = String(source.id);
+                  state.onlineSource = value;
                   state.onlinePage = 1;
                   render();
                 },
               },
             }),
           ),
-          make("span", { class: "sort-note", text: "最新内容" }),
+          filterSelect(
+            "类型",
+            state.onlineCategory,
+            [
+              ["", "全部类型"],
+              ...state.categories.map((category) => [category, category]),
+            ],
+            (value) => (state.onlineCategory = value),
+          ),
+          filterSelect(
+            "年份",
+            state.onlineYear,
+            [
+              ["", "全部年份"],
+              ...Array.from({ length: 7 }, (_, index) => {
+                const item = String(year - index);
+                return [item, item];
+              }),
+            ],
+            (value) => (state.onlineYear = value),
+          ),
         ]),
       );
-      result = await api(
-        `/api/catalog/discover?source_id=${encodeURIComponent(state.onlineSource)}&page=${state.onlinePage}`,
-      );
+      const params = new URLSearchParams({ page: String(state.onlinePage) });
+      if (state.onlineSource !== "all")
+        params.set("source_id", state.onlineSource);
+      if (state.onlineCategory) params.set("category", state.onlineCategory);
+      if (state.onlineYear) params.set("year", state.onlineYear);
+      result = await api(`/api/catalog/discover?${params}`);
     }
     if (result.errors?.length)
       root.append(
@@ -2280,6 +2367,29 @@
     event.preventDefault();
     closePlayer();
   });
+  $("player-toggle").addEventListener("click", () => {
+    const video = $("video-player");
+    if (video.paused)
+      video
+        .play()
+        .catch(() =>
+          toast("浏览器阻止了自动播放，请点击播放器开始直播。", true),
+        );
+    else video.pause();
+  });
+  $("player-mute").addEventListener("click", () => {
+    const video = $("video-player");
+    video.muted = !video.muted;
+    updatePlayerControls();
+  });
+  $("player-fullscreen").addEventListener("click", () => {
+    const dialog = $("player-dialog");
+    if (document.fullscreenElement) document.exitFullscreen?.();
+    else dialog.requestFullscreen?.();
+  });
+  for (const event of ["play", "pause", "volumechange"])
+    $("video-player").addEventListener(event, updatePlayerControls);
+
   $("video-player").addEventListener("timeupdate", () => saveProgress());
   $("video-player").addEventListener("pause", () => saveProgress(true));
   $("video-player").addEventListener("ended", () => saveProgress(true));
