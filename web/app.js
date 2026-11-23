@@ -337,11 +337,9 @@
       ? `/api/playback?url=${encodeURIComponent(upstream)}`
       : `/api/library/${encodeURIComponent(item.id)}/stream`;
     const hlsSource = /\.m3u8(?:[?#]|$)/i.test(upstream || source);
-    if (
-      hlsSource &&
-      !video.canPlayType("application/vnd.apple.mpegurl") &&
-      window.Hls?.isSupported()
-    ) {
+    const nativeHls =
+      video.canPlayType("application/vnd.apple.mpegurl") === "probably";
+    if (hlsSource && !nativeHls && window.Hls?.isSupported()) {
       const hls = new window.Hls({ enableWorker: false });
       state.hls = hls;
       hls.on(window.Hls.Events.ERROR, (_, data) => {

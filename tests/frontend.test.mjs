@@ -8,7 +8,7 @@ const application = await readFile(
   "utf8",
 );
 
-function environment(routes = {}) {
+function environment(routes = {}, { canPlayType = () => "" } = {}) {
   const elements = new Map();
   const calls = [];
   const order = [];
@@ -74,8 +74,8 @@ function environment(routes = {}) {
       this.open = false;
       order.push(`close:${this.attributes.id}`);
     }
-    canPlayType() {
-      return "";
+    canPlayType(type) {
+      return canPlayType(type);
     }
     load() {}
     pause() {}
@@ -204,6 +204,27 @@ test("remote HLS chooses the HLS player using the original URL and routes throug
   app.closePlayer();
   assert.equal(app.hlsInstances[0].destroyed, true);
   assert.equal(app.elements.get("player-dialog").open, false);
+});
+
+test("Chrome's tentative HLS support uses hls.js instead of native playback", () => {
+  const app = environment({}, { canPlayType: () => "maybe" });
+  app.play({ title: "Live", url: "https://source.example/live.m3u8" }, true);
+  assert.equal(app.hlsInstances.length, 1);
+  assert.equal(
+    app.hlsInstances[0].source,
+    "/api/playback?url=https%3A%2F%2Fsource.example%2Flive.m3u8",
+  );
+  assert.equal(app.elements.get("video-player").src, undefined);
+});
+
+test("native HLS playback is used only when the browser reports it can play", () => {
+  const app = environment({}, { canPlayType: () => "probably" });
+  app.play({ title: "Live", url: "https://source.example/live.m3u8" }, true);
+  assert.equal(app.hlsInstances.length, 0);
+  assert.equal(
+    app.elements.get("video-player").src,
+    "/api/playback?url=https%3A%2F%2Fsource.example%2Flive.m3u8",
+  );
 });
 
 test("remote viewing records tracked watched episodes without writing local-library progress", async () => {
