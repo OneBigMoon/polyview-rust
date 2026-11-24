@@ -968,12 +968,36 @@
     }
     dialog.showModal();
   }
-  const catalogGroupKey = (item) => {
-    const title = String(item.title ?? "")
+  const normalizedCatalogTitle = (title) => {
+    const value = String(title ?? "")
       .normalize("NFKC")
       .trim()
       .toLocaleLowerCase()
-      .replace(/\s+/g, " ");
+      .replace(/[\s.·\-]*[\(（]?(?:19|20)\d{2}[\)）]?$/u, "");
+    return value.replace(
+      /[\s:：,，.。!！?？、·・\-—_()（）\[\]【】《》"“”'’]/gu,
+      "",
+    );
+  };
+  const displayCatalogTitle = (title) => {
+    const value = String(title ?? "").normalize("NFKC").trim();
+    return (
+      value
+        .replace(/[\s.·\-]*[\(（]?(?:19|20)\d{2}[\)）]?$/u, "")
+        .trim() || value
+    );
+  };
+  const sourceRank = (source) => {
+    const quality = sourceQuality(source).toUpperCase();
+    if (quality.includes("4K") || quality.includes("2160")) return 5;
+    if (quality.includes("2K") || quality.includes("1440")) return 4;
+    if (quality.includes("1080")) return 3;
+    if (quality.includes("720")) return 2;
+    if (quality.includes("HD") || quality.includes("高清")) return 1;
+    return 0;
+  };
+  const catalogGroupKey = (item) => {
+    const title = normalizedCatalogTitle(item.title);
     const year = String(item.year ?? "").trim();
     return title
       ? `${item.kind || "other"}|${title}|${year}`
@@ -985,7 +1009,11 @@
       const key = catalogGroupKey(item);
       let group = groups.get(key);
       if (!group) {
-        group = { ...item, sources: [] };
+        group = {
+          ...item,
+          title: displayCatalogTitle(item.title),
+          sources: [],
+        };
         groups.set(key, group);
       }
       if (!group.cover && item.cover) group.cover = item.cover;
@@ -1003,6 +1031,18 @@
       if (!existing) {
         group.sources.push(source);
         changed.add(key);
+      }
+      group.sources.sort(
+        (left, right) =>
+          sourceRank(right) - sourceRank(left) ||
+          String(left.source_name).localeCompare(String(right.source_name), "zh-CN"),
+      );
+      const best = group.sources[0];
+      if (best) {
+        group.source_id = best.source_id;
+        group.id = best.id;
+        group.source_name = best.source_name;
+        group.remark = best.remark;
       }
     });
     return changed;
@@ -1094,6 +1134,25 @@
     }
     let result;
     const groups = new Map();
+    const groupOrder = [];
+    const compareGroupKeys = (leftKey, rightKey) => {
+      const left = groups.get(leftKey);
+      const right = groups.get(rightKey);
+      const leftSources = left.sources?.length || 1;
+      const rightSources = right.sources?.length || 1;
+      if (rightSources !== leftSources) return rightSources - leftSources;
+      const leftYear = Number(left.year) || 0;
+      const rightYear = Number(right.year) || 0;
+      if (rightYear !== leftYear) return rightYear - leftYear;
+      return String(left.title).localeCompare(String(right.title), "zh-CN");
+    };
+    const syncGroupOrder = () => {
+      const renderedKeys = new Set(groupOrder.slice(0, rendered));
+      const tail = [...groups.keys()]
+        .filter((key) => !renderedKeys.has(key))
+        .sort(compareGroupKeys);
+      groupOrder.splice(rendered, groupOrder.length - rendered, ...tail);
+    };
     const paramsFor = (page) => {
       const params = new URLSearchParams({ page: String(page) });
       if (state.onlineSource !== "all")
@@ -1239,13 +1298,14 @@
     let rendered = 0;
     const batchSize = 20;
     const renderNextBatch = () => {
-      const all = [...groups.values()];
-      const end = Math.min(rendered + batchSize, all.length);
-      for (; rendered < end; rendered += 1) renderGroup(all[rendered]);
+      const end = Math.min(rendered + batchSize, groupOrder.length);
+      for (; rendered < end; rendered += 1)
+        renderGroup(groups.get(groupOrder[rendered]));
       if (summary) {
         summary.textContent = `已显示 ${cards.size} 组影片`;
       }
     };
+    syncGroupOrder();
     renderNextBatch();
     if (!cards.size)
       grid.append(
@@ -1267,7 +1327,7 @@
       more.className = "discover-end";
       more.replaceChildren(make("span", { text: "已经到底了" }));
     };
-    if (rendered < groups.size || hasMorePages) {
+    if (rendered < groupOrder.length || hasMorePages) {
       more = make(
         "div",
         { class: "discover-more", role: "status" },
@@ -1280,9 +1340,9 @@
       moreText = more.children[more.children.length - 1];
       const loadMore = async () => {
         if (loading || sequence !== renderSequence) return;
-        if (rendered < groups.size) {
+        if (rendered < groupOrder.length) {
           renderNextBatch();
-          if (rendered >= groups.size && !hasMorePages) showEnd();
+          if (rendered >= groupOrder.length && !hasMorePages) showEnd();
           return;
         }
         if (!hasMorePages) return;
@@ -1299,9 +1359,10 @@
           changed.forEach((key) => {
             if (cards.has(key)) renderGroup(groups.get(key));
           });
+          syncGroupOrder();
           renderNextBatch();
           hasMorePages = state.onlinePage < page.page_count;
-          if (rendered >= groups.size && !hasMorePages) {
+          if (rendered >= groupOrder.length && !hasMorePages) {
             showEnd();
           } else {
             more.classList.remove("loading");

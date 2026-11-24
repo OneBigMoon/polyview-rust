@@ -862,6 +862,111 @@ test("discover merges the same media from multiple sources into one card", async
     "2024 · 甲源",
   );
 });
+test("discover merges titles with a trailing year and chooses the better source", async () => {
+  const app = environment({
+    "/api/sources": [
+      { id: 1, name: "甲源", enabled: true },
+      { id: 2, name: "乙源", enabled: true },
+    ],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": {
+      results: [
+        {
+          id: "11",
+          source_id: 1,
+          source_name: "甲源",
+          title: "片名.2026",
+          year: "2026",
+          remark: "正片",
+        },
+        {
+          id: "22",
+          source_id: 2,
+          source_name: "乙源",
+          title: "片名",
+          year: "2026",
+          remark: "1080P",
+        },
+      ],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 2,
+    },
+  });
+  const page = await app.online();
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const cards = flatten(page).filter(
+    (node) => node.className === "media-card",
+  );
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0]._sourceBadge.textContent, "聚合 2 源");
+  assert.equal(
+    flatten(cards[0]).find((node) => node.className === "poster-name")
+      .textContent,
+    "片名",
+  );
+  assert.match(cards[0]._meta.textContent, /2 个影视源/);
+});
+test("discover shows the most aggregated groups first", async () => {
+  const app = environment({
+    "/api/sources": [
+      { id: 1, name: "甲源", enabled: true },
+      { id: 2, name: "乙源", enabled: true },
+    ],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": {
+      results: [
+        {
+          id: "11",
+          source_id: 1,
+          source_name: "甲源",
+          title: "单源甲",
+          year: "2026",
+        },
+        {
+          id: "12",
+          source_id: 1,
+          source_name: "甲源",
+          title: "单源乙",
+          year: "2026",
+        },
+        {
+          id: "21",
+          source_id: 1,
+          source_name: "甲源",
+          title: "多源影片",
+          year: "2026",
+        },
+        {
+          id: "22",
+          source_id: 2,
+          source_name: "乙源",
+          title: "多源影片",
+          year: "2026",
+        },
+      ],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 4,
+    },
+  });
+  const page = await app.online();
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const cards = flatten(page).filter(
+    (node) => node.className === "media-card",
+  );
+  assert.equal(cards.length, 3);
+  assert.equal(cards[0]._sourceBadge.textContent, "聚合 2 源");
+  assert.equal(
+    flatten(cards[0]).find((node) => node.className === "poster-name")
+      .textContent,
+    "多源影片",
+  );
+});
 test("movie and series with the same title and year stay separate", async () => {
   const results = [
     {
