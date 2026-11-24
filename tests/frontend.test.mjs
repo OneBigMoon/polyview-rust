@@ -855,6 +855,20 @@ test("movie and series with the same title and year stay separate", async () => 
       page_count: 1,
       total: 2,
     },
+    "/api/catalog/discover?page=1&kind=movie": {
+      results: [results[0]],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 1,
+    },
+    "/api/catalog/discover?page=1&kind=series": {
+      results: [results[1]],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 1,
+    },
   });
   const flatten = (node) =>
     [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);

@@ -301,6 +301,7 @@ struct DiscoverQuery {
     source_id: Option<i64>,
     #[serde(default = "first_page")]
     page: u32,
+    kind: Option<String>,
     category: Option<String>,
     year: Option<String>,
 }
@@ -448,9 +449,10 @@ async fn discover_handler(
     _user: AuthUser,
     Query(query): Query<DiscoverQuery>,
 ) -> Result<Json<DiscoverResponse>, AppError> {
+    let kind = query.kind.as_deref().and_then(validate_filter);
     let category = query.category.as_deref().and_then(validate_filter);
     let year = query.year.as_deref().and_then(validate_filter);
-    discover(&state, query.source_id, query.page, category, year)
+    discover(&state, query.source_id, query.page, kind, category, year)
         .await
         .map(Json)
 }
@@ -464,11 +466,17 @@ pub async fn discover(
     state: &Shared,
     source_id: Option<i64>,
     page: u32,
+    kind: Option<&str>,
     category: Option<&str>,
     year: Option<&str>,
 ) -> Result<DiscoverResponse, AppError> {
     if !(1..=10_000).contains(&page) {
         return Err(AppError::bad_request("Page must be between 1 and 10000"));
+    }
+    if let Some(value) = kind
+        && !matches!(value, "movie" | "series" | "variety" | "anime" | "other")
+    {
+        return Err(AppError::bad_request("Unknown media kind"));
     }
     if let Some(value) = category {
         validate_text(value, "Category", 100)?;
@@ -482,7 +490,7 @@ pub async fn discover(
             return Err(AppError::bad_request("Year must be between 1900 and 2100"));
         }
     }
-    let mut type_ids = BTreeMap::new();
+    let mut type_ids: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     if let Some(category) = category {
         let conn = state.conn()?;
         let mut statement = conn.prepare(
@@ -493,21 +501,61 @@ pub async fn discover(
         })?;
         for row in rows {
             let (source_id, type_id) = row?;
-            type_ids.entry(source_id).or_insert(type_id);
+            let ids = type_ids.entry(source_id).or_default();
+            if !ids.contains(&type_id) {
+                ids.push(type_id);
+            }
+        }
+    } else if let Some(kind) = kind
+        && kind != "other"
+    {
+        let conn = state.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT source_id,type_id,type_name FROM catalog_types ORDER BY source_id,type_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (source_id, type_id, type_name) = row?;
+            if media_kind(&type_name) != kind {
+                continue;
+            }
+            let ids = type_ids.entry(source_id).or_default();
+            if !ids.contains(&type_id) {
+                ids.push(type_id);
+            }
         }
     }
+    let require_type = category.is_some() || kind.is_some_and(|kind| kind != "other");
     let active: Vec<Source> = sources(state)?
         .into_iter()
         .filter(|source| source.enabled && source_id.is_none_or(|id| source.id == id))
-        .filter(|source| category.is_none() || type_ids.contains_key(&source.id))
+        .filter(|source| {
+            !require_type || type_ids.get(&source.id).is_some_and(|ids| !ids.is_empty())
+        })
         .collect();
     if source_id.is_some() && active.is_empty() {
         return Err(AppError::not_found("Source not found or disabled"));
     }
     let page_string = page.to_string();
-    let mut responses = stream::iter(active.into_iter().map(|source| {
+    let mut jobs = Vec::new();
+    for source in active {
+        match type_ids.get(&source.id) {
+            Some(ids) if !ids.is_empty() => {
+                for type_id in ids {
+                    jobs.push((source.clone(), Some(type_id.to_string())));
+                }
+            }
+            _ => jobs.push((source, None)),
+        }
+    }
+    let mut responses = stream::iter(jobs.into_iter().map(|(source, type_string)| {
         let page_string = page_string.clone();
-        let type_string = type_ids.get(&source.id).map(ToString::to_string);
         async move {
             let mut query = vec![("ac", "detail"), ("pg", page_string.as_str())];
             if let Some(type_id) = type_string.as_deref() {
@@ -520,7 +568,7 @@ pub async fn discover(
             (source, result)
         }
     }))
-    .buffer_unordered(6);
+    .buffer_unordered(8);
     let mut fetched = Vec::new();
     while let Some((source, result)) = responses.next().await {
         if let Ok(listing) = &result
@@ -531,6 +579,7 @@ pub async fn discover(
         fetched.push((source, result));
     }
     fetched.sort_by_key(|(source, _)| source.id);
+    let mut seen = BTreeSet::new();
     let mut result = DiscoverResponse {
         results: Vec::new(),
         errors: Vec::new(),
@@ -542,20 +591,33 @@ pub async fn discover(
     for (source, fetch) in fetched {
         match fetch {
             Ok(listing) => {
-                result.results.extend(
-                    listing
-                        .items
-                        .iter()
-                        .filter_map(|item| summary(&source, item))
-                        .take(1000),
-                );
+                for item in listing
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        kind.is_none_or(|kind| media_kind(&text(item, "type_name")) == kind)
+                    })
+                    .filter_map(|item| summary(&source, item))
+                {
+                    if seen.insert((item.source_id, item.id.clone())) {
+                        result.results.push(item);
+                    }
+                }
                 result.page_count = result.page_count.max(listing.page_count);
                 result.total = result.total.saturating_add(listing.total);
             }
-            Err(message) => result.errors.push(SourceError {
-                source_id: source.id,
-                message,
-            }),
+            Err(message) => {
+                if !result
+                    .errors
+                    .iter()
+                    .any(|error| error.source_id == source.id)
+                {
+                    result.errors.push(SourceError {
+                        source_id: source.id,
+                        message,
+                    });
+                }
+            }
         }
     }
     Ok(result)
@@ -618,12 +680,20 @@ fn text(item: &Value, field: &str) -> String {
 
 fn media_kind(type_name: &str) -> &'static str {
     let name = type_name.trim();
-    if name.contains("电影") || name.ends_with('片') {
+    if name.contains("解说")
+        || name.contains("纪录片")
+        || name.contains("记录片")
+        || name.contains("预告片")
+    {
+        "other"
+    } else if name.contains("电影") {
+        "movie"
+    } else if name.contains("动漫") || name.contains("动画") || name.contains("漫剧") {
+        "anime"
+    } else if name.ends_with('片') {
         "movie"
     } else if name.contains("综艺") || name.contains("晚会") || name.contains("脱口秀") {
         "variety"
-    } else if name.contains("动漫") || name.contains("动画") || name.contains("漫剧") {
-        "anime"
     } else if name.contains('剧') {
         "series"
     } else {
@@ -883,6 +953,9 @@ mod tests {
         assert_eq!(media_kind("剧情片"), "movie");
         assert_eq!(media_kind("动漫电影"), "movie");
         assert_eq!(media_kind("国产动漫"), "anime");
+        assert_eq!(media_kind("动画片"), "anime");
+        assert_eq!(media_kind("纪录片"), "other");
+        assert_eq!(media_kind("电影解说"), "other");
         assert_eq!(media_kind("大陆综艺"), "variety");
         assert_eq!(media_kind("篮球"), "other");
         assert_eq!(media_kind(""), "other");
@@ -896,16 +969,20 @@ mod tests {
                 if let Some(word) = query.get("wd") {
                     assert_eq!(word, "中文 & A+B");
                 }
-                if let Some(kind) = query.get("t") {
-                    assert_eq!(kind, "13");
-                }
+                let type_id = query.get("t").map(String::as_str).unwrap_or("13");
+                let (vod_id, title, type_name) = match type_id {
+                    "5" => (51, "电影甲", "动作片"),
+                    "6" => (61, "电影乙", "剧情片"),
+                    "13" => (42, "故事 <script>", "国产剧"),
+                    other => panic!("unexpected type {other}"),
+                };
                 if let Some(year) = query.get("year") {
                     assert_eq!(year, "2026");
                 }
                 Json(json!({"code":1,"pagecount":"7","total":70,"list":[{
-                    "vod_id":42,"vod_name":"故事 <script>","vod_pic":"/poster.jpg",
+                    "vod_id":vod_id,"vod_name":title,"vod_pic":"/poster.jpg",
                     "vod_year":2026,"vod_remarks":"更新至2集","vod_content":"<p>简介</p>",
-                    "type_id":13,"type_name":"国产剧",
+                    "type_id":type_id.parse::<u16>().unwrap(),"type_name":type_name,
                     "vod_play_from":"HLS$$$文件$$$无效",
                     "vod_play_url":"第1集$https://media.example/1.m3u8?x=1&y=2#第2集$https://media.example/2.m3u8$$$电影$https://media.example/a.mp4$$$伪协议$javascript:alert(1)"
                 }]}))
@@ -1120,7 +1197,7 @@ mod tests {
     async fn discover_lists_latest_titles_and_page_metadata() {
         let (_temp, state) = state();
         assert!(
-            discover(&state, None, 1, None, None)
+            discover(&state, None, 1, None, None, None)
                 .await
                 .unwrap()
                 .results
@@ -1135,14 +1212,18 @@ mod tests {
                 [format!("{base}/cms?key=retained")],
             )
             .unwrap();
-        let page = discover(&state, None, 2, None, None).await.unwrap();
+        let page = discover(&state, None, 2, None, None, None).await.unwrap();
         assert_eq!(page.source_id, None);
         assert_eq!(page.page, 2);
         assert_eq!(page.page_count, 7);
         assert_eq!(page.total, 70);
         assert_eq!(page.results[0].title, "故事 <script>");
-        assert!(discover(&state, None, 0, None, None).await.is_err());
-        assert!(discover(&state, Some(999), 1, None, None).await.is_err());
+        assert!(discover(&state, None, 0, None, None, None).await.is_err());
+        assert!(
+            discover(&state, Some(999), 1, None, None, None)
+                .await
+                .is_err()
+        );
         let raw = cms_query(&state, 1, &[("ac", "detail")]).await.unwrap();
         assert_eq!(raw["pagecount"], "7");
         assert!(
@@ -1169,12 +1250,21 @@ mod tests {
                 )
                 .unwrap();
             }
+            conn.execute_batch(
+                "INSERT INTO catalog_types(source_id,type_id,type_name)
+                 SELECT id,5,'动作片' FROM catalog_sources;
+                 INSERT INTO catalog_types(source_id,type_id,type_name)
+                 SELECT id,6,'剧情片' FROM catalog_sources;
+                 INSERT INTO catalog_types(source_id,type_id,type_name)
+                 SELECT id,13,'国产剧' FROM catalog_sources;",
+            )
+            .unwrap();
         }
-        let all = discover(&state, None, 1, None, None).await.unwrap();
+        let all = discover(&state, None, 1, None, None, None).await.unwrap();
         assert_eq!(all.results.len(), 2);
         assert_eq!(all.total, 140);
         assert_eq!(all.page_count, 7);
-        let filtered = discover(&state, None, 1, Some("国产剧"), Some("2026"))
+        let filtered = discover(&state, None, 1, None, Some("国产剧"), Some("2026"))
             .await
             .unwrap();
         assert_eq!(filtered.results.len(), 2);
@@ -1188,16 +1278,38 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        let one = discover(&state, Some(ids[0]), 1, None, None).await.unwrap();
+        let one = discover(&state, Some(ids[0]), 1, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(one.results.len(), 1);
         assert_eq!(one.source_id, Some(ids[0]));
         assert_eq!(one.total, 70);
+        let movies = discover(&state, None, 1, Some("movie"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(movies.results.len(), 4);
+        assert_eq!(movies.total, 280);
+        assert!(movies.results.iter().all(|item| item.kind == "movie"));
+        let series = discover(&state, None, 1, Some("series"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(series.results.len(), 2);
+        assert!(series.results.iter().all(|item| item.kind == "series"));
         assert!(
-            discover(&state, Some(ids[0]), 1, Some("不存在"), None)
+            discover(&state, None, 1, Some("bogus"), None, None)
                 .await
                 .is_err()
         );
-        assert!(discover(&state, None, 1, None, Some("20x0")).await.is_err());
+        assert!(
+            discover(&state, Some(ids[0]), 1, None, Some("不存在"), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            discover(&state, None, 1, None, None, Some("20x0"))
+                .await
+                .is_err()
+        );
         task.abort();
     }
 }

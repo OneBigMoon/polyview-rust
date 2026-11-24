@@ -1087,6 +1087,7 @@
       const params = new URLSearchParams({ page: String(page) });
       if (state.onlineSource !== "all")
         params.set("source_id", state.onlineSource);
+      if (state.onlineKind) params.set("kind", state.onlineKind);
       if (state.onlineCategory) params.set("category", state.onlineCategory);
       if (state.onlineYear) params.set("year", state.onlineYear);
       return params;
