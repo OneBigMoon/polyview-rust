@@ -568,7 +568,7 @@ pub async fn discover(
             (source, result)
         }
     }))
-    .buffer_unordered(8);
+    .buffer_unordered(16);
     let mut fetched = Vec::new();
     while let Some((source, result)) = responses.next().await {
         if let Ok(listing) = &result

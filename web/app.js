@@ -2353,7 +2353,12 @@
     main.replaceChildren(
       make("div", { class: "loading-state" }, [
         make("span", { class: "spinner" }),
-        make("p", { text: "正在加载…" }),
+        make("p", {
+          text:
+            pageName === "online" && state.onlineKind
+              ? `正在从各影视源加载${kindLabel(state.onlineKind)}…`
+              : "正在加载…",
+        }),
       ]),
     );
     try {
