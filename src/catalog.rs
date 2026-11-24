@@ -338,6 +338,7 @@ pub struct CatalogSummary {
     pub year: String,
     pub remark: String,
     pub kind: String,
+    pub lang: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -418,6 +419,7 @@ struct DiscoverQuery {
 #[derive(Deserialize)]
 struct CategoriesQuery {
     refresh: Option<bool>,
+    kind: Option<String>,
 }
 
 fn first_page() -> u32 {
@@ -569,12 +571,24 @@ async fn categories_handler(
         refresh_categories(&state).await?;
     }
     let conn = state.conn()?;
+    let kind = query.kind.as_deref().and_then(validate_filter);
+    if let Some(value) = kind
+        && !matches!(
+            value,
+            "movie" | "series" | "variety" | "anime" | "child" | "other"
+        )
+    {
+        return Err(AppError::bad_request("Unknown media kind"));
+    }
     let mut statement =
         conn.prepare("SELECT DISTINCT type_name FROM catalog_types ORDER BY type_name")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut categories = BTreeSet::new();
     for row in rows {
-        categories.insert(row?);
+        let name = row?;
+        if kind.is_none_or(|value| media_kind(&name) == value) {
+            categories.insert(name);
+        }
     }
     Ok(Json(CategoriesResponse {
         categories: categories.into_iter().collect(),
@@ -634,13 +648,20 @@ pub async fn discover(
     if let Some(category) = category {
         let conn = state.conn()?;
         let mut statement = conn.prepare(
-            "SELECT source_id,type_id FROM catalog_types WHERE type_name=?1 ORDER BY source_id,type_id",
+            "SELECT source_id,type_id,type_name FROM catalog_types WHERE type_name=?1 ORDER BY source_id,type_id",
         )?;
         let rows = statement.query_map([category], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         for row in rows {
-            let (source_id, type_id) = row?;
+            let (source_id, type_id, type_name) = row?;
+            if kind.is_some_and(|value| media_kind(&type_name) != value) {
+                continue;
+            }
             let ids = type_ids.entry(source_id).or_default();
             if !ids.contains(&type_id) {
                 ids.push(type_id);
@@ -878,6 +899,7 @@ fn summary(source: &Source, item: &Value) -> Option<CatalogSummary> {
         year: text(item, "vod_year"),
         remark: text(item, "vod_remarks"),
         kind: media_kind(&text(item, "type_name")).to_owned(),
+        lang: text(item, "vod_lang"),
     })
 }
 

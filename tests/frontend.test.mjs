@@ -19,6 +19,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
       this.children = [];
       this.attributes = {};
       this.listeners = {};
+      this.hidden = false;
       this.dataset = {};
       this.classes = new Set();
       this.classList = {
@@ -45,6 +46,11 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     }
     prepend(child) {
       this.children.unshift(child);
+    }
+    insertBefore(child, reference) {
+      const index = this.children.indexOf(reference);
+      if (index < 0) this.children.push(child);
+      else this.children.splice(index, 0, child);
     }
     get firstChild() {
       return this.children[0];
@@ -139,12 +145,21 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "player-source",
     "player-guide",
     "player-stage",
+    "player-prev",
+    "player-next",
+    "player-hud",
+    "player-hud-title",
+    "player-hud-kind",
+    "player-hud-close",
     "player-dialog",
     "player-title",
     "player-kind",
     "player-message",
     "video-player",
     "search-input",
+    "search-clear",
+    "series-badge",
+    "downloads-badge",
     "theme-toggle",
     "nav-toggle",
     "toast",
@@ -190,6 +205,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
       this.destroyed = true;
     }
   }
+  const meta = new Element("meta");
+  meta.setAttribute("name", "theme-color");
   const document = {
     fullscreenElement: null,
     activeElement: null,
@@ -202,7 +219,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     getElementById: (id) => elements.get(id) ?? null,
     createElement: (tag) => new Element(tag),
     createTextNode: (text) => ({ nodeType: 3, textContent: text }),
-    querySelector: () => null,
+    querySelector: (selector) =>
+      selector === 'meta[name="theme-color"]' ? meta : null,
     querySelectorAll: () => [],
     dispatchEvent(type) {
       (this.listeners?.[type] ?? []).forEach((cb) => cb({ type }));
@@ -251,13 +269,14 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, online};\n})();",
+      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, online, updateNavBadges, library};\n})();",
     ),
     context,
   );
   return {
     document,
     elements,
+    meta,
     calls,
     order,
     hlsInstances,
@@ -526,6 +545,19 @@ test("clicking a live channel starts playback once the manifest is ready", () =>
   assert.equal(app.elements.get("player-toggle").hidden, true);
 
 });
+
+test("playback toggles the background pause state", () => {
+  const app = environment();
+  const video = app.elements.get("video-player");
+  app.play({ name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
+  app.hlsInstances[0].emit("manifest_parsed");
+  video.dispatchEvent("play");
+  assert.equal(app.document.body.dataset.playing, "1");
+  video.paused = true;
+  video.dispatchEvent("pause");
+  assert.equal(app.document.body.dataset.playing, "0");
+  app.closePlayer();
+});
 test("the live player shows current and upcoming programmes on the right", () => {
   const app = environment();
   const now = Math.floor(Date.now() / 1000);
@@ -574,7 +606,7 @@ test("double-clicking the video uses our fullscreen instead of the browser's", (
   let prevented = false;
   dblclick.call(video, { preventDefault() { prevented = true; } });
   assert.equal(prevented, true);
-  assert.equal(app.document.fullscreenElement, app.document.documentElement);
+  assert.equal(app.document.fullscreenElement, app.elements.get("player-stage"));
   assert.equal(app.elements.get("player-fullscreen").getAttribute("aria-label"), "退出全屏");
 });
 
@@ -583,7 +615,7 @@ test("rapid fullscreen clicks request once while a request is pending", async ()
   app.play({ id: 1, name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
   const button = app.elements.get("player-fullscreen");
   const click = button.listeners.click[0];
-  const stage = app.document.documentElement;
+  const stage = app.elements.get("player-stage");
   let requests = 0;
   stage.requestFullscreen = () => {
     requests += 1;
@@ -626,7 +658,7 @@ test("the guide starts at the current programme and hides past programmes", () =
   assert.match(view.textContent, /从当前节目开始/);
   const programs = [];
   const walk = (node) => {
-    if (node?.className?.includes("epg-program")) programs.push(node);
+    if (/(^|\s)epg-program(\s|$)/.test(node?.className || "")) programs.push(node);
     (node?.children || []).forEach((child) => {
       if (typeof child === "object") walk(child);
     });
@@ -640,6 +672,19 @@ test("the guide starts at the current programme and hides past programmes", () =
   app.state.liveGroup = "央视";
   const filtered = app.guideView(3600, 14400, 5400);
   assert.match(filtered.textContent, /CCTV-1 综合/);
+  app.state.epgOnlyCurrent = true;
+  const currentOnly = app.guideView(3600, 14400, 5400);
+  let currentCount = 0;
+  const walkCurrent = (node) => {
+    if (/(^|\s)epg-program(\s|$)/.test(node?.className || "")) currentCount += 1;
+    (node?.children || []).forEach((child) => {
+      if (typeof child === "object") walkCurrent(child);
+    });
+  };
+  walkCurrent(currentOnly);
+  assert.equal(currentCount, 1);
+  assert.match(currentOnly.textContent, /显示全部节目/);
+  app.state.epgOnlyCurrent = false;
 });
 test("the live guide keeps only channels that have programme data", () => {
   const app = environment();
@@ -658,8 +703,10 @@ test("the theme toggle switches between light and dark", () => {
   const app = environment();
   const toggle = app.elements.get("theme-toggle");
   assert.equal(app.documentElement.dataset.theme, "light");
+  assert.equal(app.meta.getAttribute("content"), "#f4f5f9");
   toggle.listeners.click[0]();
   assert.equal(app.documentElement.dataset.theme, "dark");
+  assert.equal(app.meta.getAttribute("content"), "#080c14");
   assert.equal(toggle.getAttribute("aria-label"), "切换浅色模式");
   toggle.listeners.click[0]();
   assert.equal(app.documentElement.dataset.theme, "light");
@@ -693,7 +740,7 @@ test("discover aggregates sources and offers type and year filters", async () =>
   );
   assert.deepEqual(
     rows.map((row) => row.children[0].textContent),
-    ["类型", "影视源", "分类", "年份"],
+    ["类型", "语言", "影视源", "分类", "年份"],
   );
   const chips = rows.flatMap((row) => row.children[1].children);
   const labels = chips
@@ -724,6 +771,60 @@ test("discover aggregates sources and offers type and year filters", async () =>
   );
   assert.match(filtered.url, /category=%E5%9B%BD%E4%BA%A7%E5%89%A7/);
   assert.match(filtered.url, /year=2025/);
+});
+test("discover filters by language and category options follow the selected type", async () => {
+  const app = environment({
+    "/api/sources": [{ id: 1, name: "甲源", enabled: true }],
+    "/api/catalog/categories": { categories: ["动作片", "国产剧"] },
+    "/api/catalog/categories?kind=movie": { categories: ["动作片"] },
+    "/api/catalog/discover?page=1": {
+      results: [
+        { id: "1", title: "国语片", year: "2026", lang: "汉语普通话" },
+        { id: "2", title: "英语片", year: "2026", lang: "英语" },
+      ],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 2,
+    },
+    "/api/catalog/discover?page=1&kind=movie": {
+      results: [
+        { id: "1", title: "国语片", year: "2026", lang: "汉语普通话" },
+        { id: "2", title: "英语片", year: "2026", lang: "英语" },
+      ],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 2,
+    },
+  });
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  let page = await app.online();
+  assert.ok(flatten(page).some((node) => node.textContent === "语言"));
+
+  app.state.onlineLang = "英语";
+  page = await app.online();
+  const titles = flatten(page)
+    .filter((node) => node.className === "poster-name")
+    .map((node) => node.textContent);
+  assert.deepEqual(titles, ["英语片"]);
+
+  app.state.categories = null;
+  app.state.onlineKind = "movie";
+  app.state.onlineCategory = "国产剧";
+  page = await app.online();
+  assert.ok(
+    app.calls.some(
+      (call) => call.url === "/api/catalog/categories?kind=movie",
+    ),
+  );
+  assert.equal(app.state.onlineCategory, "");
+  const chips = flatten(page)
+    .filter((node) => String(node.className || "").startsWith("filter-chip"))
+    .map((node) => node.textContent);
+  assert.ok(chips.includes("动作片"));
+  assert.ok(!chips.includes("国产剧"));
 });
 
 test("discover appends the next page from the load-more sentinel", async () => {
@@ -967,6 +1068,127 @@ test("discover shows the most aggregated groups first", async () => {
     "多源影片",
   );
 });
+test("year-only titles still aggregate and non-matching trailing years stay intact", async () => {
+  const app = environment({
+    "/api/sources": [
+      { id: 1, name: "甲源", enabled: true },
+      { id: 2, name: "乙源", enabled: true },
+    ],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": {
+      results: [
+        {
+          id: "11",
+          source_id: 1,
+          source_name: "甲源",
+          title: "1917",
+          year: "2019",
+          remark: "720P",
+        },
+        {
+          id: "12",
+          source_id: 1,
+          source_name: "甲源",
+          title: "1917",
+          year: "2019",
+          remark: "4K",
+        },
+        {
+          id: "22",
+          source_id: 2,
+          source_name: "乙源",
+          title: "1917",
+          year: "2019",
+          cover: "https://example.test/1917.jpg",
+          remark: "1080P",
+        },
+        {
+          id: "31",
+          source_id: 1,
+          source_name: "甲源",
+          title: "银翼杀手2049",
+          year: "2017",
+        },
+      ],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 4,
+    },
+  });
+  const page = await app.online();
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const cards = flatten(page).filter(
+    (node) => node.className === "media-card",
+  );
+  assert.equal(cards.length, 2);
+  assert.equal(cards[0]._sourceBadge.textContent, "聚合 2 源");
+  assert.equal(
+    flatten(cards[0]).find((node) => node.className === "poster-name")
+      .textContent,
+    "1917",
+  );
+  assert.equal(
+    flatten(cards[0]).find((node) => node.tagName === "IMG")?.attributes.src,
+    "https://example.test/1917.jpg",
+  );
+  assert.equal(
+    flatten(cards[1]).find((node) => node.className === "poster-name")
+      .textContent,
+    "银翼杀手2049",
+  );
+});
+test("search ranks exact title matches ahead of multi-source partial matches", async () => {
+  const app = environment({
+    "/api/sources": [
+      { id: 1, name: "甲源", enabled: true },
+      { id: 2, name: "乙源", enabled: true },
+    ],
+    "/api/catalog/search?q=%E7%8B%82%E9%A3%99": {
+      results: [
+        {
+          id: "11",
+          source_id: 1,
+          source_name: "甲源",
+          title: "狂飙之城",
+          year: "2026",
+        },
+        {
+          id: "12",
+          source_id: 2,
+          source_name: "乙源",
+          title: "狂飙之城",
+          year: "2026",
+        },
+        {
+          id: "21",
+          source_id: 1,
+          source_name: "甲源",
+          title: "狂飙",
+          year: "2023",
+        },
+      ],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 3,
+    },
+  });
+  app.state.query = "狂飙";
+  const page = await app.online();
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const cards = flatten(page).filter(
+    (node) => node.className === "media-card",
+  );
+  assert.equal(cards.length, 2);
+  assert.equal(
+    flatten(cards[0]).find((node) => node.className === "poster-name")
+      .textContent,
+    "狂飙",
+  );
+});
 test("movie and series with the same title and year stay separate", async () => {
   const results = [
     {
@@ -1137,4 +1359,155 @@ test("aggregated details switch between sources", async () => {
     active.map((chip) => chip.textContent),
     ["乙源 · HD"],
   );
+});
+
+test("search clear resets the current query", () => {
+  const app = environment();
+  const input = app.elements.get("search-input");
+  const clear = app.elements.get("search-clear");
+  clear.hidden = true;
+  assert.equal(clear.hidden, true);
+  input.value = "流浪地球";
+  input.dispatchEvent("input", { target: input });
+  assert.equal(app.state.query, "流浪地球");
+  assert.equal(clear.hidden, false);
+  clear.listeners.click[0]();
+  assert.equal(input.value, "");
+  assert.equal(app.state.query, "");
+  assert.equal(clear.hidden, true);
+});
+
+test("navigation badges report tracking and active downloads", () => {
+  const app = environment();
+  app.state.series = [{ id: 1 }, { id: 2 }];
+  app.state.downloads = [
+    { id: "a", status: "downloading" },
+    { id: "b", status: "completed" },
+  ];
+  app.updateNavBadges();
+  const seriesBadge = app.elements.get("series-badge");
+  const downloadBadge = app.elements.get("downloads-badge");
+  assert.equal(seriesBadge.hidden, false);
+  assert.equal(seriesBadge.textContent, "2");
+  assert.equal(downloadBadge.hidden, false);
+  assert.equal(downloadBadge.textContent, "1");
+});
+
+test("discover spotlights the most aggregated title", async () => {
+  const app = environment({
+    "/api/sources": [
+      { id: 1, name: "甲源", enabled: true },
+      { id: 2, name: "乙源", enabled: true },
+    ],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": {
+      results: [
+        {
+          id: "11",
+          source_id: 1,
+          source_name: "甲源",
+          title: "单源影片",
+          year: "2026",
+        },
+        {
+          id: "21",
+          source_id: 1,
+          source_name: "甲源",
+          title: "焦点影片",
+          year: "2026",
+        },
+        {
+          id: "22",
+          source_id: 2,
+          source_name: "乙源",
+          title: "焦点影片",
+          year: "2026",
+        },
+      ],
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 3,
+    },
+  });
+  const page = await app.online();
+  const flatten = (node) => [
+    node,
+    ...(node.children || []).flatMap((child) => flatten(child)),
+  ];
+  const nodes = flatten(page);
+  const spotlight = nodes.find((node) => node.className === "spotlight");
+  assert.ok(spotlight);
+  assert.equal(
+    flatten(spotlight).find((node) => node.tagName === "H2")?.textContent,
+    "焦点影片",
+  );
+  assert.equal(nodes.filter((node) => node.className === "media-card").length, 2);
+});
+
+test("vod playback exposes previous and next episodes", () => {
+  const app = environment();
+  const playlist = [
+    { title: "示例剧集 · 第1集", remote_url: "https://cdn.test/1.mp4" },
+    { title: "示例剧集 · 第2集", remote_url: "https://cdn.test/2.mp4" },
+  ];
+  app.play(playlist[0], false, playlist, 0);
+  const prev = app.elements.get("player-prev");
+  const next = app.elements.get("player-next");
+  assert.equal(prev.hidden, true);
+  assert.equal(next.hidden, false);
+  assert.equal(app.elements.get("player-hud-title").textContent, "示例剧集 · 第1集");
+  next.listeners.click[0]();
+  assert.equal(app.state.player.playlistIndex, 1);
+  assert.equal(app.state.player.item.title, "示例剧集 · 第2集");
+  assert.equal(prev.hidden, false);
+  assert.equal(next.hidden, true);
+});
+
+test("library shows continue watching and groups episodes by series", async () => {
+  const app = environment({
+    "/api/library": [
+      {
+        id: "m1",
+        title: "未看完电影",
+        kind: "movie",
+        position: 600,
+        duration: 1200,
+      },
+      {
+        id: "e1",
+        title: "第一集",
+        series: "测试剧",
+        kind: "episode",
+        position: 0,
+        duration: 1200,
+      },
+      {
+        id: "e2",
+        title: "第二集",
+        series: "测试剧",
+        kind: "episode",
+        position: 0,
+        duration: 1200,
+      },
+      {
+        id: "e3",
+        title: "另一集",
+        series: "另一部剧",
+        kind: "episode",
+        position: 0,
+        duration: 1200,
+      },
+    ],
+  });
+  const flatten = (node) => [
+    node,
+    ...(node.children || []).flatMap((child) => flatten(child)),
+  ];
+  app.state.filter = "episode";
+  const page = await app.library();
+  const nodes = flatten(page);
+  assert.equal(nodes.filter((node) => node.className === "continue-section").length, 1);
+  assert.equal(nodes.filter((node) => node.className === "library-series").length, 2);
+  assert.equal(nodes.filter((node) => node.className === "media-card").length, 4);
 });

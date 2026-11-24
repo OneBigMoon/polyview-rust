@@ -20,8 +20,48 @@
     onlineKind: "",
     onlineCategory: "",
     onlineYear: "",
+    onlineLang: "",
     categories: null,
     onlineObserver: null,
+    liveGroup: "all",
+    epgOnlyCurrent: false,
+  };
+  const iconPaths = {
+    play: { d: "M8 5.5v13l10.5-6.5Z", fill: true },
+    pause: { d: "M9 6v12M15 6v12" },
+    volume: {
+      d: "M4 9v6h4l5 4V5L8 9H4ZM16 9.5a4 4 0 0 1 0 5M18.5 7a7 7 0 0 1 0 10",
+    },
+    mute: {
+      d: "M4 9v6h4l5 4V5L8 9H4ZM17 9l5 6M22 9l-5 6",
+    },
+    fullscreen: {
+      d: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
+    },
+    exitFullscreen: {
+      d: "M9 4v5H4M20 9h-5V4M4 15h5v5M15 20v-5h5",
+    },
+  };
+  const setIcon = (element, name) => {
+    const icon = iconPaths[name];
+    if (!element || !icon) return;
+    if (typeof document.createElementNS !== "function") {
+      element.textContent =
+        { play: "▶", pause: "❚❚", volume: "🔊", mute: "🔇" }[name] || "";
+      return;
+    }
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", icon.d);
+    if (icon.fill) {
+      path.setAttribute("fill", "currentColor");
+      path.setAttribute("stroke", "none");
+    }
+    svg.append(path);
+    element.replaceChildren(svg);
   };
   const esc = (v) => String(v ?? "");
   const mediaKinds = [
@@ -47,6 +87,36 @@
   };
   const matchesKind = (item) =>
     !state.onlineKind || (item.kind || "other") === state.onlineKind;
+  const languageOptions = [
+    ["", "全部语言"],
+    ["国语", "国语"],
+    ["粤语", "粤语"],
+    ["英语", "英语"],
+    ["日语", "日语"],
+    ["韩语", "韩语"],
+    ["其他", "其他语言"],
+  ];
+  const normalizedLanguages = (raw) => {
+    const value = String(raw || "");
+    const result = new Set();
+    if (/国语|普通话|汉语普通话|华语/.test(value)) result.add("国语");
+    if (/粤语|广东话|港语/.test(value)) result.add("粤语");
+    if (/英语|英文/.test(value)) result.add("英语");
+    if (/日语|日文/.test(value)) result.add("日语");
+    if (/韩语|韩文/.test(value)) result.add("韩语");
+    if (!result.size && value.trim()) result.add("其他");
+    return result;
+  };
+  const languageLabel = (value) =>
+    languageOptions.find(([key]) => key === value)?.[1] || "全部语言";
+  const matchesLanguage = (item) => {
+    const selected = state.onlineLang;
+    if (!selected) return true;
+    const languages = normalizedLanguages(item.lang);
+    if (selected === "其他")
+      return languages.size > 0 && [...languages].every((entry) => entry === "其他");
+    return languages.has(selected);
+  };
   const n = (v, fallback = 0) =>
     Number.isFinite(Number(v)) ? Number(v) : fallback;
   const admin = () => state.user?.role === "admin";
@@ -157,6 +227,19 @@
     if (hint)
       children.push(make("span", { class: "section-hint", text: hint }));
     return make("div", { class: "section-title" }, children);
+  }
+  function updateNavBadges() {
+    const setBadge = (id, count) => {
+      const badge = $(id);
+      if (!badge) return;
+      badge.textContent = count > 99 ? "99+" : String(count);
+      badge.hidden = !count;
+    };
+    setBadge("series-badge", state.series.length);
+    setBadge(
+      "downloads-badge",
+      state.downloads.filter((job) => !/done|complete|failed|cancel/i.test(job.status || "")).length,
+    );
   }
   function setNav(page) {
     state.page = page;
@@ -309,13 +392,50 @@
       make("span", { class: "sort-note", text: `${list.length} 项内容` }),
     );
     root.append(filters);
-    const grid = make("div", { class: "media-grid" });
-    if (!list.length)
-      grid.append(
-        empty("⌕", "没有找到相关内容", "换一个关键词，或切换媒体筛选。"),
+    const continuing = state.library
+      .filter((item) => n(item.duration) > 0 && n(item.position) > 0 && n(item.position) < n(item.duration) * 0.95)
+      .sort((one, other) => n(other.position) - n(one.position))
+      .slice(0, 8);
+    if (continuing.length) {
+      const strip = make("div", { class: "continue-grid" });
+      continuing.forEach((item, index) => strip.append(card(item, index)));
+      root.append(
+        make("section", { class: "continue-section" }, [
+          sectionTitle("继续观看", continuing.length, "接着上次的位置看"),
+          strip,
+        ]),
       );
-    else list.forEach((item, index) => grid.append(card(item, index)));
-    root.append(grid);
+    }
+    if (state.filter === "episode") {
+      const groups = new Map();
+      list.forEach((item) => {
+        const name = item.series || "未分组剧集";
+        if (!groups.has(name)) groups.set(name, []);
+        groups.get(name).push(item);
+      });
+      groups.forEach((items, name) => {
+        const grid = make("div", { class: "media-grid" });
+        items.forEach((item, index) => grid.append(card(item, index)));
+        root.append(
+          make("section", { class: "library-series" }, [
+            sectionTitle(name, items.length),
+            grid,
+          ]),
+        );
+      });
+      if (!groups.size)
+        root.append(
+          empty("⌕", "没有找到相关内容", "换一个关键词，或切换媒体筛选。"),
+        );
+    } else {
+      const grid = make("div", { class: "media-grid" });
+      if (!list.length)
+        grid.append(
+          empty("⌕", "没有找到相关内容", "换一个关键词，或切换媒体筛选。"),
+        );
+      else list.forEach((item, index) => grid.append(card(item, index)));
+      root.append(grid);
+    }
     return root;
   }
   async function scan() {
@@ -358,11 +478,20 @@
     const live = Boolean(player?.live);
     for (const id of ["player-toggle", "player-mute", "player-fullscreen"])
       $(id).hidden = !live;
+    const playlistSize = player?.playlist?.length || 0;
+    $("player-prev").hidden =
+      !playlistSize || player.playlistIndex <= 0;
+    $("player-next").hidden =
+      !playlistSize || player.playlistIndex >= playlistSize - 1;
     video.controls = !live;
+    document.body.dataset.playing = video.paused ? "0" : "1";
     if (!live) return;
-    $("player-toggle").textContent = video.paused ? "▶" : "❚❚";
+    setIcon($("player-toggle"), video.paused ? "play" : "pause");
     $("player-toggle").setAttribute("aria-label", video.paused ? "播放" : "暂停");
-    $("player-mute").textContent = video.muted || video.volume === 0 ? "🔇" : "🔊";
+    setIcon(
+      $("player-mute"),
+      video.muted || video.volume === 0 ? "mute" : "volume",
+    );
     $("player-mute").setAttribute(
       "aria-label",
       video.muted || video.volume === 0 ? "取消静音" : "静音",
@@ -522,24 +651,38 @@
     );
     programs.slice(0, 14).forEach((program) => {
       const current = now >= program.start && now < program.stop;
+      const children = [
+        make("span", { class: "player-guide-time", text: clockTime(program.start) }),
+        make("strong", { text: program.title }),
+      ];
+      if (current)
+        children.push(
+          make("progress", {
+            class: "guide-progress",
+            max: 100,
+            value: Math.round(
+              ((now - program.start) / Math.max(1, program.stop - program.start)) *
+                100,
+            ),
+          }),
+        );
       box.append(
         make(
           "div",
           { class: `player-guide-item${current ? " current" : ""}` },
-          [
-            make("span", { class: "player-guide-time", text: clockTime(program.start) }),
-            make("strong", { text: program.title }),
-          ],
+          children,
         ),
       );
     });
   }
-  function play(item, live = false) {
+  function play(item, live = false, playlist = [], playlistIndex = 0) {
     if (state.player) closePlayer();
     state.player = {
       item,
       live,
       sources: live ? liveSources(item) : [],
+      playlist: live ? [] : playlist,
+      playlistIndex,
       sourceIndex: 0,
       failed: new Set(),
       attempt: 0,
@@ -552,10 +695,22 @@
       ? "LIVE NOW"
       : item.series || "NOW PLAYING";
     $("player-dialog").classList.toggle("live-mode", live);
+    $("player-stage").classList.toggle("live-mode", live);
     $("player-dialog").showModal();
     playerGuide(item);
     updatePlayerControls();
+    $("player-hud-title").textContent = $("player-title").textContent;
+    $("player-hud-kind").textContent = $("player-kind").textContent;
      attachPlayerSource();
+  }
+
+  function playPlaylist(offset) {
+    const current = state.player;
+    if (!current || current.live || !current.playlist?.length) return;
+    const index = current.playlistIndex + offset;
+    if (index < 0 || index >= current.playlist.length) return;
+    const item = current.playlist[index];
+    play(item, false, current.playlist, index);
   }
   async function saveProgress(force = false, keepalive = false) {
     const current = state.player,
@@ -638,6 +793,7 @@
     $("player-source").hidden = true;
     $("player-guide").hidden = true;
     $("player-dialog").classList.remove("live-mode");
+    $("player-stage").classList.remove("live-mode");
     const video = $("video-player");
     video.pause();
     destroyHls();
@@ -710,6 +866,19 @@
         ),
       ),
     ]);
+    let scroller;
+    const currentOnly = button(
+      state.epgOnlyCurrent ? "显示全部节目" : "只看当前",
+      "subtle small-button",
+      () => {
+        state.epgOnlyCurrent = !state.epgOnlyCurrent;
+        $("live-guide").replaceChildren(guideView(start, end, now));
+      },
+    );
+    const jumpNow = button("回到现在", "subtle small-button", () => {
+      if (scroller)
+        scroller.scrollLeft = ((now - start) / 60) * EPG_MINUTE_PX;
+    });
     const updated = Number(guide.updated_at) || 0;
     const toolbar = make("div", { class: "epg-toolbar" }, [
       make("div", { class: "epg-meta" }, [
@@ -720,10 +889,14 @@
               : "尚未更新节目单"
           }`,
         }),
+      ]),
+      make("div", { class: "epg-actions" }, [
+        currentOnly,
+        jumpNow,
         admin() ? button("刷新节目单", "subtle small-button", refreshEpg) : null,
       ]),
     ]);
-    const scroller = make("div", { class: "epg-scroll" });
+    scroller = make("div", { class: "epg-scroll" });
     const inner = make("div", {
       class: "epg-inner",
       style: `width:${170 + 1440 * EPG_MINUTE_PX}px`,
@@ -778,7 +951,10 @@
         style: `width:${1440 * EPG_MINUTE_PX}px`,
       });
       const items = (byChannel.get(channel.id) || []).filter(
-        (program) => program.stop > now,
+        (program) =>
+          program.stop > now &&
+          (!state.epgOnlyCurrent ||
+            (now >= program.start && now < program.stop)),
       );
       if (!items.length) {
         track.append(make("span", { class: "epg-nodata", text: "暂无节目单" }));
@@ -808,12 +984,23 @@
               }`,
               on: { click: () => play(channel, true) },
             },
-            [
-              make("strong", { text: program.title }),
-              make("small", {
-                text: `${clockTime(program.start)} - ${clockTime(program.stop)}`,
-              }),
-            ],
+              [
+                make("strong", { text: program.title }),
+                make("small", {
+                  text: `${clockTime(program.start)} - ${clockTime(program.stop)}`,
+                }),
+                now >= program.start && now < program.stop
+                  ? make("progress", {
+                      class: "epg-program-progress",
+                      max: 100,
+                      value: Math.round(
+                        ((now - program.start) /
+                          Math.max(1, program.stop - program.start)) *
+                          100,
+                      ),
+                    })
+                  : null,
+              ].filter(Boolean),
           ),
         );
       });
@@ -968,24 +1155,36 @@
     }
     dialog.showModal();
   }
-  const normalizedCatalogTitle = (title) => {
-    const value = String(title ?? "")
+  const stripTrailingYear = (value, year) => {
+    const match = value.match(
+      /([\s.·\-]*[\(（]?)((?:19|20)\d{2})([\)）]?)$/u,
+    );
+    if (!match) return value;
+    const prefix = value.slice(0, match.index).trim();
+    if (!prefix) return value;
+    const [, lead, foundYear, trail] = match;
+    const expectedYear = String(year ?? "").trim();
+    const delimited =
+      /[.·\-（(]/u.test(lead) || /[)）]/u.test(trail);
+    if (expectedYear && foundYear === expectedYear) return prefix;
+    if (!expectedYear && delimited) return prefix;
+    return value;
+  };
+  const normalizedCatalogTitle = (title, year) => {
+    const base = String(title ?? "")
       .normalize("NFKC")
       .trim()
-      .toLocaleLowerCase()
-      .replace(/[\s.·\-]*[\(（]?(?:19|20)\d{2}[\)）]?$/u, "");
-    return value.replace(
+      .toLocaleLowerCase();
+    const value = stripTrailingYear(base, year);
+    const cleaned = value.replace(
       /[\s:：,，.。!！?？、·・\-—_()（）\[\]【】《》"“”'’]/gu,
       "",
     );
+    return cleaned || base;
   };
-  const displayCatalogTitle = (title) => {
+  const displayCatalogTitle = (title, year) => {
     const value = String(title ?? "").normalize("NFKC").trim();
-    return (
-      value
-        .replace(/[\s.·\-]*[\(（]?(?:19|20)\d{2}[\)）]?$/u, "")
-        .trim() || value
-    );
+    return stripTrailingYear(value, year).trim() || value;
   };
   const sourceRank = (source) => {
     const quality = sourceQuality(source).toUpperCase();
@@ -997,26 +1196,29 @@
     return 0;
   };
   const catalogGroupKey = (item) => {
-    const title = normalizedCatalogTitle(item.title);
     const year = String(item.year ?? "").trim();
+    const title = normalizedCatalogTitle(item.title, year);
     return title
       ? `${item.kind || "other"}|${title}|${year}`
       : `id:${item.source_id}:${item.id ?? item.media_id}`;
   };
   const mergeCatalogGroups = (items, groups) => {
     const changed = new Set();
-    items.filter(matchesKind).forEach((item) => {
+    items.filter((item) => matchesKind(item) && matchesLanguage(item)).forEach((item) => {
       const key = catalogGroupKey(item);
       let group = groups.get(key);
       if (!group) {
         group = {
           ...item,
-          title: displayCatalogTitle(item.title),
+          title: displayCatalogTitle(item.title, item.year),
           sources: [],
         };
         groups.set(key, group);
       }
-      if (!group.cover && item.cover) group.cover = item.cover;
+      if (!group.cover && item.cover) {
+        group.cover = item.cover;
+        changed.add(key);
+      }
       if (!group.year && item.year) group.year = item.year;
       if (!group.remark && item.remark) group.remark = item.remark;
       const source = {
@@ -1024,13 +1226,23 @@
         id: item.id ?? item.media_id,
         source_name: item.source_name,
         remark: item.remark,
+        lang: item.lang,
       };
-      const existing = group.sources.find(
+      const existingIndex = group.sources.findIndex(
         (entry) => String(entry.source_id) === String(source.source_id),
       );
-      if (!existing) {
+      if (existingIndex === -1) {
         group.sources.push(source);
         changed.add(key);
+      } else {
+        const existing = group.sources[existingIndex];
+        if (
+          sourceRank(source) > sourceRank(existing) ||
+          (!existing.remark && source.remark)
+        ) {
+          group.sources[existingIndex] = source;
+          changed.add(key);
+        }
       }
       group.sources.sort(
         (left, right) =>
@@ -1042,12 +1254,29 @@
         group.source_id = best.source_id;
         group.id = best.id;
         group.source_name = best.source_name;
-        group.remark = best.remark;
+        group.remark = best.remark || group.remark;
       }
     });
     return changed;
   };
   const updateCatalogCard = (card, item) => {
+    if (item.cover && !card._cover && card._art) {
+      const image = make("img", {
+        src: item.cover,
+        alt: "",
+        loading: "lazy",
+        referrerpolicy: "no-referrer",
+      });
+      image.addEventListener("error", () => image.remove());
+      card._art.prepend(image);
+      card._cover = item.cover;
+    }
+    const quality = sourceQuality(item.sources?.[0] || item);
+    const qualityLabel = /4K|2K|1080P|720P|480P|HD/i.test(quality)
+      ? quality
+      : "";
+    card._quality.hidden = !qualityLabel;
+    card._quality.textContent = qualityLabel;
     const count = item.sources?.length || 1;
     card._sourceBadge.hidden = count < 2;
     card._sourceBadge.textContent = `聚合 ${count} 源`;
@@ -1075,17 +1304,12 @@
       class: "kind-badge",
       text: kindLabel(item.kind),
     });
-    art.append(badge, kindBadge);
-    if (item.cover) {
-      const image = make("img", {
-        src: item.cover,
-        alt: "",
-        loading: "lazy",
-        referrerpolicy: "no-referrer",
-      });
-      image.addEventListener("error", () => image.remove());
-      art.prepend(image);
-    }
+    const quality = make("span", {
+      class: "quality-badge",
+      hidden: true,
+      "aria-hidden": "true",
+    });
+    art.append(badge, quality, kindBadge);
     const meta = make("div", { class: "media-meta" });
     const card = make("article", { class: "media-card" }, [
       make(
@@ -1100,11 +1324,50 @@
       ),
       meta,
     ]);
+    card._art = art;
+    card._cover = "";
     card._sourceBadge = badge;
+    card._quality = quality;
     card._kindBadge = kindBadge;
     card._meta = meta;
     updateCatalogCard(card, item);
     return card;
+  }
+
+  function spotlightCard(group) {
+    const art = make("div", { class: "spotlight-art tone-0" });
+    if (group.cover)
+      art.append(
+        make("img", {
+          src: group.cover,
+          alt: "",
+          loading: "lazy",
+          referrerpolicy: "no-referrer",
+        }),
+      );
+    const quality = sourceQuality(group.sources?.[0] || group);
+    const meta = [
+      group.year,
+      `${group.sources?.length || 1} 个影视源`,
+      /4K|2K|1080P|720P|HD/i.test(quality) ? quality : "",
+      kindLabel(group.kind),
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return make("section", { class: "spotlight", "aria-label": "焦点影片" }, [
+      art,
+      make("div", { class: "spotlight-copy" }, [
+        make("p", { class: "eyebrow", text: "本周焦点" }),
+        make("h2", { text: displayCatalogTitle(group.title, group.year) }),
+        make("p", { class: "spotlight-meta", text: meta }),
+        make("div", { class: "spotlight-actions" }, [
+          button("立即播放", "primary", () => openCatalogDetail(group)),
+          button("查看片源", "subtle", () =>
+            $("content").querySelector(".media-grid .poster-button")?.click(),
+          ),
+        ]),
+      ]),
+    ]);
   }
   async function online() {
     const sequence = renderSequence;
@@ -1135,9 +1398,24 @@
     let result;
     const groups = new Map();
     const groupOrder = [];
+    const normalizedQuery = state.query
+      ? normalizedCatalogTitle(state.query)
+      : "";
+    const queryRelevance = (group) => {
+      if (!normalizedQuery) return 0;
+      const title = normalizedCatalogTitle(group.title, group.year);
+      if (title === normalizedQuery) return 3;
+      if (title.startsWith(normalizedQuery)) return 2;
+      if (title.includes(normalizedQuery)) return 1;
+      return 0;
+    };
     const compareGroupKeys = (leftKey, rightKey) => {
       const left = groups.get(leftKey);
       const right = groups.get(rightKey);
+      if (normalizedQuery) {
+        const diff = queryRelevance(right) - queryRelevance(left);
+        if (diff !== 0) return diff;
+      }
       const leftSources = left.sources?.length || 1;
       const rightSources = right.sources?.length || 1;
       if (rightSources !== leftSources) return rightSources - leftSources;
@@ -1185,6 +1463,11 @@
           ),
         ),
       ]);
+    const chooseKind = (value) => {
+      state.onlineKind = value;
+      state.onlineCategory = "";
+      state.categories = null;
+    };
     if (state.query) {
       result = await api(
         `/api/catalog/search?q=${encodeURIComponent(state.query)}`,
@@ -1192,7 +1475,8 @@
       mergeCatalogGroups(result.results, groups);
       root.append(
         make("div", { class: "discover-filter-bar" }, [
-          chipRow("类型", mediaKinds, state.onlineKind, (value) => (state.onlineKind = value)),
+          chipRow("类型", mediaKinds, state.onlineKind, chooseKind),
+          chipRow("语言", languageOptions, state.onlineLang, (value) => (state.onlineLang = value)),
         ]),
       );
       root.append(
@@ -1210,7 +1494,10 @@
         state.onlineSource = "all";
       if (!state.categories) {
         try {
-          state.categories = (await api("/api/catalog/categories")).categories || [];
+          const categoryUrl = state.onlineKind
+            ? `/api/catalog/categories?kind=${encodeURIComponent(state.onlineKind)}`
+            : "/api/catalog/categories";
+          state.categories = (await api(categoryUrl)).categories || [];
         } catch {
           state.categories = [];
         }
@@ -1223,7 +1510,8 @@
       const year = new Date().getFullYear();
       root.append(
         make("div", { class: "discover-filter-bar" }, [
-          chipRow("类型", mediaKinds, state.onlineKind, (value) => (state.onlineKind = value)),
+          chipRow("类型", mediaKinds, state.onlineKind, chooseKind),
+          chipRow("语言", languageOptions, state.onlineLang, (value) => (state.onlineLang = value)),
           chipRow(
             "影视源",
             [
@@ -1276,8 +1564,7 @@
       );
     const grid = make("div", { class: "media-grid" });
     const cards = new Map();
-    const renderGroup = (group) => {
-      const key = catalogGroupKey(group);
+    const renderGroup = (key, group) => {
       let card = cards.get(key);
       if (!card) {
         card = catalogCard(group, cards.size);
@@ -1299,13 +1586,24 @@
     const batchSize = 20;
     const renderNextBatch = () => {
       const end = Math.min(rendered + batchSize, groupOrder.length);
-      for (; rendered < end; rendered += 1)
-        renderGroup(groups.get(groupOrder[rendered]));
+      for (; rendered < end; rendered += 1) {
+        const key = groupOrder[rendered];
+        renderGroup(key, groups.get(key));
+      }
       if (summary) {
         summary.textContent = `已显示 ${cards.size} 组影片`;
       }
     };
     syncGroupOrder();
+    if (
+      !state.query &&
+      !state.onlineKind &&
+      state.onlineSource === "all" &&
+      !state.onlineCategory &&
+      !state.onlineYear &&
+      groupOrder.length
+    )
+      root.insertBefore(spotlightCard(groups.get(groupOrder[0])), summary);
     renderNextBatch();
     if (!cards.size)
       grid.append(
@@ -1357,7 +1655,7 @@
           state.onlinePage += 1;
           const changed = mergeCatalogGroups(page.results, groups);
           changed.forEach((key) => {
-            if (cards.has(key)) renderGroup(groups.get(key));
+            if (cards.has(key)) renderGroup(key, groups.get(key));
           });
           syncGroupOrder();
           renderNextBatch();
@@ -1463,10 +1761,32 @@
         : null;
     dialog.replaceChildren(
       ...[
-        make("div", { class: "dialog-top" }, [
-          make("h2", { id: "catalog-detail-title", text: item.title }),
-          icon("✕", "关闭影片详情", () => dialog.close()),
-        ]),
+        (() => {
+          const art = make("div", { class: "catalog-hero-art tone-2" });
+          if (item.cover)
+            art.append(
+              make("img", {
+                src: item.cover,
+                alt: "",
+                referrerpolicy: "no-referrer",
+              }),
+            );
+          return make("section", { class: "catalog-hero" }, [
+            art,
+            make("div", { class: "catalog-hero-shade" }),
+            make("div", { class: "catalog-hero-copy" }, [
+              make("p", { class: "eyebrow", text: "影片详情" }),
+              make("h2", { id: "catalog-detail-title", text: item.title }),
+              make("p", {
+                class: "catalog-hero-meta",
+                text: [item.year, kindLabel(item.kind), item.source_name]
+                  .filter(Boolean)
+                  .join(" · "),
+              }),
+            ]),
+            icon("✕", "关闭影片详情", () => dialog.close()),
+          ]);
+        })(),
         sourceBar,
         make("p", { class: "hint", text: "正在读取影片信息…" }),
       ].filter(Boolean),
@@ -1573,31 +1893,53 @@
       const episodeGrid = make("div", { class: "episode-grid" });
       const selected = () =>
         detail.groups[n(groups.value)].episodes[n(episodes.value)];
+      let episodeAscending = true;
+      const orderedEpisodes = () =>
+        detail.groups[n(groups.value)].episodes
+          .map((episode, index) => ({ ...episode, sourceIndex: index }))
+          .sort((one, other) =>
+            episodeAscending
+              ? one.sourceIndex - other.sourceIndex
+              : other.sourceIndex - one.sourceIndex,
+          );
+      const watchedCount = tracked?.watched_episodes || 0;
       const watch = (index) => {
         const group = detail.groups[n(groups.value)];
         if (group.direct === false) {
           toast("该线路是非直链解析页，无法直接播放，请选择直链线路。", true);
           return;
         }
-        const episode = group.episodes[index];
-        dialog.close();
-        play({
+        const playlist = orderedEpisodes().map((episode) => ({
           title: `${detail.title} · ${episode.name}`,
           remote_url: episode.url,
           tracking_id: tracked?.id,
-          watched_episodes: tracked?.watched_episodes || 0,
-          episode_number: index + 1,
-        });
+          watched_episodes: watchedCount,
+          episode_number: episode.sourceIndex + 1,
+        }));
+        dialog.close();
+        play(playlist[index], false, playlist, index);
       };
+      const sortButton = button("倒序", "subtle small-button", () => {
+        episodeAscending = !episodeAscending;
+        sortButton.textContent = episodeAscending ? "倒序" : "正序";
+        fillEpisodes();
+      });
       const fillEpisodes = () => {
         episodes.replaceChildren(
-          ...detail.groups[n(groups.value)].episodes.map((episode, index) =>
+          ...orderedEpisodes().map((episode, index) =>
             make("option", { value: index, text: episode.name }),
           ),
         );
         episodeGrid.replaceChildren(
-          ...detail.groups[n(groups.value)].episodes.map((episode, index) =>
-            button(episode.name, "subtle small-button", () => watch(index)),
+          sortButton,
+          ...orderedEpisodes().map((episode, index) =>
+            button(
+              episode.sourceIndex < watchedCount
+                ? `✓ ${episode.name}`
+                : episode.name,
+              `subtle small-button${episode.sourceIndex < watchedCount ? " watched" : ""}`,
+              () => watch(index),
+            ),
           ),
         );
       };
@@ -1742,10 +2084,31 @@
             button("保存", "subtle small-button", null, { type: "submit" }),
           ],
         );
+        const watchedCount = n(subscription.watched_episodes);
+        const totalCount = n(subscription.total_episodes);
+        const pct = totalCount
+          ? Math.min(100, Math.round((watchedCount / totalCount) * 100))
+          : 0;
+        const statusLabel = subscription.error
+          ? "来源异常"
+          : totalCount && watchedCount >= totalCount
+            ? "已追平"
+            : "连载中";
         list.append(
-          make("article", { class: "tracking-row" }, [
+          make("article", {
+            class: `tracking-row${statusLabel === "已追平" ? " finished" : ""}`,
+          }, [
             make("div", { class: "series-info" }, [
               make("h3", { text: subscription.title }),
+              make("span", {
+                class: `tracking-status${statusLabel === "来源异常" ? " error" : ""}`,
+                text: statusLabel,
+              }),
+              make("progress", {
+                class: "tracking-progress-bar",
+                max: 100,
+                value: pct,
+              }),
               make("p", {
                 text: `${subscription.watched_episodes} / ${subscription.total_episodes} 集已看 · 已入队 ${subscription.queued_episodes} 集 · 已下载 ${subscription.completed_downloads || 0} 集`,
               }),
@@ -1948,8 +2311,10 @@
     const result = await api("/api/downloads");
     state.downloads = Array.isArray(result) ? result : result?.jobs || [];
     const existing = main.querySelector(".download-list");
-    if (state.page === "downloads" && existing)
+    if (state.page === "downloads" && existing) {
       existing.replaceWith(downloadList());
+      updateNavBadges();
+    }
   }
   async function downloads() {
     await refreshDownloads();
@@ -2522,16 +2887,29 @@
     state.onlineObserver?.disconnect();
     state.onlineObserver = null;
     main.setAttribute("aria-busy", "true");
+    const loadingText =
+      pageName === "online" && state.onlineKind
+        ? `正在从各影视源加载${kindLabel(state.onlineKind)}…`
+        : "正在加载…";
     main.replaceChildren(
-      make("div", { class: "loading-state" }, [
-        make("span", { class: "spinner" }),
-        make("p", {
-          text:
-            pageName === "online" && state.onlineKind
-              ? `正在从各影视源加载${kindLabel(state.onlineKind)}…`
-              : "正在加载…",
-        }),
-      ]),
+      ["online", "library"].includes(pageName)
+        ? make("div", { class: "page-loading" }, [
+            make("p", { class: "loading-caption", text: loadingText }),
+            make(
+              "div",
+              { class: "skeleton-grid" },
+              Array.from({ length: 8 }, () =>
+                make("div", { class: "skeleton-card" }, [
+                  make("div", { class: "skeleton skeleton-poster" }),
+                  make("div", { class: "skeleton skeleton-line" }),
+                ]),
+              ),
+            ),
+          ])
+        : make("div", { class: "loading-state" }, [
+            make("span", { class: "spinner" }),
+            make("p", { text: loadingText }),
+          ]),
     );
     try {
       const page =
@@ -2548,6 +2926,7 @@
                   : await settings();
       if (sequence !== renderSequence) return;
       main.replaceChildren(page);
+      updateNavBadges();
       if (pageName === "downloads")
         state.poll = setInterval(
           () => refreshDownloads().catch((e) => toast(e.message, true)),
@@ -2729,7 +3108,7 @@
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     document
       .querySelector('meta[name="theme-color"]')
-      ?.setAttribute("content", dark ? "#0B1322" : "#F2F2F7");
+      ?.setAttribute("content", dark ? "#080c14" : "#f4f5f9");
     const toggle = $("theme-toggle");
     toggle.setAttribute("aria-label", dark ? "切换浅色模式" : "切换深色模式");
     toggle.title = toggle.getAttribute("aria-label");
@@ -2775,11 +3154,20 @@
   );
   $("help-close").addEventListener("click", () => $("help-dialog").close());
   $("player-close").addEventListener("click", closePlayer);
+  $("player-prev").addEventListener("click", () => playPlaylist(-1));
+  $("player-next").addEventListener("click", () => playPlaylist(1));
+  $("player-hud-close").addEventListener("click", () => {
+    if (document.fullscreenElement || document.webkitFullscreenElement)
+      (document.exitFullscreen || document.webkitExitFullscreen)?.call(
+        document,
+      );
+    closePlayer();
+  });
   $("player-source").addEventListener("click", () => switchLiveSource(1));
   let fullscreenExitedAt = 0;
   $("player-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
-    if (document.fullscreenElement) return;
+    if (document.fullscreenElement || document.webkitFullscreenElement) return;
     if (Date.now() - fullscreenExitedAt < 300) return;
     closePlayer();
   });
@@ -2801,12 +3189,16 @@
   let fullscreenPending = false;
   function toggleFullscreen() {
     if (fullscreenPending) return;
-    if (document.fullscreenElement) {
-      document.exitFullscreen?.();
+    const stage = $("player-stage");
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      (document.exitFullscreen || document.webkitExitFullscreen)?.call(
+        document,
+      );
       return;
     }
     fullscreenPending = true;
-    const request = document.documentElement.requestFullscreen?.();
+    const request = (stage.requestFullscreen || stage.webkitRequestFullscreen)
+      ?.call(stage);
     if (request?.finally)
       request
         .catch(() => toast("当前浏览器无法进入全屏。", true))
@@ -2821,8 +3213,11 @@
     toggleFullscreen();
   });
   document.addEventListener("fullscreenchange", () => {
-    const full = !!document.fullscreenElement;
+    const full = !!(
+      document.fullscreenElement || document.webkitFullscreenElement
+    );
     if (!full) fullscreenExitedAt = Date.now();
+    setIcon($("player-fullscreen"), full ? "exitFullscreen" : "fullscreen");
     $("player-fullscreen").setAttribute(
       "aria-label",
       full ? "退出全屏" : "全屏",
@@ -2840,11 +3235,21 @@
   $("search-input").addEventListener("input", (event) => {
     state.query = event.target.value.trim();
     state.onlinePage = 1;
+    $("search-clear").hidden = !event.target.value;
     clearTimeout(state.searchTimer);
     state.searchTimer = setTimeout(() => {
       if (["online", "library", "live", "series"].includes(state.page))
         render();
     }, 250);
+  });
+  $("search-clear").addEventListener("click", () => {
+    const input = $("search-input");
+    input.value = "";
+    state.query = "";
+    state.onlinePage = 1;
+    $("search-clear").hidden = true;
+    input.focus?.();
+    render();
   });
   document.addEventListener("keydown", (event) => {
     if (

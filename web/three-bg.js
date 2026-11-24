@@ -15,6 +15,7 @@
   let links;
   let frameId = 0;
   let visible = true;
+  let playing = false;
 
   const darkPalette = [
     0x8d51f9, 0xa78bfa, 0x4cc9f0, 0x60a5fa, 0xf472b6, 0xfbbf24,
@@ -176,11 +177,39 @@
     );
     document.addEventListener("visibilitychange", () => {
       visible = !document.hidden;
-      if (visible && !reducedMotion) {
+      if (visible && !reducedMotion && !playing) {
         cancelAnimationFrame(frameId);
         frameId = requestAnimationFrame(loop);
       }
     });
+    const syncPlayback = () => {
+      const next = document.body.dataset.playing === "1";
+      const changed = next !== playing;
+      playing = next;
+      document.body.classList.toggle("is-playing", playing);
+      if (playing) {
+        cancelAnimationFrame(frameId);
+        frameId = 0;
+      } else if (changed && visible && !reducedMotion) {
+        cancelAnimationFrame(frameId);
+        frameId = requestAnimationFrame(loop);
+      }
+    };
+    new MutationObserver(syncPlayback).observe(document.body, {
+      attributes: true,
+      attributeFilter: ["data-playing"],
+    });
+    const appShell = document.getElementById("app-shell");
+    const syncMode = () => {
+      document.body.classList.toggle("bg-browse", !!appShell && !appShell.hidden);
+    };
+    if (appShell)
+      new MutationObserver(syncMode).observe(appShell, {
+        attributes: true,
+        attributeFilter: ["hidden"],
+      });
+    syncMode();
+    syncPlayback();
     new MutationObserver(paint).observe(document.documentElement, {
       attributes: true,
       attributeFilter: ["data-theme"],
@@ -193,7 +222,7 @@
   }
 
   function loop(now) {
-    if (!renderer || !visible) return;
+    if (!renderer || !visible || playing) return;
     const time = now * 0.00012;
     world.rotation.y = time * 0.6 + pointer.x * 0.14;
     world.rotation.x = Math.sin(time * 0.8) * 0.07 + pointer.y * 0.1;
