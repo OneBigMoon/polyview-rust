@@ -112,6 +112,8 @@ pub fn router(state: Shared) -> Router {
         .route("/", get(index))
         .route("/app.js", get(script))
         .route("/style.css", get(styles))
+        .route("/three-bg.js", get(three_background))
+        .route("/vendor/three.module.min.js", get(three_module))
         .route("/vendor/hls.min.js", get(hls_script))
         .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
         .merge(auth::router())
@@ -171,5 +173,19 @@ async fn hls_script() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../web/vendor/hls.min.js"),
+    )
+}
+
+async fn three_background() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/three-bg.js"),
+    )
+}
+
+async fn three_module() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/vendor/three.module.min.js"),
     )
 }

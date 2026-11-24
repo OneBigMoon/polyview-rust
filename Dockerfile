@@ -16,6 +16,7 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/polyview /usr/local/bin/polyview
 COPY LICENSE /usr/share/doc/polyview/LICENSE
 COPY web/vendor/hls.LICENSE /usr/share/doc/polyview/hls.LICENSE
+COPY web/vendor/three.LICENSE /usr/share/doc/polyview/three.LICENSE
 ENV POLYVIEW_BIND=0.0.0.0:8080 \
     POLYVIEW_DATA_DIR=/data \
     POLYVIEW_MEDIA_DIR=/media

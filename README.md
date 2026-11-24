@@ -13,7 +13,7 @@ PolyView is a self-hosted media hub for a NAS: browse and watch from a desktop w
 - M3U text/file import, channel browsing, and HLS playback with locally bundled hls.js and native browser fallback.
 - Per-user TVBox / 影视仓 feeds for the local library, enabled online sources, and live channels. Feed tokens can be rotated to revoke previous links.
 - Argon2id password hashing, HttpOnly sessions, login throttling, and administrator/member roles.
-- Responsive Chinese web interface with light and dark themes, a mobile navigation drawer, and keyboard focus states.
+- Responsive Chinese web interface with light and dark themes, a shared Three.js particle background, a mobile navigation drawer, and keyboard focus states.
 
 Online CMS sources and media must be supplied by the administrator. PolyView does not execute APKs, TVBox spider/JAR adapters, or arbitrary source JavaScript.
 
