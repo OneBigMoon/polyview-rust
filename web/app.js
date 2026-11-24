@@ -34,6 +34,16 @@
   ];
   const kindLabel = (kind) =>
     mediaKinds.find(([value]) => value === kind)?.[1] || "其他";
+  const sourceQuality = (source) => {
+    const remark = String(source.remark || "").trim();
+    if (/4k|2160/i.test(remark)) return "4K";
+    if (/2k|1440/i.test(remark)) return "2K";
+    if (/1080/i.test(remark)) return "1080P";
+    if (/720/i.test(remark)) return "720P";
+    if (/480/i.test(remark)) return "480P";
+    if (/hd|高清|超清/i.test(remark)) return "HD";
+    return remark;
+  };
   const matchesKind = (item) =>
     !state.onlineKind || (item.kind || "other") === state.onlineKind;
   const n = (v, fallback = 0) =>
@@ -1323,22 +1333,43 @@
                 const active =
                   String(source.source_id) === String(item.source_id) &&
                   String(sourceId) === String(item.id ?? item.media_id);
-                return make("button", {
-                  type: "button",
-                  class: `filter-chip${active ? " active" : ""}`,
-                  "aria-pressed": String(active),
-                  text: source.source_name || `影视源 ${source.source_id}`,
-                  on: {
-                    click: () =>
-                      openCatalogDetail({
-                        ...item,
-                        source_id: source.source_id,
-                        id: sourceId,
-                        source_name: source.source_name,
-                        sources,
-                      }),
+                const quality = sourceQuality(source);
+                return make(
+                  "button",
+                  {
+                    type: "button",
+                    class: `filter-chip${active ? " active" : ""}`,
+                    "aria-pressed": String(active),
+                    "aria-label": [
+                      source.source_name || `影视源 ${source.source_id}`,
+                      quality,
+                    ]
+                      .filter(Boolean)
+                      .join(" "),
+                    on: {
+                      click: () =>
+                        openCatalogDetail({
+                          ...item,
+                          source_id: source.source_id,
+                          id: sourceId,
+                          source_name: source.source_name,
+                          sources,
+                        }),
+                    },
                   },
-                });
+                  [
+                    make("span", {
+                      class: "filter-chip-label",
+                      text: source.source_name || `影视源 ${source.source_id}`,
+                    }),
+                    quality
+                      ? make("span", {
+                          class: "filter-chip-quality",
+                          text: ` · ${quality}`,
+                        })
+                      : null,
+                  ],
+                );
               }),
             ),
           ])
