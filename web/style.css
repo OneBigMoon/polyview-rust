@@ -1724,6 +1724,9 @@ textarea {
   color: var(--faint);
   font-size: 12px;
 }
+.player-dialog.live-mode {
+  width: min(1180px, calc(100% - 32px));
+}
 .player-dialog.live-mode .player-stage {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 300px;
@@ -1739,6 +1742,8 @@ textarea {
   width: 100%;
   max-height: min(66vh, calc(100vh - 260px));
   margin: 0;
+  height: 100%;
+  object-fit: contain;
   border-radius: 14px;
 }
 .player-guide {
