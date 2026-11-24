@@ -960,8 +960,8 @@ test("aggregated details switch between sources", async () => {
     source_id: 1,
     title: "同一部电影",
     sources: [
-      { source_id: 1, id: "11", source_name: "甲源" },
-      { source_id: 2, id: "22", source_name: "乙源" },
+      { source_id: 1, id: "11", source_name: "甲源", remark: "正片" },
+      { source_id: 2, id: "22", source_name: "乙源", remark: "HD" },
     ],
   });
   const dialog = app.elements.get("catalog-dialog");
@@ -972,10 +972,11 @@ test("aggregated details switch between sources", async () => {
   );
   assert.deepEqual(
     chips.map((chip) => chip.textContent),
-    ["甲源"],
+    ["甲源 · 正片"],
   );
   const second = flatten(dialog).find(
-    (node) => node.className === "filter-chip" && node.textContent === "乙源",
+    (node) =>
+      node.className === "filter-chip" && node.textContent === "乙源 · HD",
   );
   assert.ok(second, "details expose the second source");
   await second.listeners.click[0]();
@@ -990,6 +991,6 @@ test("aggregated details switch between sources", async () => {
   );
   assert.deepEqual(
     active.map((chip) => chip.textContent),
-    ["乙源"],
+    ["乙源 · HD"],
   );
 });
