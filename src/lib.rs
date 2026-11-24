@@ -95,7 +95,7 @@ pub fn now() -> i64 {
 
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
-        "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+        "PRAGMA foreign_keys=ON; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
     )?;
     auth::init_schema(conn)?;
     library::init_schema(conn)?;
