@@ -30,6 +30,7 @@
     ["series", "电视剧"],
     ["variety", "综艺"],
     ["anime", "动漫"],
+    ["child", "儿童"],
     ["other", "其他"],
   ];
   const kindLabel = (kind) =>
@@ -1216,7 +1217,7 @@
       );
     const grid = make("div", { class: "media-grid" });
     const cards = new Map();
-    const appendGroup = (group) => {
+    const renderGroup = (group) => {
       const key = catalogGroupKey(group);
       let card = cards.get(key);
       if (!card) {
@@ -1227,7 +1228,25 @@
         updateCatalogCard(card, group);
       }
     };
-    groups.forEach(appendGroup);
+    let summary = null;
+    if (!state.query) {
+      summary = make("div", {
+        class: "discover-summary",
+        text: "已显示 0 组影片",
+      });
+      root.append(summary);
+    }
+    let rendered = 0;
+    const batchSize = 20;
+    const renderNextBatch = () => {
+      const all = [...groups.values()];
+      const end = Math.min(rendered + batchSize, all.length);
+      for (; rendered < end; rendered += 1) renderGroup(all[rendered]);
+      if (summary) {
+        summary.textContent = `已显示 ${cards.size} 组影片`;
+      }
+    };
+    renderNextBatch();
     if (!cards.size)
       grid.append(
         empty(
@@ -1236,30 +1255,37 @@
           "可以更换影视源或搜索其他片名。",
         ),
       );
-    let summary = null;
-    if (!state.query) {
-      summary = make("div", {
-        class: "discover-summary",
-        text: `已显示 ${cards.size} 组影片`,
-      });
-      root.append(summary);
-    }
     root.append(grid);
-    if (state.query) return root;
-    if (result.page_count > state.onlinePage) {
-      const more = make(
+    let hasMorePages = !state.query && result.page_count > state.onlinePage;
+    let more = null;
+    let moreText = null;
+    let loading = false;
+    const showEnd = () => {
+      state.onlineObserver?.disconnect();
+      state.onlineObserver = null;
+      if (!more) return;
+      more.className = "discover-end";
+      more.replaceChildren(make("span", { text: "已经到底了" }));
+    };
+    if (rendered < groups.size || hasMorePages) {
+      more = make(
         "div",
         { class: "discover-more", role: "status" },
         [
           make("span", { class: "spinner", "aria-hidden": "true" }),
-          make("span", { text: "继续加载…" }),
+          make("span", { text: "加载更多…" }),
         ],
       );
       root.append(more);
-      let loading = false;
-      const moreText = more.children[more.children.length - 1];
+      moreText = more.children[more.children.length - 1];
       const loadMore = async () => {
         if (loading || sequence !== renderSequence) return;
+        if (rendered < groups.size) {
+          renderNextBatch();
+          if (rendered >= groups.size && !hasMorePages) showEnd();
+          return;
+        }
+        if (!hasMorePages) return;
         loading = true;
         more.classList.add("loading");
         moreText.textContent = "正在加载…";
@@ -1270,16 +1296,16 @@
           if (sequence !== renderSequence) return;
           state.onlinePage += 1;
           const changed = mergeCatalogGroups(page.results, groups);
-          changed.forEach((key) => appendGroup(groups.get(key)));
-          summary.textContent = `已显示 ${cards.size} 组影片`;
-          if (state.onlinePage >= page.page_count) {
-            state.onlineObserver?.disconnect();
-            state.onlineObserver = null;
-            more.className = "discover-end";
-            more.replaceChildren(make("span", { text: "已经到底了" }));
+          changed.forEach((key) => {
+            if (cards.has(key)) renderGroup(groups.get(key));
+          });
+          renderNextBatch();
+          hasMorePages = state.onlinePage < page.page_count;
+          if (rendered >= groups.size && !hasMorePages) {
+            showEnd();
           } else {
             more.classList.remove("loading");
-            moreText.textContent = "继续加载…";
+            moreText.textContent = "加载更多…";
           }
         } catch (e) {
           if (sequence === renderSequence) {
@@ -1297,7 +1323,7 @@
           (entries) => {
             if (entries.some((entry) => entry.isIntersecting)) loadMore();
           },
-          { rootMargin: "700px 0px" },
+          { rootMargin: "0px" },
         );
         state.onlineObserver.observe(more);
       }

@@ -17,7 +17,7 @@ use std::time::Duration;
 use url::Url;
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
@@ -497,8 +497,32 @@ fn remember_types(conn: &Connection, source_id: i64, items: &[Value]) -> Result<
     Ok(())
 }
 
+fn remember_classes(conn: &Connection, source_id: i64, classes: &[Value]) -> Result<(), AppError> {
+    let mut statement = conn.prepare_cached(
+        "INSERT OR REPLACE INTO catalog_types(source_id,type_id,type_name) VALUES(?1,?2,?3)",
+    )?;
+    for class in classes {
+        let Some(type_id) = unsigned(class.get("type_id")) else {
+            continue;
+        };
+        let name = text(class, "type_name");
+        if name.trim().is_empty() {
+            continue;
+        }
+        statement.execute(params![source_id, type_id as i64, name.trim()])?;
+    }
+    Ok(())
+}
 async fn refresh_categories(state: &Shared) -> Result<(), AppError> {
     let active: Vec<Source> = active_sources(state)?;
+    let class_jobs = active.iter().cloned().map(|source| async move {
+        let result = fetch_cms_value(state, &source, &[("ac", "list")]).await;
+        (source.id, result)
+    });
+    let classes = stream::iter(class_jobs)
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
     let mut jobs = Vec::new();
     for source in &active {
         for page in 1..=4 {
@@ -514,6 +538,13 @@ async fn refresh_categories(state: &Shared) -> Result<(), AppError> {
     .collect::<Vec<_>>()
     .await;
     let conn = state.conn()?;
+    for (source_id, result) in classes {
+        if let Ok(value) = result
+            && let Some(classes) = value.get("class").and_then(Value::as_array)
+        {
+            let _ = remember_classes(&conn, source_id, classes);
+        }
+    }
     for (source_id, result) in listings {
         if let Ok(listing) = result
             && remember_types(&conn, source_id, &listing.items).is_err()
@@ -580,7 +611,10 @@ pub async fn discover(
         return Err(AppError::bad_request("Page must be between 1 and 10000"));
     }
     if let Some(value) = kind
-        && !matches!(value, "movie" | "series" | "variety" | "anime" | "other")
+        && !matches!(
+            value,
+            "movie" | "series" | "variety" | "anime" | "child" | "other"
+        )
     {
         return Err(AppError::bad_request("Unknown media kind"));
     }
@@ -674,7 +708,7 @@ pub async fn discover(
             (source, result)
         }
     }))
-    .buffer_unordered(16);
+    .buffer_unordered(32);
     let mut fetched = Vec::new();
     while let Some((source, result)) = responses.next().await {
         if let Ok(listing) = &result
@@ -790,7 +824,18 @@ fn text(item: &Value, field: &str) -> String {
 
 fn media_kind(type_name: &str) -> &'static str {
     let name = type_name.trim();
-    if name.contains("解说")
+    if name.contains("儿童")
+        || name.contains("少儿")
+        || name.contains("亲子")
+        || name.contains("宝宝")
+        || name.contains("幼儿")
+        || name.contains("早教")
+        || name.contains("益智")
+        || name.contains("童话")
+        || name.contains("儿歌")
+    {
+        "child"
+    } else if name.contains("解说")
         || name.contains("纪录片")
         || name.contains("记录片")
         || name.contains("预告片")
@@ -1068,6 +1113,9 @@ mod tests {
         assert_eq!(media_kind("动漫电影"), "movie");
         assert_eq!(media_kind("国产动漫"), "anime");
         assert_eq!(media_kind("动画片"), "anime");
+        assert_eq!(media_kind("儿童儿歌"), "child");
+        assert_eq!(media_kind("少儿动画"), "child");
+        assert_eq!(media_kind("儿童电影"), "child");
         assert_eq!(media_kind("纪录片"), "other");
         assert_eq!(media_kind("电影解说"), "other");
         assert_eq!(media_kind("大陆综艺"), "variety");

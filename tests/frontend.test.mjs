@@ -768,6 +768,45 @@ test("discover appends the next page from the load-more sentinel", async () => {
     "已经到底了",
   );
 });
+test("discover renders twenty cards at a time", async () => {
+  const app = environment({
+    "/api/sources": [{ id: 1, name: "甲源", enabled: true }],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": {
+      results: Array.from({ length: 25 }, (_, index) => ({
+        title: `影片${index + 1}`,
+        source_name: "甲源",
+        year: "2026",
+      })),
+      errors: [],
+      page: 1,
+      page_count: 1,
+      total: 25,
+    },
+  });
+  const flatten = (node) =>
+    [node, ...(node.children || []).flatMap(flatten)].filter(Boolean);
+  const page = await app.online();
+  const count = () =>
+    flatten(page).filter((node) => node.className === "media-card").length;
+  const summary = flatten(page).find(
+    (node) => node.className === "discover-summary",
+  );
+  const more = flatten(page).find(
+    (node) => node.className === "discover-more",
+  );
+  assert.equal(count(), 20);
+  assert.equal(summary.textContent, "已显示 20 组影片");
+  assert.ok(more, "missing load-more sentinel");
+  await more.listeners.click[0]();
+  assert.equal(count(), 25);
+  assert.equal(summary.textContent, "已显示 25 组影片");
+  assert.equal(
+    flatten(page).find((node) => node.className === "discover-end")
+      .textContent,
+    "已经到底了",
+  );
+});
 test("discover merges the same media from multiple sources into one card", async () => {
   const app = environment({
     "/api/sources": [

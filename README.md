@@ -5,6 +5,7 @@ PolyView is a self-hosted media hub for a NAS: browse and watch from a desktop w
 ## Included
 
 - Online catalog browsing, multi-source search, title details, playback lines, and episode selection using MacCMS-compatible JSON APIs.
+- Media-kind filters separate movies, series, variety shows, anime, children's content, and other categories.
 - Administrator-managed online sources: add, edit, enable, disable, and remove sources.
 - Same-origin authenticated playback proxy for HTTP(S) video and HLS, including nested playlists, segments, keys, and byte-range requests.
 - Online series subscriptions with watched-episode counts, manual checks, and checks every ten minutes. Automatic downloads are optional and deduplicate episodes already queued for that subscription.
@@ -90,7 +91,7 @@ Media files are not moved or deleted. The original service remains the place to 
 
 An administrator adds a MacCMS-compatible HTTP(S) JSON API in the source settings. Source URLs must not contain embedded username/password credentials. Enabled sources appear in online browsing, search, and the TV feed. Disabled sources are unavailable for lookup and tracking; an in-use source can be disabled while its subscriptions are retained. Sources can be marked **成人源**; they stay hidden from non-admin accounts in browsing, search, details, tracking, and the TV feed unless an administrator enables the global adult-source switch. Only administrators can view or change source configuration and that switch.
 
-Online browsing aggregates all enabled sources by default. Results with the same media kind, title, and year are merged into one card showing the number of sources; movies, series, variety shows, anime, and other categories stay separate. Opening a card offers a source switcher, so playback and tracking use the selected source. Results load as the page is scrolled. Media-kind, category, and year filters are available; the media-kind filter queries every cached source category of that kind, while category and year filters are translated to each source's own numeric category IDs where possible, and selecting a single source remains possible.
+Online browsing aggregates all enabled sources by default. Results with the same media kind, title, and year are merged into one card showing the number of sources; movies, series, variety shows, anime, and other categories stay separate. Opening a card offers a source switcher, so playback and tracking use the selected source. The first twenty cards render immediately; more cards appear in batches of twenty as the page is scrolled, fetching the next source page only after the current batch is exhausted. Media-kind, category, and year filters are available; the media-kind filter queries every cached source category of that kind, while category and year filters are translated to each source's own numeric category IDs where possible, and selecting a single source remains possible.
 
 Choose a title, playback line, and episode to watch. The browser fetches online media through the authenticated playback proxy, which resolves relative HLS URLs without relying on the source's browser CORS settings. Source reachability, authorization, video codecs, and any source restrictions still apply.
 
