@@ -25,8 +25,27 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             url TEXT NOT NULL UNIQUE,
-            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1))
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+            adult INTEGER NOT NULL DEFAULT 0 CHECK(adult IN (0,1))
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
         );",
+    )?;
+    let has_adult: bool = conn.query_row(
+        "SELECT COUNT(*)>0 FROM pragma_table_info('catalog_sources') WHERE name='adult'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_adult {
+        conn.execute(
+            "ALTER TABLE catalog_sources ADD COLUMN adult INTEGER NOT NULL DEFAULT 0 CHECK(adult IN (0,1))",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO settings(key,value) VALUES ('adult_sources_enabled','0')",
+        [],
     )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS catalog_types (
@@ -47,6 +66,10 @@ pub fn router() -> Router<Shared> {
             "/api/sources/{id}",
             delete(delete_source).put(update_source),
         )
+        .route(
+            "/api/catalog/settings",
+            get(settings_handler).put(save_settings_handler),
+        )
         .route("/api/catalog/search", get(search_handler))
         .route("/api/catalog/discover", get(discover_handler))
         .route("/api/catalog/categories", get(categories_handler))
@@ -59,6 +82,7 @@ pub struct Source {
     pub name: String,
     pub url: String,
     pub enabled: bool,
+    pub adult: bool,
 }
 
 fn source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
@@ -67,20 +91,101 @@ fn source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
         name: row.get(1)?,
         url: row.get(2)?,
         enabled: row.get(3)?,
+        adult: row.get(4)?,
     })
 }
 
 pub fn sources(state: &Shared) -> Result<Vec<Source>, AppError> {
     let conn = state.conn()?;
-    let mut stmt = conn.prepare("SELECT id,name,url,enabled FROM catalog_sources ORDER BY id")?;
+    let mut stmt =
+        conn.prepare("SELECT id,name,url,enabled,adult FROM catalog_sources ORDER BY id")?;
     Ok(stmt.query_map([], source_row)?.collect::<Result<_, _>>()?)
+}
+
+pub fn adult_sources_enabled(conn: &Connection) -> Result<bool, AppError> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='adult_sources_enabled'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .as_deref()
+        == Some("1"))
+}
+
+pub fn active_sources(state: &Shared) -> Result<Vec<Source>, AppError> {
+    let show_adult = {
+        let conn = state.conn()?;
+        adult_sources_enabled(&conn)?
+    };
+    Ok(sources(state)?
+        .into_iter()
+        .filter(|source| source.enabled && (show_adult || !source.adult))
+        .collect())
+}
+
+fn ensure_source_visible(conn: &Connection, source: &Source) -> Result<(), AppError> {
+    if source.adult && !adult_sources_enabled(conn)? {
+        return Err(AppError::not_found("Source not found or disabled"));
+    }
+    Ok(())
 }
 
 async fn list_sources(
     State(state): State<Shared>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<Json<Vec<Source>>, AppError> {
-    sources(&state).map(Json)
+    let show_adult = {
+        let conn = state.conn()?;
+        user.role == "admin" || adult_sources_enabled(&conn)?
+    };
+    let mut list = sources(&state)?;
+    if user.role != "admin" {
+        list.retain(|source| source.enabled && (show_adult || !source.adult));
+    }
+    Ok(Json(list))
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogSettings {
+    adult_sources_enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct CatalogSettingsInput {
+    adult_sources_enabled: bool,
+}
+
+async fn settings_handler(
+    State(state): State<Shared>,
+    user: AuthUser,
+) -> Result<Json<CatalogSettings>, AppError> {
+    require_admin(&user)?;
+    let conn = state.conn()?;
+    Ok(Json(CatalogSettings {
+        adult_sources_enabled: adult_sources_enabled(&conn)?,
+    }))
+}
+
+async fn save_settings_handler(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Json(input): Json<CatalogSettingsInput>,
+) -> Result<Json<CatalogSettings>, AppError> {
+    require_admin(&user)?;
+    state.conn()?.execute(
+        "INSERT INTO settings(key,value) VALUES('adult_sources_enabled',?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [if input.adult_sources_enabled {
+            "1"
+        } else {
+            "0"
+        }],
+    )?;
+    Ok(Json(CatalogSettings {
+        adult_sources_enabled: input.adult_sources_enabled,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -89,6 +194,8 @@ struct SourceInput {
     url: String,
     #[serde(default = "enabled_by_default")]
     enabled: bool,
+    #[serde(default)]
+    adult: bool,
 }
 
 fn enabled_by_default() -> bool {
@@ -150,8 +257,8 @@ async fn create_source(
     let (name, url) = validate_source(&input)?;
     let conn = state.conn()?;
     conn.execute(
-        "INSERT INTO catalog_sources(name,url,enabled) VALUES(?,?,?)",
-        params![name, url, input.enabled],
+        "INSERT INTO catalog_sources(name,url,enabled,adult) VALUES(?,?,?,?)",
+        params![name, url, input.enabled, input.adult],
     )
     .map_err(source_write_error)?;
     Ok((
@@ -161,6 +268,7 @@ async fn create_source(
             name,
             url,
             enabled: input.enabled,
+            adult: input.adult,
         }),
     ))
 }
@@ -176,8 +284,8 @@ async fn update_source(
     if state
         .conn()?
         .execute(
-            "UPDATE catalog_sources SET name=?,url=?,enabled=? WHERE id=?",
-            params![name, url, input.enabled, id],
+            "UPDATE catalog_sources SET name=?,url=?,enabled=?,adult=? WHERE id=?",
+            params![name, url, input.enabled, input.adult, id],
         )
         .map_err(source_write_error)?
         == 0
@@ -189,6 +297,7 @@ async fn update_source(
         name,
         url,
         enabled: input.enabled,
+        adult: input.adult,
     }))
 }
 
@@ -335,8 +444,8 @@ async fn search_handler(
 
 pub async fn search(state: &Shared, query: &str) -> Result<SearchResponse, AppError> {
     let query = validate_text(query, "Search query", 100)?;
-    let active = sources(state)?.into_iter().filter(|source| source.enabled);
-    let mut responses = stream::iter(active.map(|source| async move {
+    let active = active_sources(state)?;
+    let mut responses = stream::iter(active.into_iter().map(|source| async move {
         let result = fetch_items(state, &source, &[("ac", "detail"), ("wd", query)]).await;
         (source, result)
     }))
@@ -389,10 +498,7 @@ fn remember_types(conn: &Connection, source_id: i64, items: &[Value]) -> Result<
 }
 
 async fn refresh_categories(state: &Shared) -> Result<(), AppError> {
-    let active: Vec<Source> = sources(state)?
-        .into_iter()
-        .filter(|source| source.enabled)
-        .collect();
+    let active: Vec<Source> = active_sources(state)?;
     let mut jobs = Vec::new();
     for source in &active {
         for page in 1..=4 {
@@ -532,9 +638,9 @@ pub async fn discover(
         }
     }
     let require_type = category.is_some() || kind.is_some_and(|kind| kind != "other");
-    let active: Vec<Source> = sources(state)?
+    let active: Vec<Source> = active_sources(state)?
         .into_iter()
-        .filter(|source| source.enabled && source_id.is_none_or(|id| source.id == id))
+        .filter(|source| source_id.is_none_or(|id| source.id == id))
         .filter(|source| {
             !require_type || type_ids.get(&source.id).is_some_and(|ids| !ids.is_empty())
         })
@@ -637,12 +743,16 @@ pub async fn detail(state: &Shared, source_id: i64, id: &str) -> Result<CatalogD
     let source = state
         .conn()?
         .query_row(
-            "SELECT id,name,url,enabled FROM catalog_sources WHERE id=? AND enabled=1",
+            "SELECT id,name,url,enabled,adult FROM catalog_sources WHERE id=? AND enabled=1",
             [source_id],
             source_row,
         )
         .optional()?
         .ok_or_else(|| AppError::not_found("Source not found or disabled"))?;
+    {
+        let conn = state.conn()?;
+        ensure_source_visible(&conn, &source)?;
+    }
     let page = fetch_items(state, &source, &[("ac", "detail"), ("ids", id)])
         .await
         .map_err(|message| AppError(StatusCode::BAD_GATEWAY, message))?;
@@ -839,12 +949,16 @@ pub async fn cms_query(
     let source = state
         .conn()?
         .query_row(
-            "SELECT id,name,url,enabled FROM catalog_sources WHERE id=? AND enabled=1",
+            "SELECT id,name,url,enabled,adult FROM catalog_sources WHERE id=? AND enabled=1",
             [source_id],
             source_row,
         )
         .optional()?
         .ok_or_else(|| AppError::not_found("Source not found or disabled"))?;
+    {
+        let conn = state.conn()?;
+        ensure_source_visible(&conn, &source)?;
+    }
     fetch_cms_value(state, &source, parameters)
         .await
         .map_err(|message| AppError(StatusCode::BAD_GATEWAY, message))
@@ -1008,6 +1122,7 @@ mod tests {
             name: "测试".into(),
             url: "https://cms.example/api.php".into(),
             enabled: true,
+            adult: false,
         };
         assert_eq!(
             create_source(State(state.clone()), viewer, Json(input()))
@@ -1058,6 +1173,67 @@ mod tests {
             .await
             .unwrap();
         assert!(sources(&state).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn adult_sources_are_hidden_until_an_admin_enables_them() {
+        let (_temp, state) = state();
+        let (base, task) = fixture().await;
+        state
+            .conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO catalog_sources(name,url,enabled,adult) VALUES
+                 ('normal',?1,1,0),('adult',?2,1,1)",
+                [
+                    format!("{base}/cms?key=retained&normal=1"),
+                    format!("{base}/cms?key=retained&adult=1"),
+                ],
+            )
+            .unwrap();
+        let viewer = AuthUser {
+            id: 2,
+            username: "viewer".into(),
+            role: "user".into(),
+        };
+        assert_eq!(active_sources(&state).unwrap().len(), 1);
+        let Json(list) = list_sources(State(state.clone()), viewer.clone())
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "normal");
+        assert_eq!(
+            settings_handler(State(state.clone()), viewer.clone())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            save_settings_handler(
+                State(state.clone()),
+                viewer,
+                Json(CatalogSettingsInput {
+                    adult_sources_enabled: true
+                })
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let Json(settings) = save_settings_handler(
+            State(state.clone()),
+            admin(),
+            Json(CatalogSettingsInput {
+                adult_sources_enabled: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(settings.adult_sources_enabled);
+        assert_eq!(active_sources(&state).unwrap().len(), 2);
+        task.abort();
     }
 
     #[tokio::test]
@@ -1144,6 +1320,7 @@ mod tests {
                 name: "test".into(),
                 url: format!("{base}{path}?key=private"),
                 enabled: true,
+                adult: false,
             };
             let error = fetch_items(&state, &source, &[("ac", "detail")])
                 .await

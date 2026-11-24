@@ -88,7 +88,7 @@ Media files are not moved or deleted. The original service remains the place to 
 
 ## Online viewing and series tracking
 
-An administrator adds a MacCMS-compatible HTTP(S) JSON API in the source settings. Source URLs must not contain embedded username/password credentials. Enabled sources appear in online browsing, search, and the TV feed. Disabled sources are unavailable for lookup and tracking; an in-use source can be disabled while its subscriptions are retained.
+An administrator adds a MacCMS-compatible HTTP(S) JSON API in the source settings. Source URLs must not contain embedded username/password credentials. Enabled sources appear in online browsing, search, and the TV feed. Disabled sources are unavailable for lookup and tracking; an in-use source can be disabled while its subscriptions are retained. Sources can be marked **成人源**; they stay hidden from non-admin accounts in browsing, search, details, tracking, and the TV feed unless an administrator enables the global adult-source switch. Only administrators can view or change source configuration and that switch.
 
 Online browsing aggregates all enabled sources by default. Results with the same media kind, title, and year are merged into one card showing the number of sources; movies, series, variety shows, anime, and other categories stay separate. Opening a card offers a source switcher, so playback and tracking use the selected source. Results load as the page is scrolled. Media-kind, category, and year filters are available; the media-kind filter queries every cached source category of that kind, while category and year filters are translated to each source's own numeric category IDs where possible, and selecting a single source remains possible.
 
@@ -125,6 +125,7 @@ Media, catalog, tracking, download, and TV-feed APIs require a login. Initial se
 | Endpoint                                                                                    | Purpose                                                                        |
 | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | `GET/POST /api/sources`, `PUT/DELETE /api/sources/{id}`                                     | List and manage CMS sources                                                    |
+| `GET/PUT /api/catalog/settings`                                                             | Read or update the admin-only adult-source switch                              |
 | `GET /api/catalog/discover`, `/api/catalog/categories`, `/api/catalog/search`, `/api/catalog/{source_id}/detail` | Multi-source browsing with media-kind, category, and year filters, client-side title aggregation, search, and title details |
 | `GET /api/playback?url=...`                                                                 | Authenticated HLS/video playback proxy                                         |
 | `GET/POST /api/tracking`, `PUT/DELETE /api/tracking/{id}`, `POST /api/tracking/check`       | Online subscriptions, watched counts, automatic download selection, and checks |

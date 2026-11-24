@@ -268,6 +268,10 @@ async fn administrators_manage_users_and_regular_users_cannot_manage_sources() {
             "/api/users",
             json!({"username":"intruder","password":PASSWORD,"role":"admin"}),
         ),
+        (
+            "/api/sources",
+            json!({"name":"intruder","url":"https://example.org/cms"}),
+        ),
         ("/api/library/scan", json!({})),
         (
             "/api/channels/import",
@@ -282,6 +286,31 @@ async fn administrators_manage_users_and_regular_users_cannot_manage_sources() {
             "{route}"
         );
     }
+    for (method, route, body) in [
+        (
+            "PUT",
+            "/api/sources/1",
+            Some(json!({"name":"intruder","url":"https://example.org/cms","enabled":true})),
+        ),
+        ("DELETE", "/api/sources/1", None),
+        (
+            "PUT",
+            "/api/catalog/settings",
+            Some(json!({"adult_sources_enabled":true})),
+        ),
+    ] {
+        assert_eq!(
+            app.request(method, route, Some(&viewer), body).await.status,
+            StatusCode::FORBIDDEN,
+            "{method} {route}"
+        );
+    }
+    assert_eq!(
+        app.request("GET", "/api/catalog/settings", Some(&viewer), None)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(
         app.request(
             "POST",

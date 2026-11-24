@@ -2011,7 +2011,50 @@
       }),
     ]);
     try {
-      const sources = await api("/api/sources");
+      const [sources, catalogSettings] = await Promise.all([
+        api("/api/sources"),
+        api("/api/catalog/settings"),
+      ]);
+      const adultEnabled = make("input", {
+        type: "checkbox",
+        checked: catalogSettings.adult_sources_enabled,
+      });
+      panel.append(
+        make(
+          "form",
+          {
+            class: "form-row",
+            on: {
+              submit: async (event) => {
+                event.preventDefault();
+                try {
+                  await api("/api/catalog/settings", {
+                    method: "PUT",
+                    body: { adult_sources_enabled: adultEnabled.checked },
+                  });
+                  toast(
+                    adultEnabled.checked ? "成人源已开启" : "成人源已关闭",
+                  );
+                  render();
+                } catch (error) {
+                  toast(error.message, true);
+                }
+              },
+            },
+          },
+          [
+            make("label", { class: "checkbox-label" }, [
+              adultEnabled,
+              "允许成人源",
+            ]),
+            button("保存成人源设置", "subtle", null, { type: "submit" }),
+          ],
+        ),
+        make("p", {
+          class: "hint",
+          text: "关闭后成人源不会出现在浏览、搜索和电视端。只有管理员能修改。",
+        }),
+      );
       const newForm = make(
         "form",
         {
@@ -2028,6 +2071,7 @@
                   body: {
                     name: form.elements.name.value.trim(),
                     url: form.elements.url.value.trim(),
+                    adult: form.elements.adult.checked,
                   },
                 });
                 toast("影视源已添加");
@@ -2055,6 +2099,10 @@
               placeholder: "https://example.com/api.php/provide/vod/",
             }),
           ]),
+          make("label", { class: "checkbox-label" }, [
+            make("input", { type: "checkbox", name: "adult" }),
+            "成人源",
+          ]),
           button("添加影视源", "primary", null, { type: "submit" }),
         ],
       );
@@ -2079,6 +2127,10 @@
           type: "checkbox",
           checked: source.enabled,
         });
+        const adult = make("input", {
+          type: "checkbox",
+          checked: source.adult,
+        });
         const form = make(
           "form",
           {
@@ -2093,6 +2145,7 @@
                       name: name.value.trim(),
                       url: url.value.trim(),
                       enabled: enabled.checked,
+                      adult: adult.checked,
                     },
                   });
                   toast("影视源已保存");
@@ -2106,6 +2159,7 @@
             name,
             url,
             make("label", { class: "checkbox-label" }, [enabled, "启用"]),
+            make("label", { class: "checkbox-label" }, [adult, "成人源"]),
             button("保存", "subtle small-button", null, { type: "submit" }),
             button("移除", "danger small-button", async () => {
               if (

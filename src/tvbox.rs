@@ -145,7 +145,7 @@ async fn config(
         "searchable": 1, "quickSearch": 1, "filterable": 0
     })];
     sites.extend(
-        crate::catalog::sources(&state)?
+        crate::catalog::active_sources(&state)?
             .into_iter()
             .filter(|source| source.enabled)
             .map(|source| {

@@ -140,12 +140,17 @@ async fn create(
     }
     let id = {
         let conn = state.conn()?;
-        let available: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM catalog_sources WHERE id=? AND enabled=1)",
-            [input.source_id],
-            |row| row.get(0),
-        )?;
-        if !available {
+        let source: Option<(bool, bool)> = conn
+            .query_row(
+                "SELECT enabled,adult FROM catalog_sources WHERE id=?",
+                [input.source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((enabled, adult)) = source else {
+            return Err(AppError::not_found("Source not found or disabled"));
+        };
+        if !enabled || (adult && !catalog::adult_sources_enabled(&conn)?) {
             return Err(AppError::not_found("Source not found or disabled"));
         }
         match conn.execute(
