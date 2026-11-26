@@ -42,6 +42,7 @@ pub fn router() -> Router<Shared> {
         .route("/tvbox/{token}/grants/{grant}", get(live_grant))
         .route("/tvbox/{token}/channels/{id}/logo", get(live_logo))
         .route("/tvbox/{token}/media/{id}", get(stream).head(stream))
+        .route("/tvbox/{token}/media/{id}/art/{kind}", get(artwork))
 }
 
 fn new_token() -> String {
@@ -336,11 +337,21 @@ async fn source_catalog(
     })))
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct VodItem {
+    #[serde(skip)]
+    identified: bool,
     vod_id: String,
     vod_name: String,
     vod_pic: String,
+    vod_sub: String,
+    vod_year: String,
+    vod_score: Option<f64>,
+    vod_class: String,
+    vod_actor: String,
+    vod_director: String,
+    vod_backdrop: String,
+    seasons: Vec<crate::scraper::Season>,
     type_id: String,
     type_name: &'static str,
     vod_remarks: String,
@@ -461,62 +472,87 @@ async fn telegram_stream(
 }
 
 fn local_items(state: &Shared, token: &str, origin: &str) -> Result<Vec<VodItem>, AppError> {
-    let conn = state.conn()?;
-    let mut query = conn.prepare(
-        "SELECT m.id,m.title,m.kind,m.series_id,COALESCE(s.title,''),m.season,m.episode
-         FROM library_media m LEFT JOIN library_series s ON s.id=m.series_id
-         WHERE m.available=1 ORDER BY m.season,m.episode,m.title COLLATE NOCASE,m.id",
-    )?;
-    let rows = query.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<i64>>(5)?,
-            row.get::<_, Option<i64>>(6)?,
-        ))
-    })?;
+    let rows = crate::library::items(&*state.conn()?, 0, crate::library::Selection::Search(""))?;
     let mut items: BTreeMap<String, VodItem> = BTreeMap::new();
     for row in rows {
-        let (id, title, kind, series_id, series, season, episode) = row?;
-        let is_series = kind == "episode" && series_id.is_some();
-        let key = if is_series {
-            format!("s{}", series_id.unwrap_or_default())
-        } else {
-            format!("m{id}")
+        let id = row.id;
+        let is_series = row.series_id.is_some();
+        let key = match row.series_id {
+            Some(series_id) => format!("s{series_id}"),
+            None => format!("m{id}"),
         };
-        let item = items.entry(key.clone()).or_insert_with(|| VodItem {
-            vod_id: key,
-            vod_name: if is_series { series } else { title.clone() },
-            vod_pic: String::new(),
-            type_id: if is_series {
-                "episode".into()
-            } else {
-                "movie".into()
-            },
-            type_name: if is_series { "剧集" } else { "电影" },
-            vod_remarks: String::new(),
-            vod_content: String::new(),
-            vod_play_from: "PolyView",
-            vod_play_url: String::new(),
-        });
-        if !item.vod_play_url.is_empty() {
-            item.vod_play_url.push('#');
+        let item = items.entry(key).or_default();
+        if item.vod_name.is_empty() || (!item.identified && !row.metadata.provider.is_empty()) {
+            let art_url = |path: String, kind: &str| {
+                if path == format!("/api/library/{id}/art/{kind}") {
+                    format!("{origin}/tvbox/{token}/media/{id}/art/{kind}")
+                } else {
+                    path
+                }
+            };
+            item.identified = !row.metadata.provider.is_empty();
+            item.vod_name = row.series.unwrap_or_else(|| row.title.clone());
+            item.vod_sub = row.metadata.original_title;
+            item.vod_pic = art_url(row.cover, "poster");
+            item.vod_backdrop = art_url(row.metadata.backdrop, "backdrop");
+            item.vod_year = row.year;
+            item.vod_score = row.metadata.rating;
+            item.vod_class = row.metadata.genres.join(", ");
+            item.vod_actor = row
+                .metadata
+                .cast
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            item.vod_director = row
+                .metadata
+                .crew
+                .iter()
+                .filter(|p| p.role.eq_ignore_ascii_case("director") || p.role == "导演")
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            item.type_id = if is_series { "episode" } else { "movie" }.to_owned();
+            item.type_name = if is_series { "剧集" } else { "电影" };
+            item.vod_content = row.description;
+            item.vod_play_from = "PolyView";
         }
-        let label = if is_series {
-            match (season, episode) {
-                (Some(season), Some(episode)) => format!("S{season:02}E{episode:02}"),
-                _ => protocol_label(&title),
-            }
+        let title = row.title;
+        let mut label = if let (Some(season), Some(episode)) = (row.season, row.episode) {
+            format!("S{season:02}E{episode:02}")
+        } else if is_series {
+            protocol_label(&title)
         } else {
             "播放".into()
         };
+        if let Some(episode) = row
+            .metadata
+            .seasons
+            .iter()
+            .find(|s| Some(s.number) == row.season)
+            .and_then(|s| s.episodes.iter().find(|e| Some(e.number) == row.episode))
+            .filter(|e| !e.title.is_empty())
+        {
+            label.push(' ');
+            label.push_str(&protocol_label(&episode.title));
+        }
+        if item.seasons.is_empty() {
+            item.seasons = row.metadata.seasons;
+        }
+        if !item.vod_play_url.is_empty() {
+            item.vod_play_url.push('#');
+        }
         item.vod_play_url
             .push_str(&format!("{label}${origin}/tvbox/{token}/media/{id}"));
     }
-    let mut items: Vec<_> = items.into_values().collect();
+    let mut items: Vec<_> = items
+        .into_iter()
+        .map(|(id, mut item)| {
+            item.vod_id = id;
+            item
+        })
+        .collect();
     items.sort_by(|left, right| {
         left.vod_name
             .to_lowercase()
@@ -663,6 +699,15 @@ async fn live_logo(
 ) -> Result<Response, AppError> {
     require_token(&state, &token)?;
     crate::playback::channel_logo(&state, id).await
+}
+
+async fn artwork(
+    State(state): State<Shared>,
+    Path((token, id, kind)): Path<(String, i64, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    require_token(&state, &token)?;
+    let (mime, bytes) = crate::scraper::artwork(&*state.conn()?, id, &kind)?;
+    Ok(([(header::CONTENT_TYPE, mime)], bytes))
 }
 
 async fn stream(

@@ -1,3 +1,13 @@
+mod automation;
+mod views;
+
+pub(crate) use views::{Selection, items};
+
+pub use automation::start_automation_worker;
+pub(crate) use automation::{
+    acknowledge_organized_external, enabled as automation_enabled, index_external,
+};
+
 use crate::{
     AppError, Shared,
     auth::{AuthUser, require_admin},
@@ -47,13 +57,19 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     }
     crate::ensure_column(conn, "library_user_media", "favorite_at", "INTEGER")?;
     conn.execute("UPDATE library_user_media SET favorite_at=updated_at WHERE favorite=1 AND favorite_at IS NULL", [])?;
-    Ok(())
+    // Scans reconcile in-flight organizer paths, and catalog projections read cached metadata.
+    crate::organizer::init_schema(conn)?;
+    crate::scraper::init_schema(conn)?;
+    automation::init_schema(conn)
 }
 
 pub fn router() -> Router<Shared> {
     Router::new()
         .route("/api/library", get(list))
         .route("/api/library/scan", post(scan))
+        .route("/api/library/{id}", get(views::detail))
+        .route("/api/library/{id}/scrape", post(automation::scrape))
+        .route("/api/library/{id}/reidentify", post(automation::reidentify))
         .route("/api/library/{id}/stream", get(stream).head(stream))
         .route("/api/library/{id}/favorite", put(favorite))
         .route("/api/library/{id}/progress", put(progress))
@@ -79,6 +95,8 @@ pub struct MediaItem {
     pub cover: String,
     pub year: String,
     pub description: String,
+    #[serde(flatten)]
+    pub(crate) metadata: views::DisplayMetadata,
 }
 
 #[derive(Default, Deserialize)]
@@ -92,20 +110,11 @@ async fn list(
     Query(search): Query<Search>,
 ) -> Result<Json<Vec<MediaItem>>, AppError> {
     let conn = state.conn()?;
-    let query = search.q.unwrap_or_default();
-    let mut stmt = conn.prepare(
-        "SELECT m.id,m.title,m.relative_path,m.kind,s.title,m.series_id,m.season,m.episode,m.size,
-                COALESCE(u.favorite,0),COALESCE(u.position,0),COALESCE(u.duration,0),COALESCE(u.watched,0),
-                m.cover,m.year,m.description
-         FROM library_media m LEFT JOIN library_series s ON s.id=m.series_id
-         LEFT JOIN library_user_media u ON u.media_id=m.id AND u.user_id=?1
-         WHERE m.available=1 AND (?2='' OR instr(lower(m.title || ' ' || COALESCE(s.title,'')),lower(?2))>0)
-         ORDER BY s.title COLLATE NOCASE,m.season,m.episode,m.title COLLATE NOCASE"
-    )?;
-    let items = stmt
-        .query_map(params![user.id, query], media_row)?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(items))
+    Ok(Json(views::items(
+        &conn,
+        user.id,
+        views::Selection::Search(search.q.as_deref().unwrap_or_default()),
+    )?))
 }
 
 pub(crate) fn media_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
@@ -126,6 +135,7 @@ pub(crate) fn media_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> 
         cover: row.get(13)?,
         year: row.get(14)?,
         description: row.get(15)?,
+        metadata: Default::default(),
     })
 }
 
@@ -144,13 +154,32 @@ struct ScannedFile {
 }
 
 impl ScannedFile {
-    fn index(&self, conn: &Connection) -> Result<(), AppError> {
+    fn index(&self, conn: &Connection) -> Result<Option<i64>, AppError> {
+        if crate::organizer::skip_scan_path(conn, self.root, &self.relative_path)? {
+            return Ok(None);
+        }
+        if let Some(id) = conn.query_row(
+            "UPDATE library_media SET size=?3,available=1 WHERE root=?1 AND relative_path=?2 RETURNING id",
+            params![self.root, self.relative_path, self.size], |row| row.get(0),
+        ).optional()? {
+            automation::enqueue(conn, id, self.size)?;
+            return Ok(Some(id));
+        }
         let relative = FsPath::new(&self.relative_path);
         let stem = relative
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        let (series, season, episode) = episode_info(stem, relative);
+        let detected = crate::organizer::detect_filename(relative);
+        let (series, season, episode) = if let Some(episode) = detected.episode {
+            (
+                Some(detected.title),
+                detected.season.map(i64::from),
+                Some(i64::from(episode)),
+            )
+        } else {
+            episode_info(stem, relative)
+        };
         let series_id = if let Some(title) = series {
             conn.execute(
                 "INSERT INTO library_series(title) VALUES(?) ON CONFLICT(title) DO NOTHING",
@@ -169,14 +198,14 @@ impl ScannedFile {
         } else {
             "movie"
         };
-        conn.execute(
+        let id = conn.query_row(
             "INSERT INTO library_media(title,relative_path,root,kind,series_id,season,episode,size,available)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1)
-             ON CONFLICT(root,relative_path) DO UPDATE SET title=excluded.title,kind=excluded.kind,
-             series_id=excluded.series_id,season=excluded.season,episode=excluded.episode,size=excluded.size,available=1",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1) RETURNING id",
             params![clean_title(stem), self.relative_path, self.root, kind, series_id, season, episode, self.size],
+            |row| row.get(0),
         )?;
-        Ok(())
+        automation::enqueue(conn, id, self.size)?;
+        Ok(Some(id))
     }
 }
 
@@ -225,6 +254,7 @@ async fn scan(State(state): State<Shared>, user: AuthUser) -> Result<Json<ScanRe
 
 /// Blocking: callers on the async runtime must use spawn_blocking.
 pub fn scan_library(state: &Shared) -> Result<ScanResult, AppError> {
+    let _organizer_scan = crate::organizer::scan_guard(state)?;
     let media_root = fs::canonicalize(&state.media_dir)?;
     let download_root = fs::canonicalize(&state.download_dir)?;
     let mut missing: HashSet<(String, String)> = {
@@ -245,11 +275,14 @@ pub fn scan_library(state: &Shared) -> Result<ScanResult, AppError> {
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
     let mut added = 0;
-    let total = files.len();
+    let mut total = 0;
     // Only mark files from the pre-walk snapshot as missing. A queue worker may
     // have indexed a new file while this scan was walking a different directory.
     for file in files {
-        file.index(&tx)?;
+        if file.index(&tx)?.is_none() {
+            continue;
+        }
+        total += 1;
         if !missing.remove(&(file.root.to_owned(), file.relative_path)) {
             added += 1;
         }
@@ -257,7 +290,8 @@ pub fn scan_library(state: &Shared) -> Result<ScanResult, AppError> {
     let mut removed = 0;
     for (root, path) in missing {
         removed += tx.execute(
-            "UPDATE library_media SET available=0 WHERE root=? AND relative_path=? AND available=1",
+            "UPDATE library_media SET available=0 WHERE root=? AND relative_path=? AND available=1
+             AND NOT EXISTS (SELECT 1 FROM organizer_history h WHERE h.media_id=library_media.id AND h.status IN ('pending','rolling_back'))",
             params![root, path],
         )?;
     }

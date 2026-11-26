@@ -1,3 +1,7 @@
+pub mod automation;
+mod rules;
+use rules::Rules;
+
 use crate::{
     AppError, Shared,
     auth::AuthUser,
@@ -69,7 +73,13 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
     }
-    Ok(())
+    ensure_column(
+        conn,
+        "tracking_subscriptions",
+        "rules",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    automation::init_schema(conn)
 }
 
 pub fn router() -> Router<Shared> {
@@ -77,6 +87,7 @@ pub fn router() -> Router<Shared> {
         .route("/api/tracking", get(list).post(create))
         .route("/api/tracking/check", post(check))
         .route("/api/tracking/{id}", delete(remove).put(update))
+        .merge(automation::router())
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +105,7 @@ pub struct Subscription {
     pub error: Option<String>,
     pub queued_episodes: i64,
     pub completed_downloads: i64,
+    rules: Rules,
 }
 
 const SUBSCRIPTION_SELECT: &str =
@@ -101,7 +113,7 @@ const SUBSCRIPTION_SELECT: &str =
             s.watched_episodes,s.auto_download,s.last_checked,s.error,
             (SELECT COUNT(*) FROM tracking_downloads td WHERE td.subscription_id=s.id),
             (SELECT COUNT(*) FROM tracking_downloads td LEFT JOIN downloads d ON d.id=td.download_id
-             WHERE td.subscription_id=s.id AND (d.status='completed' OR td.archived_completed=1)), s.paused
+             WHERE td.subscription_id=s.id AND (d.status='completed' OR td.archived_completed=1)), s.paused, s.rules
      FROM tracking_subscriptions s";
 
 fn subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
@@ -119,6 +131,7 @@ fn subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
         queued_episodes: row.get(10)?,
         completed_downloads: row.get(11)?,
         paused: row.get(12)?,
+        rules: Rules::read(row, 13)?,
     })
 }
 
@@ -154,13 +167,16 @@ struct CreateInput {
     media_id: String,
     #[serde(default)]
     auto_download: bool,
+    #[serde(default)]
+    rules: Rules,
 }
 
 async fn create(
     State(state): State<Shared>,
     user: AuthUser,
-    Json(input): Json<CreateInput>,
+    Json(mut input): Json<CreateInput>,
 ) -> Result<(StatusCode, Json<Subscription>), AppError> {
+    let rules = input.rules.encode()?;
     let media_id = input.media_id.trim();
     if media_id.is_empty()
         || media_id.chars().count() > 256
@@ -186,14 +202,15 @@ async fn create(
             return Err(AppError::not_found("Source not found or disabled"));
         }
         match conn.execute(
-            "INSERT INTO tracking_subscriptions(user_id,source_id,media_id,title,auto_download)
-             VALUES(?,?,?,?,?)",
+            "INSERT INTO tracking_subscriptions(user_id,source_id,media_id,title,auto_download,rules)
+             VALUES(?,?,?,?,?,?)",
             params![
                 user.id,
                 input.source_id,
                 media_id,
                 media_id,
-                input.auto_download
+                input.auto_download,
+                rules
             ],
         ) {
             Err(rusqlite::Error::SqliteFailure(code, _))
@@ -223,14 +240,16 @@ struct UpdateInput {
     watched_episodes: Option<i64>,
     auto_download: Option<bool>,
     paused: Option<bool>,
+    rules: Option<Rules>,
 }
 
 async fn update(
     State(state): State<Shared>,
     user: AuthUser,
     Path(id): Path<i64>,
-    Json(input): Json<UpdateInput>,
+    Json(mut input): Json<UpdateInput>,
 ) -> Result<Json<Subscription>, AppError> {
+    let rules = input.rules.as_mut().map(Rules::encode).transpose()?;
     {
         let conn = state.conn()?;
         let (watched, total): (i64, i64) = conn
@@ -248,11 +267,11 @@ async fn update(
             ));
         }
         conn.execute(
-            "UPDATE tracking_subscriptions SET watched_episodes=?,auto_download=COALESCE(?,auto_download),paused=COALESCE(?,paused) WHERE id=? AND user_id=?",
-            params![watched, input.auto_download, input.paused, id, user.id],
+            "UPDATE tracking_subscriptions SET watched_episodes=?,auto_download=COALESCE(?,auto_download),paused=COALESCE(?,paused),rules=COALESCE(?,rules) WHERE id=? AND user_id=?",
+            params![watched, input.auto_download, input.paused, rules, id, user.id],
         )?;
     }
-    if input.auto_download == Some(true) {
+    if input.auto_download == Some(true) || rules.is_some() {
         let _ = check_one(&state, id, user.id).await;
     }
     Ok(Json(owned_subscription(&state, id, user.id)?))
@@ -348,6 +367,7 @@ struct CheckState {
     automatic: bool,
     total: i64,
     notified: i64,
+    rules: Rules,
 }
 
 fn check_state(
@@ -358,7 +378,7 @@ fn check_state(
 ) -> Result<Option<CheckState>, AppError> {
     Ok(conn
         .query_row(
-            "SELECT watched_episodes,auto_download,total_episodes,notified_episodes
+            "SELECT watched_episodes,auto_download,total_episodes,notified_episodes,rules
              FROM tracking_subscriptions WHERE id=? AND user_id=? AND source_id=? AND media_id=? AND paused=0",
             params![id, user_id, detail.source_id, detail.id],
             |row| Ok(CheckState {
@@ -366,6 +386,7 @@ fn check_state(
                 automatic: row.get(1)?,
                 total: row.get(2)?,
                 notified: row.get(3)?,
+                rules: Rules::read(row, 4)?,
             }),
         )
         .optional()?)
@@ -373,15 +394,39 @@ fn check_state(
 
 fn tracking_group<'a>(
     conn: &Connection,
-    groups: &'a [PlayGroup],
+    detail: &'a CatalogDetail,
+    rules: &Rules,
 ) -> Result<&'a PlayGroup, AppError> {
-    if let Some(group) = groups.iter().find(|group| group.direct) {
-        return Ok(group);
-    }
-    for group in groups {
-        if parsers::has_matching_parser(conn, &group.name)? {
+    let mut first_parsed = None;
+    let mut any_match = false;
+    for group in &detail.groups {
+        let all_direct = if rules.active() {
+            let mut matching = group
+                .episodes
+                .iter()
+                .filter(|episode| rules.matches(detail, group, episode))
+                .peekable();
+            if matching.peek().is_none() {
+                continue;
+            }
+            matching.all(|episode| episode.direct)
+        } else {
+            group.direct
+        };
+        any_match = true;
+        if all_direct {
             return Ok(group);
         }
+        if first_parsed.is_none() && parsers::has_matching_parser(conn, &group.name)? {
+            first_parsed = Some(group);
+        }
+    }
+    if let Some(group) = first_parsed {
+        return Ok(group);
+    }
+    // A filtered release still contributes its catalog episode count, without resolving a URL.
+    if !any_match && let Some(group) = detail.groups.first() {
+        return Ok(group);
     }
     Err(AppError(
         StatusCode::BAD_GATEWAY,
@@ -400,7 +445,7 @@ async fn apply_detail(
         let Some(snapshot) = check_state(&conn, id, user_id, &detail)? else {
             return Ok(0);
         };
-        let group = tracking_group(&conn, &detail.groups)?;
+        let group = tracking_group(&conn, &detail, &snapshot.rules)?;
         if group.episodes.len() > 10_000 {
             return Err(AppError::bad_request(
                 "A subscription supports at most 10,000 episodes",
@@ -428,7 +473,10 @@ async fn apply_detail(
             } else {
                 format!("name:{name}")
             };
-            if ordinal <= snapshot.watched || known.contains(&key) {
+            if ordinal <= snapshot.watched
+                || known.contains(&key)
+                || !snapshot.rules.matches(&detail, group, episode)
+            {
                 continue;
             }
             let media =
@@ -451,7 +499,7 @@ async fn apply_detail(
         params![detail.title, detail.cover, total, if send_update { total } else { current.notified }, now(), id, user_id],
     )?;
     let mut queued = 0;
-    if current.automatic && !prepared.is_empty() {
+    if current.automatic && current.rules == snapshot.rules && !prepared.is_empty() {
         let metadata = network::DownloadMetadata {
             cover: detail.cover,
             year: detail.year,
@@ -518,6 +566,9 @@ pub fn start_worker(state: Shared) -> JoinHandle<()> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            if let Err(error) = automation::sync_due(&state).await {
+                tracing::warn!(message = %error.1, "Could not schedule Douban wishlist sync");
+            }
             match check_user(&state, None).await {
                 Ok(result) => {
                     for error in result.errors {
@@ -615,6 +666,7 @@ mod tests {
                 source_id,
                 media_id: "42".into(),
                 auto_download: automatic,
+                rules: Rules::default(),
             }),
         )
         .await
@@ -705,6 +757,7 @@ mod tests {
                 watched_episodes: Some(1),
                 auto_download: Some(true),
                 paused: None,
+                rules: None,
             }),
         )
         .await
@@ -806,6 +859,7 @@ mod tests {
                     watched_episodes: Some(watched),
                     auto_download: Some(true),
                     paused: None,
+                    rules: None,
                 }),
             )
             .await

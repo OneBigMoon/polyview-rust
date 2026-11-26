@@ -9,6 +9,7 @@ const application = await readFile(
   new URL("../web/app.js", import.meta.url),
   "utf8",
 );
+const mediaScript = new vm.Script(await readFile(new URL("../web/media-settings.js", import.meta.url), "utf8"));
 
 function environment(routes = {}, { canPlayType = () => "" } = {}) {
   const elements = new Map();
@@ -279,10 +280,11 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     marker,
     "test harness must replace only the startup call",
   );
+  mediaScript.runInContext(context);
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {cloud, calendar, state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, favorites, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
+      "globalThis.hooks = {cloud, calendar, state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, favorites, series, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
     ),
     context,
   );
@@ -1955,7 +1957,7 @@ test("settings tabs render one panel at a time", async () => {
   app.state.user = { id: 1, username: "root", role: "admin" };
   const page = await app.settings();
   assert.deepEqual(pageClass(page, "filter-chip").map((chip) => chip.textContent),
-    ["账户安全", "家庭成员", "在线影视源", "解析接口", "网盘与资源频道", "直播与节目单", "通知与日历", "备份与工具", "影视仓订阅"]);
+    ["账户安全", "家庭成员", "在线影视源", "解析接口", "网盘与资源频道", "媒体自动化", "直播与节目单", "通知与日历", "备份与工具", "影视仓订阅"]);
   const panelTitles = (view) => pageNodes(pageClass(view, "settings-panel")[0])
     .filter((node) => node.tagName === "H2").map((node) => node.textContent);
   assert.deepEqual(panelTitles(page), ["修改密码"]);
@@ -3598,3 +3600,189 @@ test("failed Telegram album imports preserve the selected video and allow anothe
 
 registerParserPanelTests({ environment, pageNodes, pageButton });
 registerCloudPageTests({ environment, pageNodes, pageButton });
+
+function mediaWrites(app) {
+  return app.calls.filter(({ options }) => options.method && options.method !== "GET").map(({ url, options }) => {
+    assert.equal(options.headers["X-PolyView-Request"], "1");
+    assert.equal(options.credentials, "same-origin");
+    return [url, options.method, options.body ? JSON.parse(options.body) : undefined];
+  });
+}
+
+test("local poster details show cached artwork and credits, switch seasons, and resume the selected local episode", async () => {
+  const episodes = [1, 2].map((season) => ({ id: 10 + season, title: `本地第${season}季`, series: "故事", series_id: 7, kind: "episode", season, episode: 1, position: season * 10, duration: 100 }));
+  const detail = { ...episodes[0], cover: "/art/poster", backdrop: "/art/backdrop", year: "2024", rating: 8.2, genres: ["剧情", "音乐"], original_title: "A Story", description: "跨越两季的故事", cast: [{ name: "演员甲", role: "主角" }], crew: [{ name: "导演乙", role: "导演" }], seasons: [
+    { number: 1, title: "第一季", episodes: [{ number: 1, title: "前奏" }] }, { number: 2, title: "第二季", episodes: [{ number: 1, title: "重逢" }, { number: 2, title: "明天" }] },
+  ], episodes };
+  const app = environment({ "/api/library": episodes, "/api/library/11": detail });
+  app.state.user = { id: 9, role: "member" };
+  const stack = pageClass(await app.library(), "stack-card")[0];
+  await m6Click(stack, "影片详情");
+  const dialog = app.elements.get("library-detail-dialog");
+  assert.equal(dialog.open, true);
+  assert.equal(pageClass(dialog, "media-cover")[0].attributes.src, detail.cover);
+  assert.equal(pageClass(dialog, "media-backdrop")[0].attributes.src, detail.backdrop);
+  for (const text of ["故事", "A Story", "2024", "8.2", "剧情", "音乐", "跨越两季的故事", "演员甲 · 主角", "导演乙 · 导演"]) assert.ok(dialog.textContent.includes(text), text);
+  assert.doesNotMatch(dialog.textContent, /识别与整理|重新刮削/);
+  pageButton(dialog, "第 1 集 · 前奏");
+  const season = m6Field(dialog, "library_season");
+  season.value = "2";
+  season.dispatchEvent("change");
+  assert.doesNotMatch(dialog.textContent, /前奏/);
+  assert.equal(pageButton(dialog, "第 2 集 · 明天").disabled, true);
+  await m6Click(dialog, "第 1 集 · 重逢");
+  assert.equal(dialog.open, false);
+  assert.equal(app.state.player.playlistIndex, 1);
+  assert.equal(app.state.player.resumePosition, 20);
+  assert.equal(app.elements.get("video-player").src, "/api/library/12/stream");
+});
+
+test("administrators can correct a title, queue a fresh scrape, and organize the chosen file", async () => {
+  const movie = { id: 18, title: "旧片名", kind: "movie", year: "2013" };
+  const app = environment({ "/api/library": [movie], "/api/library/18": movie });
+  app.state.user = { id: 1, role: "admin" };
+  await m6Click(await app.library(), "影片详情");
+  const dialog = app.elements.get("library-detail-dialog");
+  m6Field(dialog, "title").value = "正确片名";
+  m6Field(dialog, "year").value = "2014";
+  m6Field(dialog, "tmdb_id").value = "32";
+  await m6Submit(dialog, "重新识别");
+  await m6Click(dialog, "重新刮削");
+  app.context.window.confirm = () => false;
+  await m6Click(dialog, "整理此文件");
+  assert.equal(mediaWrites(app).length, 2);
+  app.context.window.confirm = (message) => message.includes("旧片名");
+  await m6Click(dialog, "整理此文件");
+  assert.deepEqual(mediaWrites(app), [
+    ["/api/library/18/reidentify", "POST", { title: "正确片名", year: "2014", tmdb_id: 32 }], ["/api/library/18/scrape", "POST", {}], ["/api/library/18/organize", "POST", {}],
+  ]);
+});
+
+function automationFixture() {
+  const organization = { mode: "hardlink", movie_template: "Movies/{title}.{ext}", episode_template: "TV/{title}.{ext}", auto_organize: true };
+  const history = [{ id: 14, media_id: 3, source_path: "incoming/file", target_path: "Movies/Film.mp4", mode: "hardlink", status: "completed" }];
+  const scraper = { enabled: true, has_tmdb_key: true, has_proxy: true, tmdb_url: "https://tmdb.test", image_url: "https://img.test", bangumi_url: "https://bgm.test", douban_url: "https://douban.test" };
+  const server = { enabled: true, kind: "emby", url: "https://media.test", has_api_key: true };
+  const clients = [{ id: 4, name: "家用 BT", provider: "transmission", endpoint: "https://bt.test/rpc", has_credentials: true, members_allowed: true, remote_root: "/remote", local_root: "/local" }];
+  const app = m6DownloadsFixture({
+    "/api/settings/scraper": scraper, "/api/settings/media-server": server, "/api/settings/organizer": organization,
+    "/api/organizer/history": history, "/api/organizer/14/rollback": () => { history[0].status = "rolled_back"; return history[0]; },
+    "/api/downloaders": (method, body) => { if (method === "POST") clients.push({ ...body, id: 5 }); return clients; },
+    "/api/downloaders/4": (method) => { if (method === "DELETE") clients.splice(0, 1); return {}; },
+  }, { id: 1, role: "admin" });
+  app.state.page = "settings";
+  app.state.settingsTab = "media";
+  return app;
+}
+
+test("TMDB, proxy and media server secrets are write-only and can be preserved, replaced or cleared", async () => {
+  const app = automationFixture();
+  const page = await app.settings();
+  for (const name of ["tmdb_key", "proxy", "api_key", "username", "password"]) {
+    assert.equal(m6Field(page, name).attributes.type, "password");
+    assert.equal(m6Field(page, name).value, "");
+  }
+  await m6Submit(page, "保存刮削设置");
+  const preserved = mediaWrites(app)[0][2];
+  assert.equal(preserved.enabled, true);
+  assert.equal(preserved.tmdb_url, "https://tmdb.test");
+  assert.equal("tmdb_key" in preserved || "proxy" in preserved, false);
+  m6Field(page, "tmdb_key").value = "replacement";
+  m6Field(page, "clear_proxy").checked = true;
+  await m6Submit(page, "保存刮削设置");
+  assert.deepEqual(mediaWrites(app)[1][2], { ...preserved, tmdb_key: "replacement", proxy: "" });
+  assert.equal(m6Field(page, "tmdb_key").value, "");
+  m6Field(page, "kind").value = "jellyfin";
+  await m6Submit(page, "保存媒体服务器");
+  assert.deepEqual(mediaWrites(app)[2], ["/api/settings/media-server", "PUT", { enabled: true, kind: "jellyfin", url: "https://media.test" }]);
+  m6Field(page, "api_key").value = "new-server-key";
+  await m6Submit(page, "保存媒体服务器");
+  assert.equal(mediaWrites(app)[3][2].api_key, "new-server-key");
+  assert.equal(m6Field(page, "api_key").value, "");
+  app.state.user = { id: 2, role: "member" };
+  const count = app.calls.length;
+  await m6Submit(page, "保存媒体服务器");
+  const memberPage = await app.settings();
+  assert.equal(app.calls.length, count);
+  assert.doesNotMatch(memberPage.textContent, /媒体自动化|元数据刮削|外部下载器/);
+});
+
+test("admin organization templates, rollback history, and downloader CRUD use scoped endpoints", async () => {
+  const app = automationFixture();
+  const page = await app.settings();
+  m6Field(page, "mode").value = "move";
+  await m6Submit(page, "保存整理设置");
+  assert.equal(mediaWrites(app)[0][2].mode, "move");
+  assert.match(page.textContent, /incoming\/file/);
+  assert.match(page.textContent, /Movies\/Film.mp4/);
+  await m6Click(page, "回滚整理");
+  assert.match(page.textContent, /已回滚/);
+  assert.ok(!pageNodes(page).some((node) => node.tagName === "BUTTON" && node.textContent === "回滚整理"));
+  const create = m6Form(page, "创建下载器");
+  m6Field(create, "name").value = "备用";
+  m6Field(create, "endpoint").value = "https://qb.test";
+  await m6Submit(page, "创建下载器");
+  assert.equal(mediaWrites(app)[2][2].provider, "qbittorrent");
+  const edit = m6Form(page, "保存下载器");
+  assert.equal(m6Field(edit, "password").value, "");
+  m6Field(edit, "members_allowed").checked = false;
+  await m6Submit(page, "保存下载器");
+  assert.equal(mediaWrites(app)[3][2].members_allowed, false);
+  assert.equal("password" in mediaWrites(app)[3][2], false);
+  assert.equal("username" in mediaWrites(app)[3][2], false);
+  await m6Click(page, "删除下载器");
+  assert.deepEqual(mediaWrites(app).map(([path, method]) => [method, path]), [
+    ["PUT", "/api/settings/organizer"], ["POST", "/api/organizer/14/rollback"], ["POST", "/api/downloaders"], ["PUT", "/api/downloaders/4"], ["DELETE", "/api/downloaders/4"],
+  ]);
+  assert.doesNotMatch(page.textContent, /家用 BT/);
+});
+
+test("members submit, inspect and control external tasks from the downloads page without loading credentials", async () => {
+  const path = "/api/external-tasks";
+  const jobs = [];
+  const app = m6DownloadsFixture({
+    "/api/downloaders/choices": [{ id: 8, name: "家庭下载", provider: "transmission" }],
+    [path]: (method) => { if (method === "POST") jobs.push({ id: 9, name: "测试片", progress: 0.25, status: "running", files: [{ name: "片名.mkv", size: 500 }] }); return jobs; },
+    [`${path}/9/pause`]: () => { jobs[0].status = "paused"; }, [`${path}/9/resume`]: () => { jobs[0].status = "running"; }, [`${path}/9`]: () => { jobs.pop(); },
+  });
+  const page = await app.downloads();
+  const panel = pageClass(page, "external-tasks")[0];
+  panel.open = true;
+  await panel.listeners.toggle[0]();
+  assert.match(panel.textContent, /暂无外部下载任务/);
+  m6Field(panel, "url").value = "magnet:?xt=urn:btih:abc";
+  await m6Submit(panel, "提交外部下载");
+  assert.match(panel.textContent, /测试片.*25%.*片名.mkv/);
+  const files = () => pageNodes(panel).find((node) => node.tagName === "DETAILS" && node.children[0]?.textContent === "文件（1）");
+  files().open = true;
+  await page.refreshQueue(true);
+  assert.equal(files().open, true);
+  await m6Click(panel, "暂停任务");
+  assert.match(panel.textContent, /已暂停/);
+  await m6Click(panel, "恢复任务");
+  await m6Click(panel, "移除任务");
+  assert.doesNotMatch(panel.textContent, /片名.mkv/);
+  assert.deepEqual(mediaWrites(app), [[path, "POST", { downloader_id: 8, url: "magnet:?xt=urn:btih:abc" }], [`${path}/9/pause`, "POST", undefined], [`${path}/9/resume`, "POST", undefined], [`${path}/9`, "DELETE", undefined]]);
+  assert.ok(!app.calls.some(({ url }) => url === "/api/downloaders" || url.startsWith("/api/settings/")));
+});
+
+test("member wishlist preferences and per-subscription quality filters submit independently", async () => {
+  const path = "/api/tracking/douban";
+  const app = m6DownloadsFixture({ "/api/series": [], "/api/tracking": [{ id: 6, title: "追剧", watched_episodes: 1, total_episodes: 8, rules: { quality: "1080p", include_keywords: ["国语"], exclude_keywords: [] } }], [path]: { profile: "alice", interval_hours: 12, enabled: false, auto_download: false }, [`${path}/sync`]: { last_checked: 1600000000, imported: 2 } });
+  app.state.page = "series";
+  const page = await app.series();
+  const wishlist = pageNodes(page).find((node) => node.tagName === "DETAILS" && node.children[0].textContent === "豆瓣想看同步");
+  wishlist.open = true;
+  await wishlist.listeners.toggle[0]();
+  assert.equal(m6Field(wishlist, "profile").value, "alice");
+  m6Field(wishlist, "enabled").checked = true;
+  await m6Submit(wishlist, "保存想看设置");
+  await m6Click(wishlist, "同步已保存的想看列表");
+  assert.match(wishlist.textContent, /导入 2 项/);
+  assert.equal(m6Field(page, "quality").value, "1080p");
+  m6Field(page, "quality").value = "4K";
+  m6Field(page, "include_keywords").value = "国语， HDR";
+  m6Field(page, "exclude_keywords").value = "预告";
+  await m6Submit(page, "保存筛选规则");
+  assert.deepEqual(mediaWrites(app), [[path, "PUT", { profile: "alice", interval_hours: 12, enabled: true, auto_download: false }], [`${path}/sync`, "POST", {}], ["/api/tracking/6", "PUT", { rules: { quality: "4K", include_keywords: ["国语", "HDR"], exclude_keywords: ["预告"] } }]]);
+});

@@ -641,7 +641,9 @@ fn unique_relative_path(
             .to_string_lossy()
             .into_owned();
         let reserved: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM downloads WHERE relative_path=?1)",
+            "SELECT EXISTS(SELECT 1 FROM downloads WHERE relative_path=?1)
+                 OR EXISTS(SELECT 1 FROM organizer_history WHERE status!='rolled_back'
+                    AND ((source_root='media' AND source_path=?1) OR target_path=?1))",
             [&relative_path],
             |row| row.get(0),
         )?;
@@ -778,6 +780,7 @@ pub struct DownloadRuntime {
     notify: Notify,
     probe: tokio::sync::Mutex<Option<(String, Instant, bool)>>,
     scan: tokio::sync::Mutex<()>,
+    pub(crate) library_worker: tokio::sync::Mutex<()>,
 }
 
 impl DownloadRuntime {
@@ -835,12 +838,17 @@ fn schedule(
                     }
                 }
                 Ok(true) => {
-                    let _scan = state.download_runtime.scan.lock().await;
-                    let scan_state = state.clone();
-                    match tokio::task::spawn_blocking(move || crate::library::scan_library(&scan_state)).await {
-                        Ok(Ok(_)) => crate::notify::send_in_background(&state, "下载已入库", job.title),
-                        Ok(Err(error)) => tracing::warn!(error = %error.1, "Could not scan completed download"),
-                        Err(error) => tracing::warn!(%error, "Could not scan completed download"),
+                    // Publication already indexed the file and queued automation atomically.
+                    // The automation consumer sends the notice after its final phase.
+                    let automated = state.conn().and_then(|conn| crate::library::automation_enabled(&conn));
+                    if matches!(automated, Ok(false)) {
+                        let _scan = state.download_runtime.scan.lock().await;
+                        let scan_state = state.clone();
+                        match tokio::task::spawn_blocking(move || crate::library::scan_library(&scan_state)).await {
+                            Ok(Ok(_)) => crate::notify::send_in_background(&state, "下载已入库", job.title),
+                            Ok(Err(error)) => tracing::warn!(error = %error.1, "Could not scan completed download"),
+                            Err(error) => tracing::warn!(%error, "Could not scan completed download"),
+                        }
                     }
                 }
                 Ok(false) => {}

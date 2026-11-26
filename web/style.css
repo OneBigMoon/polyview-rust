@@ -3208,6 +3208,29 @@ textarea {
   font-size: 10px;
   font-weight: 700;
 }
+.media-detail { width: min(860px, calc(100% - 24px)); max-width: 860px; }
+.media-detail-body { display: grid; gap: 18px; }
+.media-detail-hero { position: relative; isolation: isolate; overflow: hidden; display: flex; align-items: end; flex-wrap: wrap; gap: 18px; padding: clamp(16px, 4vw, 32px); border-radius: var(--radius); background: var(--surface); }
+.media-backdrop { position: absolute; z-index: -2; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.media-detail-hero:has(.media-backdrop)::before { content: ""; position: absolute; z-index: -1; inset: 0; background: linear-gradient(to top, var(--surface), color-mix(in srgb, var(--surface) 86%, transparent) 50%, color-mix(in srgb, var(--surface) 30%, transparent)); }
+.media-cover { width: clamp(86px, 20vw, 145px); aspect-ratio: 2 / 3; border-radius: 8px; object-fit: cover; box-shadow: var(--shadow); }
+.media-detail-copy { flex: 1 1 240px; min-width: 0; }
+.media-detail-copy p { margin: 0 0 10px; overflow-wrap: anywhere; }
+.media-original { font-weight: 650; }
+.media-facts { font-size: 13px; }
+.media-credits { display: flex; flex-wrap: wrap; gap: 6px 16px; list-style: none; padding: 0; margin: 0; }
+.media-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr)); gap: 12px; align-items: end; margin: 12px 0; }
+.media-fields .button { justify-self: start; }
+.media-fields .checkbox-label { align-self: center; }
+.media-feedback:empty { display: none; }
+.media-feedback { color: var(--muted); font-size: 13px; }
+.media-record, .media-editor { border-top: 1px solid var(--line); padding: 12px 0; overflow-wrap: anywhere; }
+.media-editor summary, .external-tasks summary { cursor: pointer; }
+.media-record h3, .media-record p { margin: 4px 0; }
+.media-record progress { width: min(320px, 100%); }
+.media-record .head-actions { margin-top: 8px; }
+.tracking-rules { grid-column: 1 / -1; margin-top: 12px; }
+
 .epg-actions {
   display: flex;
   flex-wrap: wrap;

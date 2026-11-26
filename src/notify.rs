@@ -31,7 +31,7 @@ pub enum Channel {
 }
 
 impl NotifySettings {
-    fn channels(&self) -> impl Iterator<Item = (Channel, &str)> {
+    pub(crate) fn channels(&self) -> impl Iterator<Item = (Channel, &str)> {
         [
             (Channel::Bark, self.bark_url.as_str()),
             (Channel::WebhookPost, self.webhook_post_url.as_str()),
@@ -98,7 +98,7 @@ pub struct Delivery {
     pub message: String,
 }
 
-async fn deliver(
+pub(crate) async fn deliver(
     state: &Shared,
     channel: Channel,
     raw: &str,

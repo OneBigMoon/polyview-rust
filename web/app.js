@@ -331,6 +331,18 @@
     );
     render();
   }
+  function mediaViews() {
+    const owner = state.user, sequence = renderSequence;
+    return globalThis.polyviewMedia({
+      make, button, api, play, posterImage, admin,
+      current: () => owner === state.user && sequence === renderSequence,
+    });
+  }
+  function mediaDetailButton(item) {
+    return button("影片详情", "subtle small-button", () => mediaViews().detail(item), {
+      "aria-label": `查看 ${item.series || item.title} 的影片详情`,
+    });
+  }
   function card(item, index) {
     const pct =
       n(item.duration) > 0
@@ -390,11 +402,12 @@
       poster,
       fav,
       make("div", { class: "media-meta" }, [
-        make("span", { text: [meta, item.year].filter(Boolean).join(" · ") }),
+        make("span", { text: [meta, item.year, item.rating > 0 && `${item.rating} 分`].filter(Boolean).join(" · ") }),
         item.watched
           ? make("span", { class: "watched", text: "✓ 已看" })
           : null,
       ]),
+      mediaDetailButton(item),
     ]);
   }
   const seriesKey = (item) =>
@@ -590,6 +603,7 @@
               text: expanded ? "已展开" : "点击展开",
             }),
           ]),
+          mediaDetailButton(items[0]),
         ]);
         const section = make("section", {
           class: "library-series library-stack",
@@ -2937,6 +2951,7 @@
   }
   function trackingRows(subscriptions) {
     const list = make("div", { class: "series-list" });
+    const media = mediaViews();
     if (!subscriptions.length)
       list.append(
         empty(
@@ -3109,6 +3124,7 @@
               }),
             ]),
             form,
+            media.rules(subscription),
           ]),
         );
       });
@@ -3129,9 +3145,14 @@
         button("检查更新", "primary", checkTracking),
       ),
     );
+    const onlineSubscriptions = make("section");
+    function paintSubscriptions(entries) {
+      onlineSubscriptions.replaceChildren(sectionTitle("在线追剧", entries.length), trackingRows(entries));
+    }
+    paintSubscriptions(subscriptions);
     root.append(
-      sectionTitle("在线追剧", subscriptions.length),
-      trackingRows(subscriptions),
+      mediaViews().wishlist(paintSubscriptions),
+      onlineSubscriptions,
       sectionTitle("本地剧集", state.series.length),
     );
     const list = make("div", { class: "series-list" });
@@ -3650,7 +3671,10 @@
         return change("/api/downloads/completed", "DELETE");
     });
     const root = make("div", {}, head("下载任务", "把想看的内容带回你的媒体库。", cleanup));
-    root.refreshQueue = refresh;
+    const external = mediaViews().tasks();
+    root.refreshQueue = async (background = false) => {
+      await Promise.all([refresh(background), external.refresh(background)]);
+    };
     const add = make("section", { class: "panel" }, [
       make("h2", { text: "添加下载" }),
       make("p", {
@@ -3732,7 +3756,7 @@
     root.append(native, add, telegram);
     if (credentials) root.append(credentials);
     if (parameters) root.append(parameters);
-    root.append(queue);
+    root.append(queue, external.panel);
     return root;
   }
   async function liveSubscriptionSettings() {
@@ -4792,6 +4816,7 @@
             ["sources", "在线影视源"],
             ["parsers", "解析接口"],
             ["cloud", "网盘与资源频道"],
+            ["media", "媒体自动化"],
             ["epg", "直播与节目单"],
             ["notify", "通知与日历"],
             ["backup", "备份与工具"],
@@ -4829,6 +4854,7 @@
     else if (active === "sources") body.append(await sourceSettings());
     else if (active === "parsers") body.append(await globalThis.polyviewParserPanel({ make, button, api, toast }));
     else if (active === "cloud") body.append(await cloudViews().settings());
+    else if (active === "media") body.append(...await mediaViews().settings());
     else if (active === "epg") body.append(...await Promise.all([epgSettings(), liveSubscriptionSettings(), channelAliasSettings()]));
     else if (active === "notify") body.append(...await notificationCalendarSettings());
     else if (active === "backup") body.append(...backupSettings());
@@ -4962,6 +4988,7 @@
     state.downloadFilter = "all";
     main.replaceChildren();
     if ($("catalog-dialog")?.open) $("catalog-dialog").close();
+    if ($("library-detail-dialog")?.open) $("library-detail-dialog").close();
     $("app-shell").hidden = true;
     $("auth-screen").hidden = false;
     authMode(false);

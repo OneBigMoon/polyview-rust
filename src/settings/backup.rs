@@ -50,8 +50,23 @@ struct Backup {
         skip_serializing_if = "Option::is_none"
     )]
     cloud: Option<crate::cloud::Backup>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    automation: Option<AutomationConfig>,
     epg_config: EpgConfig,
     app_settings: SiteSettings,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomationConfig {
+    scraper: crate::scraper::Backup,
+    organizer: crate::organizer::Backup,
+    downloaders: crate::downloaders::Backup,
+    tracking: crate::tracking::automation::Backup,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -147,6 +162,12 @@ async fn export(State(state): State<Shared>, user: AuthUser) -> Result<Json<Back
         live_channels: Some(export_channels(&tx)?),
         source_subscriptions: Some(source_subscriptions::export_config(&tx)?),
         cloud: Some(crate::cloud::export_config(&tx)?),
+        automation: Some(AutomationConfig {
+            scraper: crate::scraper::export_config(&tx)?,
+            organizer: crate::organizer::export_config(&tx)?,
+            downloaders: crate::downloaders::export_config(&tx)?,
+            tracking: crate::tracking::automation::export_config(&tx)?,
+        }),
         epg_config: EpgConfig {
             url: tx.query_row("SELECT value FROM settings WHERE key='epg_url'", [], |r| {
                 r.get(0)
@@ -333,6 +354,12 @@ async fn import(
     }
     if let Some(config) = backup.cloud {
         crate::cloud::restore_config(&tx, config)?;
+    }
+    if let Some(config) = backup.automation {
+        crate::scraper::restore_config(&tx, config.scraper)?;
+        crate::organizer::restore_config(&tx, config.organizer)?;
+        crate::downloaders::restore_config(&tx, config.downloaders)?;
+        crate::tracking::automation::restore_config(&tx, config.tracking)?;
     }
     tx.commit()?;
     state.playback_grants.clear();

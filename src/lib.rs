@@ -3,14 +3,17 @@ pub mod calendar;
 pub mod catalog;
 pub mod cloud;
 pub mod download_settings;
+pub mod downloaders;
 pub mod epg;
 pub mod legacy;
 pub mod library;
 pub mod live_sources;
 pub mod network;
 pub mod notify;
+pub mod organizer;
 pub mod parsers;
 pub mod playback;
+pub mod scraper;
 pub mod settings;
 pub mod source_subscriptions;
 pub mod telegram;
@@ -151,6 +154,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     source_subscriptions::init_schema(conn)?;
     parsers::init_schema(conn)?;
     cloud::init_schema(conn)?;
+    organizer::init_schema(conn)?;
+    scraper::init_schema(conn)?;
+    downloaders::init_schema(conn)?;
     Ok(())
 }
 
@@ -160,6 +166,7 @@ pub fn router(state: Shared) -> Router {
         .route("/app.js", get(script))
         .route("/parser-settings.js", get(parser_settings_script))
         .route("/cloud.js", get(cloud_script))
+        .route("/media-settings.js", get(media_settings_script))
         .route("/style.css", get(styles))
         .route("/three-bg.js", get(three_background))
         .route("/vendor/three.module.min.js", get(three_module))
@@ -178,6 +185,9 @@ pub fn router(state: Shared) -> Router {
         .merge(user_data::router())
         .merge(settings::router())
         .merge(download_settings::router())
+        .merge(downloaders::router())
+        .merge(organizer::router())
+        .merge(scraper::router())
         .merge(telegram::router())
         .merge(calendar::router())
         .merge(notify::router())
@@ -236,6 +246,12 @@ async fn cloud_script() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../web/cloud.js"),
+    )
+}
+async fn media_settings_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/media-settings.js"),
     )
 }
 async fn styles() -> impl IntoResponse {

@@ -12,6 +12,10 @@ mod cloud_search;
 mod download_metadata;
 #[path = "cases/download_settings.rs"]
 mod download_settings;
+#[path = "cases/external_clients.rs"]
+mod external_clients;
+#[path = "cases/library_automation.rs"]
+mod library_automation;
 #[path = "cases/live_formats.rs"]
 mod live_formats;
 #[path = "cases/live_probes.rs"]
@@ -24,6 +28,8 @@ mod live_sources;
 mod member_feeds;
 #[path = "cases/notify.rs"]
 mod notify;
+#[path = "cases/organizer.rs"]
+mod organizer;
 #[path = "cases/parsers.rs"]
 mod parsers;
 #[path = "cases/play_settings.rs"]
@@ -34,6 +40,8 @@ mod playback_fallback;
 mod recommend;
 #[path = "cases/resolved_download.rs"]
 mod resolved_download;
+#[path = "cases/scraper.rs"]
+mod scraper;
 #[path = "cases/source_ops.rs"]
 mod source_ops;
 #[path = "cases/source_subscriptions.rs"]
@@ -50,6 +58,8 @@ mod telegram_queue;
 mod telegram_stream;
 #[path = "cases/telegram_web_login.rs"]
 mod telegram_web_login;
+#[path = "cases/tracking_automation.rs"]
+mod tracking_automation;
 #[path = "cases/tracking_resolve.rs"]
 mod tracking_resolve;
 #[path = "cases/user_data.rs"]
