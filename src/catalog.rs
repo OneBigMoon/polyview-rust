@@ -32,17 +32,12 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         );",
     )?;
-    let has_adult: bool = conn.query_row(
-        "SELECT COUNT(*)>0 FROM pragma_table_info('catalog_sources') WHERE name='adult'",
-        [],
-        |row| row.get(0),
+    crate::ensure_column(
+        conn,
+        "catalog_sources",
+        "adult",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(adult IN (0,1))",
     )?;
-    if !has_adult {
-        conn.execute(
-            "ALTER TABLE catalog_sources ADD COLUMN adult INTEGER NOT NULL DEFAULT 0 CHECK(adult IN (0,1))",
-            [],
-        )?;
-    }
     conn.execute(
         "INSERT OR IGNORE INTO settings(key,value) VALUES ('adult_sources_enabled','0')",
         [],
@@ -71,6 +66,7 @@ pub fn router() -> Router<Shared> {
             get(settings_handler).put(save_settings_handler),
         )
         .route("/api/catalog/search", get(search_handler))
+        .route("/api/catalog/suggest", get(suggest_handler))
         .route("/api/catalog/discover", get(discover_handler))
         .route("/api/catalog/categories", get(categories_handler))
         .route("/api/catalog/{source_id}/detail", get(detail_handler))
@@ -339,6 +335,8 @@ pub struct CatalogSummary {
     pub remark: String,
     pub kind: String,
     pub lang: String,
+    #[serde(default)]
+    pub area: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -442,6 +440,58 @@ async fn search_handler(
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, AppError> {
     search(&state, &query.q).await.map(Json)
+}
+
+#[derive(Serialize)]
+struct Suggestion {
+    title: String,
+    year: String,
+    kind: &'static str,
+}
+
+async fn suggest_handler(
+    State(state): State<Shared>,
+    _user: AuthUser,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Vec<Suggestion>>, AppError> {
+    let query = validate_text(&query.q, "Search query", 100)?;
+    let needle = query.to_lowercase();
+    let state = &state;
+    let mut pages = stream::iter(active_sources(state)?.into_iter().map(|source| async move {
+        fetch_cms_value(state, &source, &[("ac", "list"), ("wd", query)]).await
+    }))
+    .buffer_unordered(6);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+    let mut suggestions = Vec::new();
+    let mut seen = BTreeSet::new();
+    while let Ok(Some(response)) = tokio::time::timeout_at(deadline, pages.next()).await {
+        let Ok(page) = response else { continue };
+        let Some(items) = page.get("list").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(title) = item.get("vod_name").and_then(Value::as_str) else {
+                continue;
+            };
+            let title = title.trim();
+            let normalized = title.to_lowercase();
+            if normalized.contains(&needle) && seen.insert(normalized) {
+                suggestions.push(Suggestion {
+                    title: title.to_owned(),
+                    year: text(item, "vod_year"),
+                    kind: media_kind(
+                        item.get("type_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                });
+                if suggestions.len() == 8 {
+                    return Ok(Json(suggestions));
+                }
+            }
+        }
+    }
+    Ok(Json(suggestions))
 }
 
 pub async fn search(state: &Shared, query: &str) -> Result<SearchResponse, AppError> {
@@ -900,6 +950,7 @@ fn summary(source: &Source, item: &Value) -> Option<CatalogSummary> {
         remark: text(item, "vod_remarks"),
         kind: media_kind(&text(item, "type_name")).to_owned(),
         lang: text(item, "vod_lang"),
+        area: text(item, "vod_area"),
     })
 }
 

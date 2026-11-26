@@ -62,12 +62,13 @@ struct ChannelSource {
 }
 
 #[derive(Debug, Serialize)]
-struct Channel {
+pub(crate) struct Channel {
     id: i64,
     name: String,
     group_name: String,
     logo: String,
     url: String,
+    pub favorite: bool,
     sources: Vec<ChannelSource>,
 }
 
@@ -81,19 +82,32 @@ struct PlaylistChannel {
 
 async fn list_channels(
     State(state): State<Shared>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<Json<Vec<Channel>>, AppError> {
     let conn = state.conn()?;
-    let mut query = conn
-        .prepare("SELECT id,name,group_name,logo,url FROM channels ORDER BY group_name,name,id")?;
+    Ok(Json(channels_for_user(&conn, user.id, false)?))
+}
+
+pub(crate) fn channels_for_user(
+    conn: &Connection,
+    user_id: i64,
+    favorites_only: bool,
+) -> Result<Vec<Channel>, AppError> {
+    let mut query = conn.prepare(
+        "SELECT c.id,c.name,c.group_name,c.logo,c.url,f.channel_id IS NOT NULL
+        FROM channels c LEFT JOIN channel_favorites f ON f.channel_id=c.id AND f.user_id=?1
+        WHERE NOT ?2 OR f.channel_id IS NOT NULL
+        ORDER BY CASE WHEN ?2 THEN f.created_at END DESC,c.group_name,c.name,c.id",
+    )?;
     let mut channels = query
-        .query_map([], |row| {
+        .query_map(params![user_id, favorites_only], |row| {
             Ok(Channel {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 group_name: row.get(2)?,
                 logo: row.get(3)?,
                 url: row.get(4)?,
+                favorite: row.get(5)?,
                 sources: Vec::new(),
             })
         })?
@@ -117,7 +131,7 @@ async fn list_channels(
             });
         }
     }
-    Ok(Json(channels))
+    Ok(channels)
 }
 
 #[derive(Deserialize)]
@@ -947,6 +961,8 @@ mod tests {
         .unwrap();
         init_schema(&conn).unwrap();
         crate::library::init_schema(&conn).unwrap();
+        crate::catalog::init_schema(&conn).unwrap();
+        crate::user_data::init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
             media_dir,

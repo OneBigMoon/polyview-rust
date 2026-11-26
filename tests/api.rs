@@ -1,3 +1,8 @@
+#[path = "cases/suggest.rs"]
+mod suggest;
+#[path = "cases/user_data.rs"]
+mod user_data;
+
 use axum::{
     Router,
     body::{Body, to_bytes},

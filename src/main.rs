@@ -57,17 +57,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()?,
     });
-    if let Some(path) = env::var_os("POLYVIEW_LEGACY_DB").filter(|path| !path.is_empty()) {
+    let legacy_path = env::var_os("POLYVIEW_LEGACY_DB").filter(|path| !path.is_empty());
+    let import_state = state.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        let Some(path) = legacy_path else {
+            return polyview::legacy::supplement_legacy(&import_state);
+        };
         let db_path = PathBuf::from(path);
         let config_path = env::var_os("POLYVIEW_LEGACY_CONFIG")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
-        let import_state = state.clone();
-        let report = tokio::task::spawn_blocking(move || {
-            polyview::legacy::import_legacy(&import_state, &db_path, config_path.as_deref())
-        })
-        .await?
-        .map_err(|error| error.1)?;
+        polyview::legacy::import_legacy(&import_state, &db_path, config_path.as_deref()).map(Some)
+    })
+    .await?
+    .map_err(|error| error.1)?;
+    if let Some(report) = report {
         let report_path = data_dir.join("legacy-import-report.json");
         std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
         #[cfg(unix)]

@@ -7,6 +7,7 @@ pub mod network;
 pub mod playback;
 pub mod tracking;
 pub mod tvbox;
+pub mod user_data;
 
 use axum::{
     Json, Router,
@@ -93,6 +94,32 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// Adds a column from a trusted schema declaration without replacing existing data.
+pub fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), AppError> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2 COLLATE NOCASE)",
+        [table, column],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        conn.execute(
+            &format!(
+                "ALTER TABLE {} ADD COLUMN {} {definition}",
+                quote(table),
+                quote(column)
+            ),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
         "PRAGMA foreign_keys=ON; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
@@ -104,6 +131,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     tracking::init_schema(conn)?;
     tvbox::init_schema(conn)?;
     epg::init_schema(conn)?;
+    user_data::init_schema(conn)?;
     Ok(())
 }
 
@@ -124,6 +152,7 @@ pub fn router(state: Shared) -> Router {
         .merge(catalog::router())
         .merge(tracking::router())
         .merge(tvbox::router())
+        .merge(user_data::router())
         .fallback(|| async { AppError::not_found("Not found") })
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(security_headers))
@@ -188,4 +217,30 @@ async fn three_module() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../web/vendor/three.module.min.js"),
     )
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_column_upgrade_preserves_existing_rows_and_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY); INSERT INTO items VALUES(1);",
+        )
+        .unwrap();
+        ensure_column(&conn, "items", "priority", "INTEGER NOT NULL DEFAULT 100").unwrap();
+        let priority = || {
+            conn.query_row("SELECT priority FROM items WHERE id=1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(priority(), 100);
+        conn.execute("UPDATE items SET priority=3 WHERE id=1", [])
+            .unwrap();
+        ensure_column(&conn, "items", "priority", "INTEGER NOT NULL DEFAULT 100").unwrap();
+        assert_eq!(priority(), 3);
+    }
 }

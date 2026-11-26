@@ -21,6 +21,7 @@
     onlineCategory: "",
     onlineYear: "",
     onlineLang: "",
+    onlineArea: "",
     categories: null,
     onlineObserver: null,
     liveGroup: "all",
@@ -92,6 +93,22 @@
   };
   const matchesKind = (item) =>
     !state.onlineKind || (item.kind || "other") === state.onlineKind;
+  const areaPatterns = new Map([
+    ["中国大陆", /大陆|大陸|内地|內地|^(中国|中國)$|\b(china|cn|mainland)\b/i],
+    ["港台", /港台|香港|台湾|臺灣|台灣|澳门|澳門|\b(hong kong|taiwan|macao|macau|hk|tw)\b/i],
+    ["美国", /美国|美國|\b(usa?|united states|america)\b/i],
+    ["日本", /日本|\b(japan|jp)\b/i],
+    ["韩国", /韩国|韓國|南韩|南韓|\b(korea|kr)\b/i],
+    ["欧美", /欧美|歐美|欧洲|歐洲|英国|英國|法国|法國|德国|德國|意大利|義大利|西班牙|加拿大|俄罗斯|俄羅斯|瑞典|丹麦|荷兰|挪威|芬兰|比利时|瑞士|奥地利|爱尔兰|波兰|\b(europe|uk|britain|france|germany|italy|canada|spain|russia)\b/i],
+  ]);
+  const areaOptions = [["", "全部地区"], ...[...areaPatterns.keys(), "其他"].map((area) => [area, area])];
+  function matchesArea(item) {
+    const selected = state.onlineArea;
+    if (!selected) return true;
+    const area = String(item.area || "").trim();
+    if (selected === "其他") return ![...areaPatterns.values()].some((pattern) => pattern.test(area));
+    return areaPatterns.get(selected).test(area);
+  }
   const languageOptions = [
     ["", "全部语言"],
     ["国语", "国语"],
@@ -306,7 +323,7 @@
       document.createTextNode("影音空间 "),
       make("span", { text: "/" }),
       document.createTextNode(
-        ` ${{ online: "影视发现", library: "媒体库", live: "电视直播", series: "追剧清单", downloads: "下载任务", settings: "账户与设置" }[page]}`,
+        ` ${{ online: "影视发现", library: "媒体库", live: "电视直播", favorites: "我的收藏", series: "追剧清单", downloads: "下载任务", settings: "账户与设置" }[page]}`,
       ),
     );
     render();
@@ -625,6 +642,21 @@
     button.hidden = false;
     button.textContent = `线路 ${player.sourceIndex + 1}/${player.sources.length} · 切换`;
   }
+  async function changeChannelFavorite(channel, star, refresh) {
+    if (star.disabled) return;
+    star.disabled = true;
+    const favorite = !channel.favorite;
+    try {
+      await api(`/api/channels/${encodeURIComponent(channel.id)}/favorite`, { method: "PUT", body: { favorite } });
+      channel.favorite = favorite;
+      if (state.player?.live && state.player.item.id === channel.id) {
+        state.player.item.favorite = favorite;
+        updatePlayerControls();
+      }
+      refresh();
+    } catch (error) { toast(error.message, true); }
+    finally { star.disabled = false; }
+  }
   function updatePlayerControls() {
     const player = state.player;
     const video = $("video-player");
@@ -639,6 +671,16 @@
     $("player-prev").setAttribute("aria-label", live ? "上一台" : "上一集");
     $("player-next").setAttribute("aria-label", live ? "下一台" : "下一集");
     $("player-speed").hidden = !player || live;
+    const star = $("player-favorite");
+    if (star) {
+      star.hidden = !live || player.item.id == null;
+      if (!star.hidden) {
+        star.textContent = player.item.favorite ? "★" : "☆";
+        star.setAttribute("aria-pressed", String(Boolean(player.item.favorite)));
+        star.setAttribute("aria-label", player.item.favorite ? "取消收藏频道" : "收藏频道");
+        star.title = star.getAttribute("aria-label");
+      }
+    }
     const guideToggle = $("player-guide-toggle");
     guideToggle.hidden = !live;
     if (live) {
@@ -779,7 +821,7 @@
         if (!current()) return;
         if (
           n(player.item.position) > 0 &&
-          n(player.item.position) < video.duration - 1
+          (player.item.remote_url ? n(player.item.position) < video.duration : n(player.item.position) < video.duration - 1)
         )
           video.currentTime = player.item.position;
         if (!hlsSource || nativeHls || !state.hls) startPlayback();
@@ -901,59 +943,54 @@
     )
       return;
     if (!force && Date.now() - current.lastSaved < 10000) return;
-    if (current.item.remote_url) {
-      if (
-        current.item.tracking_id &&
-        (video.ended || video.currentTime / video.duration > 0.9) &&
-        !current.item.marked_watched
-      ) {
-        current.item.marked_watched = true;
-        try {
-          await api(`/api/tracking/${current.item.tracking_id}`, {
-            method: "PUT",
-            body: {
-              watched_episodes: Math.max(
-                current.item.watched_episodes || 0,
-                current.item.episode_number,
-              ),
-            },
-            keepalive,
-          });
-        } catch (error) {
-          current.item.marked_watched = false;
-          toast(`追剧进度未保存：${error.message}`, true);
-        }
-      }
-      current.lastSaved = Date.now();
-      return;
+    const item = current.item;
+    const remote = Boolean(item.remote_url);
+    const completed = video.ended || video.currentTime / video.duration > 0.9;
+    let trackingSave;
+    if (remote && item.tracking_id && completed && !item.marked_watched) {
+      item.marked_watched = true;
+      trackingSave = api(`/api/tracking/${item.tracking_id}`, {
+        method: "PUT",
+        body: { watched_episodes: Math.max(item.watched_episodes || 0, item.episode_number) },
+        keepalive,
+      }).catch((error) => {
+        item.marked_watched = false;
+        toast(`追剧进度未保存：${error.message}`, true);
+      });
     }
+    if (remote && (item.source_id == null || item.media_id == null)) return trackingSave;
     const body = {
       position: Math.min(video.duration, Math.max(0, n(video.currentTime))),
       duration: video.duration,
-      watched: Boolean(
-        current.item.watched ||
-          video.ended ||
-          video.currentTime / video.duration > 0.9,
-      ),
+      ...(remote ? {
+        source_id: item.source_id,
+        media_id: item.media_id,
+        title: item.catalog_title || item.title,
+        cover: item.cover || "",
+        episode_index: item.episode_index ?? 0,
+        episode_name: item.episode_name || "",
+        remote_url: item.remote_url,
+      } : { watched: Boolean(item.watched || completed) }),
     };
     const payload = JSON.stringify(body);
-    if (payload === current.lastPayload) return;
+    if (payload === current.lastPayload) return trackingSave;
     current.lastSaved = Date.now();
     current.lastPayload = payload;
-    Object.assign(current.item, body);
+    if (!remote) Object.assign(item, body);
     try {
       await api(
-        `/api/library/${encodeURIComponent(current.item.id)}/progress`,
+        remote ? "/api/progress" : `/api/library/${encodeURIComponent(item.id)}/progress`,
         { method: "PUT", body, keepalive },
       );
       current.errorShown = false;
     } catch (e) {
-      current.lastPayload = "";
+      if (current.lastPayload === payload) current.lastPayload = "";
       if (!current.errorShown) {
         toast(`观看进度未保存：${e.message}`, true);
         current.errorShown = true;
       }
     }
+    await trackingSave;
   }
   function closePlayer() {
     if (!state.player) return;
@@ -961,7 +998,7 @@
       if (
         state.user &&
         !state.player &&
-        ["library", "series"].includes(state.page)
+        ["online", "favorites", "library", "series"].includes(state.page)
       )
         render();
     });
@@ -1002,7 +1039,9 @@
     const covered = new Set(programs.map((program) => program.channel_id));
     return channels.filter((channel) => covered.has(channel.id));
   }
-  function guideView(start, end, now = Math.floor(Date.now() / 1000)) {
+  const favoritesGroup = Symbol("favorite channels");
+  function guideView(start, end, now = Math.floor(Date.now() / 1000), allChannels = state.channels) {
+    const refreshGuide = () => $("live-guide")?.replaceChildren(guideView(start, end, now, allChannels));
     const guide = state.epg || {};
     const programs = Array.isArray(guide.programs) ? guide.programs : [];
     const byChannel = new Map();
@@ -1016,33 +1055,23 @@
       groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
     });
     const groups = [...groupCounts.keys()];
-    if (state.liveGroup !== "all" && !groupCounts.has(state.liveGroup))
+    const favoriteChannels = allChannels.filter((channel) => channel.favorite);
+    if (state.liveGroup !== "all" && !groupCounts.has(state.liveGroup) && !(state.liveGroup === favoritesGroup && favoriteChannels.length))
       state.liveGroup = "all";
     const query = state.query.toLowerCase();
-    const channels = state.channels.filter(
+    const channels = (state.liveGroup === favoritesGroup ? favoriteChannels : state.channels).filter(
       (channel) =>
-        (state.liveGroup === "all" || (channel.group_name || "其他") === state.liveGroup) &&
+        (state.liveGroup === "all" || state.liveGroup === favoritesGroup || (channel.group_name || "其他") === state.liveGroup) &&
         (!query || `${channel.name} ${channel.group_name}`.toLowerCase().includes(query)),
     );
+    const groupTab = (group, label) => button(label, `subtle small-button${state.liveGroup === group ? " active" : ""}`, () => {
+      state.liveGroup = group;
+      refreshGuide();
+    }, { "aria-pressed": String(state.liveGroup === group) });
     const tabs = make("div", { class: "live-groups" }, [
-      button(
-        `全部 ${state.channels.length}`,
-        `subtle small-button${state.liveGroup === "all" ? " active" : ""}`,
-        () => {
-          state.liveGroup = "all";
-          $("live-guide").replaceChildren(guideView(start, end, now));
-        },
-      ),
-      ...groups.map((group) =>
-        button(
-          `${group} ${groupCounts.get(group) || 0}`,
-          `subtle small-button${state.liveGroup === group ? " active" : ""}`,
-          () => {
-            state.liveGroup = group;
-            $("live-guide").replaceChildren(guideView(start, end, now));
-          },
-        ),
-      ),
+      favoriteChannels.length ? groupTab(favoritesGroup, "★ 收藏") : null,
+      groupTab("all", `全部 ${state.channels.length}`),
+      ...groups.map((group) => groupTab(group, `${group} ${groupCounts.get(group)}`)),
     ]);
     let scroller;
     const panBack = button("← -2 小时", "subtle small-button", () => {
@@ -1056,7 +1085,7 @@
       "subtle small-button",
       () => {
         state.epgOnlyCurrent = !state.epgOnlyCurrent;
-        $("live-guide").replaceChildren(guideView(start, end, now));
+        refreshGuide();
       },
     );
     const jumpNow = button("回到现在", "subtle small-button", () => {
@@ -1110,12 +1139,14 @@
     inner.append(rulerRow);
     channels.forEach((channel, channelIndex) => {
       const row = make("div", { class: "epg-row" });
-      row.append(
+      const star = icon(channel.favorite ? "★" : "☆", `${channel.favorite ? "取消收藏" : "收藏"} ${channel.name}`, () => changeChannelFavorite(channel, star, refreshGuide), "guide-star");
+      star.setAttribute("aria-pressed", String(Boolean(channel.favorite)));
+      row.append(make("div", { class: "epg-channel guide-channel-cell" }, [star,
         make(
           "button",
           {
             type: "button",
-            class: "epg-channel",
+            class: "guide-channel-play",
             "aria-label": `播放 ${channel.name}`,
             on: { click: () => play(channel, true, channels, channelIndex) },
           },
@@ -1131,7 +1162,7 @@
             ]),
           ],
         ),
-      );
+      ]));
       const track = make("div", {
         class: "epg-track",
         style: `width:${1440 * EPG_MINUTE_PX}px`,
@@ -1248,7 +1279,7 @@
         ]),
       ),
     );
-    if (!state.channels.length) {
+    if (!state.channels.length && !allChannels.some((channel) => channel.favorite)) {
       const hasChannels = allChannels.length > 0;
       root.append(
         empty(
@@ -1272,7 +1303,7 @@
       return root;
     }
     const guide = make("div", { id: "live-guide" });
-    guide.append(guideView(start, end, now));
+    guide.append(guideView(start, end, now, allChannels));
     root.append(guide);
     return root;
   }
@@ -1411,7 +1442,7 @@
   };
   const mergeCatalogGroups = (items, groups) => {
     const changed = new Set();
-    items.filter((item) => matchesKind(item) && matchesLanguage(item)).forEach((item) => {
+    items.filter((item) => matchesKind(item) && matchesLanguage(item) && matchesArea(item)).forEach((item) => {
       const key = catalogGroupKey(item);
       let group = groups.get(key);
       if (!group) {
@@ -1605,6 +1636,89 @@
       "aria-label": "焦点影片",
     }, [art, copy]);
   }
+  function mediaKey(item) {
+    return [item.source_id, item.media_id ?? item.id].map(encodeURIComponent).join("/");
+  }
+  function elapsedLabel(position) {
+    const seconds = Math.floor(position);
+    return [Math.floor(seconds / 60), seconds % 60].map((v) => String(v).padStart(2, "0")).join(":");
+  }
+  function savedCard(item, index, playLabel, onPlay, removeLabel, onRemove) {
+    const title = item.title || item.name;
+    const art = make("div", { class: `poster-art tone-${index % 6}` }, [
+      item.cover || item.logo ? make("img", { src: item.cover || item.logo, alt: "", loading: "lazy", referrerpolicy: "no-referrer" }) : null,
+      make("span", { class: "poster-name", text: title }),
+      item.duration > 0 ? make("progress", { class: "media-progress", max: item.duration, value: item.position || 0 }) : null,
+    ]);
+    const remove = icon("×", removeLabel, async () => {
+      remove.disabled = true;
+      try { await onRemove(); }
+      catch (error) { toast(error.message, true); }
+      finally { remove.disabled = false; }
+    }, "favorite-button");
+    return make("article", { class: "media-card saved-card" }, [
+      make("button", { class: "poster-button", type: "button", "aria-label": playLabel, on: { click: onPlay } }, art),
+      remove,
+      make("div", { class: "media-meta", text: [item.episode_name, item.position > 0 ? elapsedLabel(item.position) : "", item.year].filter(Boolean).join(" · ") }),
+    ]);
+  }
+  function continueWatching(entries) {
+    const section = make("section", { class: "continue-section" });
+    const cards = make("div", { class: "continue-grid resume-grid" });
+    function paint() {
+      section.hidden = !entries.length;
+      section.replaceChildren(sectionTitle("继续观看", entries.length), cards);
+      cards.replaceChildren(...entries.map((item, index) => {
+        const local = item.entry_kind === "local";
+        const resume = () => {
+          if (!local && !item.remote_url) return openCatalogDetail(item, true);
+          play(local ? { ...item, id: item.local_id } : { ...item, catalog_title: item.title }, false, [], 0, true);
+        };
+        return savedCard(item, index, `续播 ${item.title}`, resume, `移除 ${item.title}`, async () => {
+          const path = local ? `local/${encodeURIComponent(item.local_id)}` : `online/${mediaKey(item)}`;
+          await api(`/api/progress/${path}`, { method: "DELETE" });
+          const current = entries.indexOf(item);
+          if (current >= 0) entries.splice(current, 1);
+          paint();
+        });
+      }));
+    }
+    paint();
+    return section;
+  }
+  async function favorites() {
+    const data = await api("/api/favorites");
+    const root = make("div", {}, head("我的收藏", "播放或管理已收藏的影片和频道。"));
+    for (const [key, label] of [["catalog", "在线影视收藏"], ["local", "本地媒体收藏"], ["channels", "收藏直播频道"]]) {
+      const items = data[key] || [];
+      const section = make("section", { class: "favorites-section" });
+      function paint() {
+        const grid = make("div", { class: "media-grid" }, items.map((item, index) => {
+          const title = item.title || item.name;
+          const watch = () => {
+            if (key === "catalog") return openCatalogDetail(item, true);
+            if (key === "channels") return play(item, true, items.slice(), index, true);
+            play(item, false, [], 0, true);
+          };
+          return savedCard(item, index, `播放 ${title}`, watch, `取消收藏 ${title}`, async () => {
+            if (key === "catalog") await api(`/api/favorites/${mediaKey(item)}`, { method: "DELETE" });
+            else {
+              const path = key === "local" ? "library" : "channels";
+              await api(`/api/${path}/${encodeURIComponent(item.id)}/favorite`, { method: "PUT", body: { favorite: false } });
+              item.favorite = false;
+            }
+            const current = items.indexOf(item);
+            if (current >= 0) items.splice(current, 1);
+            paint();
+          });
+        }));
+        section.replaceChildren(sectionTitle(label, items.length), items.length ? grid : make("p", { class: "hint", text: "暂无收藏" }));
+      }
+      paint();
+      root.append(section);
+    }
+    return root;
+  }
   async function online() {
     const sequence = renderSequence;
     state.onlineObserver?.disconnect();
@@ -1616,6 +1730,14 @@
       {},
       head("影视发现", "搜索影片、在线观看，把想追的故事加入清单。"),
     );
+    if (!state.query) {
+      try {
+        const entries = await api("/api/progress");
+        if (entries?.length) root.append(continueWatching(entries));
+      } catch (error) {
+        root.append(make("p", { class: "hint", text: `继续观看暂不可用：${error.message}` }));
+      }
+    }
     if (!enabled.length) {
       root.append(
         empty(
@@ -1716,6 +1838,7 @@
         make("div", { class: "discover-filter-bar" }, [
           chipRow("类型", mediaKinds, state.onlineKind, chooseKind),
           chipRow("语言", languageOptions, state.onlineLang, (value) => (state.onlineLang = value)),
+          chipRow("地区", areaOptions, state.onlineArea, (value) => (state.onlineArea = value)),
         ]),
       );
       root.append(
@@ -1751,6 +1874,7 @@
         make("div", { class: "discover-filter-bar" }, [
           chipRow("类型", mediaKinds, state.onlineKind, chooseKind),
           chipRow("语言", languageOptions, state.onlineLang, (value) => (state.onlineLang = value)),
+          chipRow("地区", areaOptions, state.onlineArea, (value) => (state.onlineArea = value)),
           chipRow(
             "影视源",
             [
@@ -1840,6 +1964,7 @@
       state.onlineSource === "all" &&
       !state.onlineCategory &&
       !state.onlineYear &&
+      !state.onlineArea &&
       groupOrder.length
     ) {
       const featured = groupOrder.map((key) => groups.get(key)).filter((group) => group.cover).slice(0, 5);
@@ -1932,7 +2057,7 @@
     }
     return root;
   }
-  async function openCatalogDetail(item) {
+  async function openCatalogDetail(item, playImmediately = false) {
     let dialog = $("catalog-dialog");
     if (!dialog) {
       dialog = make("dialog", {
@@ -2034,11 +2159,15 @@
     );
     if (!dialog.open) dialog.showModal();
     try {
-      const [detail, subscriptions] = await Promise.all([
+      const mediaId = item.id ?? item.media_id;
+      const progressQuery = new URLSearchParams({ source_id: item.source_id, media_id: mediaId });
+      const [detail, subscriptions, progress, saved] = await Promise.all([
         api(
-          `/api/catalog/${item.source_id}/detail?id=${encodeURIComponent(item.id || item.media_id)}`,
+          `/api/catalog/${item.source_id}/detail?id=${encodeURIComponent(mediaId)}`,
         ),
         api("/api/tracking"),
+        api(`/api/progress?${progressQuery}`),
+        api("/api/favorites"),
       ]);
       if (dialog.dataset.sequence !== String(sequence) || !dialog.open) return;
       let tracked = subscriptions.find(
@@ -2063,6 +2192,27 @@
         content.append(
           make("p", { class: "catalog-description", text: description }),
         );
+      const favoriteData = {
+        source_id: detail.source_id, media_id: detail.id, title: detail.title,
+        cover: detail.cover || item.cover || "", year: detail.year || item.year || "",
+        kind: item.kind || "other", remark: detail.remark || "",
+      };
+      let isFavorite = saved?.catalog?.some((entry) => mediaKey(entry) === mediaKey(favoriteData)) || false;
+      const favorite = button("", "subtle", async () => {
+        favorite.disabled = true;
+        try {
+          if (isFavorite) await api(`/api/favorites/${mediaKey(favoriteData)}`, { method: "DELETE" });
+          else await api("/api/favorites", { method: "POST", body: favoriteData });
+          isFavorite = !isFavorite;
+          paintFavorite();
+        } catch (error) { toast(error.message, true); }
+        finally { favorite.disabled = false; }
+      });
+      function paintFavorite() {
+        favorite.textContent = isFavorite ? "★ 已收藏" : "☆ 收藏";
+        favorite.setAttribute("aria-pressed", String(isFavorite));
+      }
+      paintFavorite();
       const auto = make("input", { type: "checkbox" });
       const trackButton = button(
         tracked ? "已加入追剧" : "加入追剧",
@@ -2103,6 +2253,7 @@
       content.append(
         make("div", { class: "catalog-actions" }, [
           trackButton,
+          favorite,
           !tracked
             ? make("label", { class: "checkbox-label" }, [auto, "自动下载更新"])
             : make("span", {
@@ -2147,7 +2298,7 @@
       let submitting = false;
       const picked = new Set();
       let episodeButtons = [];
-      const watch = (index) => {
+      const watch = (index, position = 0, autoplay = false) => {
         const group = detail.groups[n(groups.value)];
         if (group.direct === false) {
           toast("该线路是非直链解析页，无法直接播放，请选择直链线路。", true);
@@ -2156,13 +2307,32 @@
         const playlist = orderedEpisodes().map((episode) => ({
           title: `${detail.title} · ${episode.name}`,
           remote_url: episode.url,
+          catalog_title: detail.title,
+          source_id: detail.source_id,
+          media_id: detail.id,
+          cover: favoriteData.cover,
+          episode_index: episode.sourceIndex,
+          episode_name: episode.name,
           tracking_id: tracked?.id,
           watched_episodes: watchedCount,
           episode_number: episode.sourceIndex + 1,
         }));
         dialog.close();
-        play(playlist[index], false, playlist, index);
+        playlist[index].position = position;
+        play(playlist[index], false, playlist, index, autoplay);
       };
+      const record = progress?.[0];
+      function resume() {
+        // Prefer the original stream when multiple providers label their episodes differently.
+        let line = detail.groups.findIndex((group) => group.direct !== false && group.episodes.some((episode) => episode.url === record.remote_url));
+        if (line < 0) line = detail.groups.findIndex((group) => group.direct !== false && group.episodes[record.episode_index]);
+        if (line < 0) return toast("该集暂无可用直链线路。", true);
+        groups.value = String(line);
+        const ordered = orderedEpisodes();
+        let index = ordered.findIndex((episode) => episode.url === record.remote_url);
+        if (index < 0) index = ordered.findIndex((episode) => episode.sourceIndex === record.episode_index);
+        watch(index, record.position, true);
+      }
       const sortButton = button("倒序", "subtle small-button", () => {
         episodeAscending = !episodeAscending;
         sortButton.textContent = episodeAscending ? "倒序" : "正序";
@@ -2305,6 +2475,7 @@
           make("label", {}, ["线路", groups]),
           make("label", {}, ["集数", episodes]),
           button("在线播放", "primary", () => watch(n(episodes.value))),
+          record?.position > 0 ? button(`续播 ${record.episode_name || "本集"}（${elapsedLabel(record.position)}）`, "subtle", resume) : null,
           download,
         ]),
         make("div", { class: "catalog-batch" }, [
@@ -2320,6 +2491,10 @@
         }),
       );
       dialog.append(content);
+      if (playImmediately) {
+        if (record?.position > 0) resume();
+        else if (selected()) watch(n(episodes.value), 0, true);
+      }
     } catch (error) {
       if (dialog.dataset.sequence === String(sequence))
         dialog.append(
@@ -3082,6 +3257,8 @@
         ]);
         const copy = button("复制", "subtle small-button", async () => {
           try {
+            if (typeof navigator === "undefined" || !navigator.clipboard?.writeText)
+              throw new Error("剪贴板不可用");
             await navigator.clipboard.writeText(url);
             copy.textContent = "✓ 已复制";
             setTimeout(() => {
@@ -3368,6 +3545,7 @@
     );
     try {
       const page =
+        pageName === "favorites" ? await favorites() :
         pageName === "online"
           ? await online()
           : pageName === "library"
@@ -3623,6 +3801,11 @@
     closePlayer();
   });
   $("player-source").addEventListener("click", () => switchLiveSource(1));
+  $("player-favorite")?.addEventListener("click", () => {
+    if (state.player?.live) return changeChannelFavorite(state.player.item, $("player-favorite"), () => {
+      if (["live", "favorites"].includes(state.page)) render();
+    });
+  });
   paintSpeedButton();
   $("player-speed").addEventListener("click", cycleSpeed);
   $("player-guide-toggle").addEventListener("click", () => {
@@ -3733,31 +3916,107 @@
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) saveProgress(true, true);
   });
-  $("search-input").addEventListener("input", (event) => {
-    state.query = event.target.value.trim();
-    state.onlinePage = 1;
-    $("search-clear").hidden = !event.target.value;
+  const searchInput = $("search-input");
+  const searchPopup = $("search-popup");
+  const searchablePage = () => ["online", "library", "live", "series"].includes(state.page);
+  let popupVersion = 0;
+  let suggestionTimer;
+  let composingSearch = false;
+
+  function closeSearchPopup() {
+    clearTimeout(suggestionTimer);
+    popupVersion++;
+    if (searchPopup) searchPopup.hidden = true;
+  }
+  function submitSearch(value, catalog = false) {
+    closeSearchPopup();
     clearTimeout(state.searchTimer);
-    state.searchTimer = setTimeout(() => {
-      if (["online", "library", "live", "series"].includes(state.page))
-        render();
-    }, 250);
-  });
-  $("search-input").addEventListener("keydown", (event) => {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
-    if (["online", "library", "live", "series"].includes(state.page)) return;
-    state.query = $("search-input").value.trim();
+    searchInput.value = value.trim();
+    state.query = searchInput.value;
     state.onlinePage = 1;
-    setNav("online");
+    $("search-clear").hidden = !state.query;
+    if (state.query) api("/api/search/history", { method: "POST", body: { keyword: state.query } }).catch(() => {});
+    if ((catalog && state.page !== "online") || !searchablePage()) setNav("online");
+    else render();
+  }
+  async function showSearchHistory() {
+    closeSearchPopup();
+    if (!searchPopup) return;
+    const version = popupVersion;
+    const history = await api("/api/search/history").catch(() => []);
+    if (version !== popupVersion || !history.length) return;
+    const remove = async (keyword) => {
+      const suffix = keyword ? `?q=${encodeURIComponent(keyword)}` : "";
+      try {
+        await api(`/api/search/history${suffix}`, { method: "DELETE" });
+        if (version === popupVersion) {
+          searchInput.focus?.();
+          if (version === popupVersion) await showSearchHistory();
+        }
+      } catch (error) { toast(error.message, true); }
+    };
+    searchPopup.replaceChildren(
+      make("strong", { text: "最近搜索" }),
+      button("清空历史", "", () => remove()),
+      make("div", { class: "search-history-chips" }, history.map((keyword) =>
+        make("span", { class: "search-history-chip" }, [
+          button(keyword, "", () => submitSearch(keyword)),
+          button("×", "", () => remove(keyword), { "aria-label": `删除搜索记录 ${keyword}` }),
+        ]))),
+    );
+    searchPopup.hidden = false;
+  }
+  function updateSearch() {
+    closeSearchPopup();
+    clearTimeout(state.searchTimer);
+    const query = searchInput.value.trim();
+    state.query = query;
+    state.onlinePage = 1;
+    $("search-clear").hidden = !searchInput.value;
+    state.searchTimer = setTimeout(() => { if (searchablePage()) render(); }, 250);
+    if (!query) { showSearchHistory(); return; }
+    if (!searchPopup) return;
+    const version = popupVersion;
+    suggestionTimer = setTimeout(async () => {
+      if (version !== popupVersion) return;
+      const suggestions = await api(`/api/catalog/suggest?q=${encodeURIComponent(query)}`).catch(() => []);
+      if (version !== popupVersion || !suggestions.length) return;
+      searchPopup.replaceChildren(...suggestions.map(({ title, year, kind }) => button(
+        [title, year, kind && kindLabel(kind)].filter(Boolean).join(" · "),
+        "search-suggestion", () => submitSearch(title, true),
+      )));
+      searchPopup.hidden = false;
+    }, 300);
+  }
+  function leaveSearch(event) {
+    if (event.relatedTarget !== searchInput && !searchPopup?.contains?.(event.relatedTarget)) closeSearchPopup();
+  }
+  searchInput.addEventListener("focus", showSearchHistory);
+  searchInput.addEventListener("blur", leaveSearch);
+  searchPopup?.addEventListener("focusout", leaveSearch);
+  searchPopup?.addEventListener("mousedown", (event) => event.preventDefault());
+  searchPopup?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { searchInput.focus(); closeSearchPopup(); }
+  });
+  searchInput.addEventListener("compositionstart", () => {
+    composingSearch = true;
+    clearTimeout(state.searchTimer);
+    closeSearchPopup();
+  });
+  searchInput.addEventListener("compositionend", () => { composingSearch = false; updateSearch(); });
+  searchInput.addEventListener("input", (event) => {
+    if (!event.isComposing && !composingSearch) updateSearch();
+  });
+  searchInput.addEventListener("keydown", (event) => {
+    if (event.isComposing || composingSearch || event.keyCode === 229) return;
+    if (event.key === "Escape") { event.preventDefault(); closeSearchPopup(); }
+    if (event.key === "Enter") { event.preventDefault(); submitSearch(searchInput.value); }
   });
   $("search-clear").addEventListener("click", () => {
-    const input = $("search-input");
-    input.value = "";
-    state.query = "";
-    state.onlinePage = 1;
-    $("search-clear").hidden = true;
-    input.focus?.();
+    searchInput.value = "";
+    searchInput.focus?.();
+    updateSearch();
+    clearTimeout(state.searchTimer);
     render();
   });
   document.addEventListener("keydown", (event) => {

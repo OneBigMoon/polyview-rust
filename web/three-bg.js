@@ -2,9 +2,7 @@
   const canvas = document.getElementById("bg-canvas");
   if (!canvas) return;
 
-  const reducedMotion = window.matchMedia(
-    "(prefers-reduced-motion: reduce)",
-  ).matches;
+  const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
   const pointer = { x: 0, y: 0 };
   let renderer;
   let scene;

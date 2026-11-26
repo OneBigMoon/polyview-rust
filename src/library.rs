@@ -42,6 +42,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
          );
          CREATE INDEX IF NOT EXISTS library_media_series ON library_media(series_id);",
     )?;
+    crate::ensure_column(conn, "library_user_media", "favorite_at", "INTEGER")?;
+    conn.execute("UPDATE library_user_media SET favorite_at=updated_at WHERE favorite=1 AND favorite_at IS NULL", [])?;
     Ok(())
 }
 
@@ -94,25 +96,27 @@ async fn list(
          ORDER BY s.title COLLATE NOCASE,m.season,m.episode,m.title COLLATE NOCASE"
     )?;
     let items = stmt
-        .query_map(params![user.id, query], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                relative_path: row.get(2)?,
-                kind: row.get(3)?,
-                series: row.get(4)?,
-                series_id: row.get(5)?,
-                season: row.get(6)?,
-                episode: row.get(7)?,
-                size: row.get(8)?,
-                favorite: row.get(9)?,
-                position: row.get(10)?,
-                duration: row.get(11)?,
-                watched: row.get(12)?,
-            })
-        })?
+        .query_map(params![user.id, query], media_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(items))
+}
+
+pub(crate) fn media_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
+    Ok(MediaItem {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        relative_path: row.get(2)?,
+        kind: row.get(3)?,
+        series: row.get(4)?,
+        series_id: row.get(5)?,
+        season: row.get(6)?,
+        episode: row.get(7)?,
+        size: row.get(8)?,
+        favorite: row.get(9)?,
+        position: row.get(10)?,
+        duration: row.get(11)?,
+        watched: row.get(12)?,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -393,7 +397,7 @@ async fn stream(
     Ok(response.into_response())
 }
 
-fn check_media(conn: &Connection, id: i64) -> Result<(), AppError> {
+pub(crate) fn check_media(conn: &Connection, id: i64) -> Result<(), AppError> {
     if !conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM library_media WHERE id=?1 AND available=1)",
         [id],
@@ -418,8 +422,9 @@ async fn favorite(
     let conn = state.conn()?;
     check_media(&conn, id)?;
     conn.execute(
-        "INSERT INTO library_user_media(user_id,media_id,favorite,updated_at) VALUES(?1,?2,?3,?4)
-         ON CONFLICT(user_id,media_id) DO UPDATE SET favorite=excluded.favorite,updated_at=excluded.updated_at",
+        "INSERT INTO library_user_media(user_id,media_id,favorite,updated_at,favorite_at) VALUES(?1,?2,?3,?4,?4)
+         ON CONFLICT(user_id,media_id) DO UPDATE SET favorite=excluded.favorite,
+         favorite_at=CASE WHEN excluded.favorite=0 THEN NULL WHEN library_user_media.favorite=1 THEN library_user_media.favorite_at ELSE excluded.favorite_at END",
         params![user.id,id,input.favorite,now()],
     )?;
     Ok(Json(serde_json::json!({"favorite": input.favorite})))

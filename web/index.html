@@ -104,6 +104,12 @@
           </nav>
           <p class="nav-label">我的</p>
           <nav>
+            <button class="nav-item" data-view="favorites">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m12 3 2.8 5.6 6.2.9-4.5 4.4 1.1 6.1-5.6-2.9-5.6 2.9 1.1-6.1L3 9.5l6.2-.9Z"/>
+              </svg>
+              我的收藏
+            </button>
             <button class="nav-item" data-view="series">
               <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M6 4.5h12a1 1 0 0 1 1 1v14l-7-4-7 4v-14a1 1 0 0 1 1-1z"/>
@@ -155,12 +161,13 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
           </button>
           <span id="breadcrumb" class="breadcrumb">影音空间 <span aria-hidden="true">/</span> 影视发现</span>
-          <label class="search-field">
+          <div class="search-field" role="search">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
             <input id="search-input" type="search" placeholder="搜索影片、剧集或频道" aria-label="搜索当前页面" autocomplete="off" />
+            <div id="search-popup" class="search-popup" aria-label="搜索历史与建议" role="group" hidden></div>
             <button id="search-clear" class="search-clear" type="button" aria-label="清除搜索" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg></button>
             <kbd aria-hidden="true">/</kbd>
-          </label>
+          </div>
           <div class="topbar-actions">
             <button id="theme-toggle" class="icon-button" aria-label="切换深色模式" title="切换深色模式">
               <span class="theme-icon-light" aria-hidden="true">
@@ -277,6 +284,7 @@
             title="收起节目单"
             hidden
           >收起节目单</button>
+          <button id="player-favorite" class="button subtle small-button" type="button" aria-label="收藏频道" aria-pressed="false" hidden>☆</button>
           <button
             id="player-source"
             class="button subtle small-button"

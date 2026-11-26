@@ -145,6 +145,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "player-mute",
     "player-fullscreen",
     "player-source",
+    "player-favorite",
     "player-speed",
     "player-guide-toggle",
     "player-guide",
@@ -161,6 +162,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "player-message",
     "video-player",
     "search-input",
+    "search-popup",
     "search-clear",
     "series-badge",
     "downloads-badge",
@@ -275,7 +277,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
+      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, favorites, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
     ),
     context,
   );
@@ -743,7 +745,7 @@ test("discover aggregates sources and offers type and year filters", async () =>
   );
   assert.deepEqual(
     rows.map((row) => row.children[0].textContent),
-    ["类型", "语言", "影视源", "分类", "年份"],
+    ["类型", "语言", "地区", "影视源", "分类", "年份"],
   );
   const chips = rows.flatMap((row) => row.children[1].children);
   const labels = chips
@@ -1850,4 +1852,205 @@ test("existing discover spotlight without covers keeps a single feature", async 
   assert.equal(spots.length, 1);
   assert.equal(pageNodes(spots[0]).find((node) => node.tagName === "H2").textContent, "聚合片");
   assert.equal(pageClass(page, "spotlight-dot").length, 0);
+});
+
+test("discovery filters source regions before grouping", async () => {
+  const areas = ["内地", "中國香港", "臺灣", "USA", "Japan", "韓國", "法国", "泰国"];
+  const app = environment(pageDiscoveryRoutes(areas.map((area, id) => ({ id: String(id), source_id: 1, title: area, area }))));
+  let page = await app.online();
+  const expected = { 中国大陆: ["内地"], 港台: ["中國香港", "臺灣"], 美国: ["USA"], 日本: ["Japan"], 韩国: ["韓國"], 欧美: ["法国"], 其他: ["泰国"] };
+  pageButton(page, "全部地区");
+  for (const [region, titles] of Object.entries(expected)) {
+    const areaRow = pageClass(page, "discover-filter-row").find((row) => row.children[0].textContent === "地区");
+    pageButton(areaRow, region).dispatchEvent("click");
+    assert.equal(app.state.onlineArea, region);
+    page = await app.online();
+    assert.deepEqual(pageClass(page, "poster-name").map((node) => node.textContent).sort(), titles.slice().sort());
+  }
+});
+
+test("search history displays, deletes individual entries, and clears all", async () => {
+  const history = ["流浪地球", "海岸"];
+  const app = environment({ "/api/search/history": history });
+  const input = app.elements.get("search-input");
+  const popup = app.elements.get("search-popup");
+  await input.listeners.focus[0]();
+  assert.equal(popup.hidden, false);
+  pageButton(popup, "流浪地球");
+  const remove = pageNodes(popup).find((node) => node.attributes?.["aria-label"] === "删除搜索记录 流浪地球");
+  history.shift();
+  await remove.listeners.click[0]();
+  assert.equal(pageClass(popup, "search-history-chip").length, 1);
+  history.length = 0;
+  await pageButton(popup, "清空历史").listeners.click[0]();
+  assert.equal(popup.hidden, true);
+  const deletions = app.calls.filter(({ options }) => options.method === "DELETE");
+  assert.deepEqual(deletions.map(({ url }) => url), [`/api/search/history?q=${encodeURIComponent("流浪地球")}`, "/api/search/history"]);
+  assert.ok(deletions.every(({ options }) => options.headers["X-PolyView-Request"] === "1"));
+});
+
+test("search suggestions debounce, ignore IME and stale results, and submit the chosen title", async () => {
+  const app = environment({ "/api/sources": [], "/api/catalog/suggest?q=a": [{ title: "旧标题" }], "/api/catalog/suggest?q=ab": [{ title: "新标题", year: "2026", kind: "movie" }] });
+  const input = app.elements.get("search-input");
+  const popup = app.elements.get("search-popup");
+  const timers = [];
+  app.context.setTimeout = (callback, delay) => timers.push({ callback, delay });
+  app.state.page = "settings";
+  input.dispatchEvent("compositionstart");
+  input.value = "a";
+  input.dispatchEvent("input", { isComposing: true });
+  input.dispatchEvent("keydown", { key: "Enter", isComposing: true });
+  assert.equal(app.state.page, "settings");
+  assert.equal(timers.length, 0);
+  input.dispatchEvent("compositionend");
+  assert.equal(app.calls.length, 0);
+  const stale = timers.find(({ delay }) => delay === 300).callback();
+  input.value = "ab";
+  input.dispatchEvent("input");
+  await stale;
+  assert.equal(popup.hidden, true);
+  await timers.at(-1).callback();
+  assert.equal(popup.hidden, false);
+  input.dispatchEvent("keydown", { key: "Escape", preventDefault() {} });
+  assert.equal(popup.hidden, true);
+  input.dispatchEvent("input");
+  await timers.at(-1).callback();
+  input.dispatchEvent("blur");
+  assert.equal(popup.hidden, true);
+  input.dispatchEvent("input");
+  await timers.at(-1).callback();
+  pageClass(popup, "search-suggestion")[0].dispatchEvent("click");
+  assert.equal(app.state.page, "online");
+  assert.equal(app.state.query, "新标题");
+  assert.equal(popup.hidden, true);
+  const post = app.calls.find(({ url, options }) => url === "/api/search/history" && options.method === "POST");
+  assert.deepEqual(JSON.parse(post.options.body), { keyword: "新标题" });
+  assert.equal(post.options.headers["X-PolyView-Request"], "1");
+});
+
+function savedMediaFixture() {
+  const item = { id: "a/b", source_id: 3, title: "故事", cover: "https://example.test/poster.jpg", kind: "series" };
+  const episodes = [1, 2].map((i) => ({ name: `第${i}集`, url: `https://example.test/${i}.mp4` }));
+  const record = { entry_kind: "online", source_id: 3, media_id: item.id, title: item.title, cover: item.cover,
+    remote_url: episodes[1].url, episode_index: 1, episode_name: episodes[1].name, position: 62.75, duration: 100 };
+  const local = { id: 9, title: "本地片", favorite: true, position: 10, duration: 100 };
+  const channel = { id: 4, name: "地方台", url: "https://example.test/live.m3u8", favorite: true };
+  const routes = {
+    "/api/catalog/3/detail?id=a%2Fb": { ...item, groups: [{ name: "直链", direct: true, episodes }] },
+    "/api/tracking": [],
+    "/api/sources": [],
+    "/api/favorites": { catalog: [{ ...item, media_id: item.id }], local: [local], channels: [channel] },
+    "/api/progress?source_id=3&media_id=a%2Fb": [record],
+    "/api/progress": [record, { ...local, entry_kind: "local", local_id: local.id }],
+  };
+  return { app: environment(routes), item, record, local, channel, routes };
+}
+
+function savedAction(root, label) {
+  return playbackNode(root, (node) => node.attributes?.["aria-label"] === label, label);
+}
+
+function savedMutation(app, url, method) {
+  const call = app.calls.find((call) => call.url === url && call.options.method === method);
+  assert.ok(call, `${method} ${url}`);
+  assert.equal(call.options.headers["X-PolyView-Request"], "1");
+  return call.options.body && JSON.parse(call.options.body);
+}
+
+test("detail resumes the saved episode after sorting and persists exact online seconds", async () => {
+  const { app, item, record } = savedMediaFixture();
+  await app.openCatalogDetail(item);
+  const dialog = app.elements.get("catalog-dialog");
+  pageButton(dialog, "倒序").dispatchEvent("click");
+  pageButton(dialog, "续播 第2集（01:02）").dispatchEvent("click");
+  assert.equal(app.state.player.playlistIndex, 0);
+  assert.equal(app.state.player.item.remote_url, record.remote_url);
+  const video = app.elements.get("video-player");
+  video.onloadedmetadata();
+  assert.equal(video.currentTime, record.position);
+  assert.equal(video.playCalls, 1);
+  video.currentTime = 70.125;
+  await app.saveProgress(true);
+  const { entry_kind, ...expected } = record;
+  assert.deepEqual(savedMutation(app, "/api/progress", "PUT"), { ...expected, position: 70.125 });
+  assert.ok(app.calls.every(({ url }) => !url.startsWith("/api/library/")));
+});
+
+test("discovery resumes and removes online and local entries and skips history during search", async () => {
+  const { app } = savedMediaFixture();
+  const page = await app.online();
+  const strip = pageClass(page, "continue-section")[0];
+  assert.ok(strip);
+  assert.match(strip.textContent, /继续观看/);
+  assert.match(strip.textContent, /第2集/);
+  assert.equal(pageNodes(strip).filter((node) => node.tagName === "PROGRESS").length, 2);
+  savedAction(strip, "续播 故事").dispatchEvent("click");
+  assert.equal(app.state.player.item.episode_index, 1);
+  assert.equal(app.state.player.autoplay, true);
+  await savedAction(strip, "移除 故事").listeners.click[0]();
+  savedMutation(app, "/api/progress/online/3/a%2Fb", "DELETE");
+  assert.doesNotMatch(strip.textContent, /故事/);
+  savedAction(strip, "续播 本地片").dispatchEvent("click");
+  assert.equal(app.state.player.item.id, 9);
+  assert.equal(app.elements.get("video-player").src, "/api/library/9/stream");
+  await savedAction(strip, "移除 本地片").listeners.click[0]();
+  savedMutation(app, "/api/progress/local/9", "DELETE");
+  assert.equal(strip.hidden, true);
+  app.state.query = "故事";
+  app.calls.length = 0;
+  assert.equal(pageClass(await app.online(), "continue-section").length, 0);
+  assert.ok(app.calls.every(({ url }) => url !== "/api/progress"));
+});
+
+test("catalog detail reads and toggles the current source's favorite", async () => {
+  const { app, item } = savedMediaFixture();
+  await app.openCatalogDetail(item);
+  const dialog = app.elements.get("catalog-dialog");
+  const star = pageButton(dialog, "★ 已收藏");
+  await star.listeners.click[0]();
+  savedMutation(app, "/api/favorites/3/a%2Fb", "DELETE");
+  assert.equal(star.textContent, "☆ 收藏");
+  await star.listeners.click[0]();
+  const body = savedMutation(app, "/api/favorites", "POST");
+  assert.equal(body.media_id, item.id);
+  assert.equal(body.title, item.title);
+  assert.equal(body.source_id, item.source_id);
+  assert.equal(star.getAttribute("aria-pressed"), "true");
+});
+
+test("favorites offers one-click playback and removal in all three sections", async () => {
+  const { app, record } = savedMediaFixture();
+  const page = await app.favorites();
+  assert.deepEqual(pageNodes(page).filter((node) => node.tagName === "H2").map((node) => node.textContent), ["在线影视收藏", "本地媒体收藏", "收藏直播频道"]);
+  await savedAction(page, "播放 故事").listeners.click[0]();
+  assert.equal(app.state.player.item.remote_url, record.remote_url);
+  assert.equal(app.state.player.autoplay, true);
+  savedAction(page, "播放 本地片").dispatchEvent("click");
+  assert.equal(app.state.player.item.id, 9);
+  savedAction(page, "播放 地方台").dispatchEvent("click");
+  assert.equal(app.state.player.live, true);
+  assert.equal(app.state.player.item.id, 4);
+  for (const title of ["故事", "本地片", "地方台"]) await savedAction(page, `取消收藏 ${title}`).listeners.click[0]();
+  savedMutation(app, "/api/favorites/3/a%2Fb", "DELETE");
+  assert.deepEqual(savedMutation(app, "/api/library/9/favorite", "PUT"), { favorite: false });
+  assert.deepEqual(savedMutation(app, "/api/channels/4/favorite", "PUT"), { favorite: false });
+  assert.equal(pageClass(page, "saved-card").length, 0);
+});
+
+test("guide stars filter favorite channels and the player star removes a favorite", async () => {
+  const app = livePlaybackFixture([[1, "一台", "央视"], [2, "二台", "地方"]], [1, 2]);
+  const page = await app.live();
+  await savedAction(page, "收藏 一台").listeners.click[0]();
+  assert.deepEqual(savedMutation(app, "/api/channels/1/favorite", "PUT"), { favorite: true });
+  pageButton(page, "★ 收藏").dispatchEvent("click");
+  assert.match(page.textContent, /一台/);
+  assert.doesNotMatch(page.textContent, /二台/);
+  savedAction(page, "播放 一台").dispatchEvent("click");
+  const star = app.elements.get("player-favorite");
+  assert.equal(star.hidden, false);
+  assert.equal(star.getAttribute("aria-pressed"), "true");
+  app.calls.length = 0;
+  await star.listeners.click[0]();
+  assert.deepEqual(savedMutation(app, "/api/channels/1/favorite", "PUT"), { favorite: false });
+  assert.equal(star.getAttribute("aria-pressed"), "false");
 });
