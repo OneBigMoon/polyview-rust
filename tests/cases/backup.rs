@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const EXPORT: &str = "/api/settings/export";
 const IMPORT: &str = "/api/settings/import";
@@ -36,6 +37,16 @@ fn sample(backup: &mut Value) {
     }]);
     backup["live_sources"] = json!([{
         "id":19,"name":"Television","url":"https://tv.invalid/guide.m3u","enabled":false
+    }]);
+    backup["live_channels"] = json!([{
+        "name":"News HD", "group_name":"News", "tvg_id":"news.hd", "logo":"",
+        "url":"https://tv.invalid/hd", "sources":[
+            {"url":"https://tv.invalid/hd", "label":"HD", "position":0,
+             "headers_json":"{}", "catchup_mode":"", "catchup_source":""},
+            {"url":"https://tv.invalid/sd", "label":"SD", "position":1,
+             "headers_json":r#"{"Cookie":"key=fixture-secret"}"#,
+             "catchup_mode":"default", "catchup_source":"/replay?begin=${(b)yyyyMMddHHmmss}"}
+        ]
     }]);
     backup["epg_config"] =
         json!({"url":"https://epg.invalid/one.xml\nhttps://epg.invalid/two.xml"});
@@ -240,6 +251,23 @@ async fn backup_rejects_unknown_keys_invalid_values_and_rolls_back_partial_impor
         ("/catalog_sources/0/proxy_url", json!("file:///bad")),
         ("/live_sources/0/url", json!("file:///tmp/invalid")),
         ("/live_sources/0/id", json!(0)),
+        ("/live_channels", Value::Null),
+        ("/live_channels/0/tvg_id", json!("bad\nmetadata")),
+        ("/live_channels/0/url", json!("file:///bad")),
+        ("/live_channels/0/sources/1/url", json!("file:///bad")),
+        ("/live_channels/0/sources/1/position", json!(-1)),
+        (
+            "/live_channels/0/sources/1/headers_json",
+            json!(r#"{"Cookie":"bad\r\nfixture-secret"}"#),
+        ),
+        (
+            "/live_channels/0/sources/1/headers_json",
+            json!(r#"{"Host":"fixture-secret"}"#),
+        ),
+        (
+            "/live_channels/0/sources/1/catchup_source",
+            json!("file:///fixture-secret"),
+        ),
         ("/epg_config/url", json!("data:text/plain,no")),
         ("/app_settings/epg_aliases/0/from", json!("")),
         ("/app_settings/adult_sources_enabled", json!("0")),
@@ -286,6 +314,23 @@ async fn backup_rejects_unknown_keys_invalid_values_and_rolls_back_partial_impor
         .unwrap()
         .push(entry);
     invalid.push(duplicate);
+    let mut duplicate_channel = backup.clone();
+    let channel = duplicate_channel["live_channels"][0].clone();
+    duplicate_channel["live_channels"]
+        .as_array_mut()
+        .unwrap()
+        .push(channel);
+    invalid.push(duplicate_channel);
+    let mut duplicate = backup.clone();
+    duplicate["live_channels"][0]["sources"][1]["url"] =
+        duplicate["live_channels"][0]["url"].clone();
+    invalid.push(duplicate);
+    let mut runtime_field = backup.clone();
+    runtime_field["live_channels"][0]["sources"][0]["fail_count"] = json!(9);
+    invalid.push(runtime_field);
+    let mut bad_mode = backup.clone();
+    bad_mode["live_channels"][0]["sources"][1]["catchup_mode"] = json!("bad\nmode");
+    invalid.push(bad_mode);
     for value in invalid {
         let reply = restore(&app, &admin, value).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
@@ -333,13 +378,22 @@ async fn feed_backup_restores_selection_ownership_and_parser_configuration() {
         "lives":[{"name":"TV","type":0,"url":live}],
         "parses":[{"name":"Fixture parser","type":1,"url":parser}]
     })));
-    let routes = Router::new().route(
-        "/config",
-        axum::routing::get({
-            let feed = feed.clone();
-            move || std::future::ready(axum::Json(feed.lock().unwrap().clone()))
-        }),
-    );
+    let stream_requests = Arc::new(AtomicUsize::new(0));
+    let routes = Router::new()
+        .route(
+            "/config",
+            axum::routing::get({
+                let feed = feed.clone();
+                move || std::future::ready(axum::Json(feed.lock().unwrap().clone()))
+            }),
+        )
+        .fallback({
+            let hits = stream_requests.clone();
+            move || {
+                hits.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(StatusCode::NOT_FOUND)
+            }
+        });
     let server = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
     let origin = TestApp::new();
     let admin = origin.setup().await;
@@ -365,10 +419,36 @@ async fn feed_backup_restores_selection_ownership_and_parser_configuration() {
         .request("POST", sync, Some(&admin), Some(json!({})))
         .await;
     assert_eq!(reply.status, StatusCode::OK);
+    let playlist = format!(
+        "#EXTM3U\n#EXTINF:-1 tvg-id=\"news.hd\" catchup=\"default\" catchup-source=\"{base}/archive?start=${{(b)yyyyMMddHHmmss}}\",News HD\n{base}/stream.hls|Cookie=session%3Dline-secret\n"
+    );
+    let channels = origin
+        .request(
+            "POST",
+            "/api/channels/import",
+            Some(&admin),
+            Some(json!({"playlist":playlist})),
+        )
+        .await;
+    assert_eq!(channels.status, StatusCode::OK);
     let mut backup = export(&origin, &admin).await;
     assert_eq!(backup["catalog_sources"].as_array().unwrap().len(), 1);
     assert_eq!(backup["catalog_sources"][0]["url"], cms);
     assert_eq!(backup["live_sources"][0]["url"], live);
+    let channel = &backup["live_channels"][0];
+    assert_eq!(channel["tvg_id"], "news.hd");
+    let line = &channel["sources"][0];
+    assert!(
+        line["headers_json"]
+            .as_str()
+            .unwrap()
+            .contains("session=line-secret")
+    );
+    assert_eq!(line["catchup_mode"], "default");
+    assert_eq!(
+        line["catchup_source"],
+        format!("{base}/archive?start=${{(b)yyyyMMddHHmmss}}")
+    );
     let sources = backup["source_subscriptions"]["sources"]
         .as_array_mut()
         .unwrap();
@@ -472,6 +552,7 @@ async fn feed_backup_restores_selection_ownership_and_parser_configuration() {
         let body = String::from_utf8_lossy(&reply.body);
         assert!(!body.contains("feed-secret"));
         assert!(!body.contains("header-secret"));
+        assert!(!body.contains("line-secret"));
     }
 
     let manual = TestApp::new();
@@ -516,6 +597,7 @@ async fn feed_backup_restores_selection_ownership_and_parser_configuration() {
             assert_eq!(actual["live_sources"][0]["id"], 92);
         }
     }
+    assert_eq!(stream_requests.load(Ordering::SeqCst), 0);
     server.abort();
 }
 
@@ -544,4 +626,77 @@ async fn large_configuration_backups_roundtrip_without_raising_other_request_lim
     assert_eq!(rows.len(), 257);
     assert_eq!(rows[256]["custom_cookie"], header);
     assert_eq!(restore(&app, &admin, exported).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn live_backup_keeps_line_owners_favorites_and_destination_health() {
+    let target = TestApp::new();
+    let admin = target.setup().await;
+    let member_id = target.create_viewer(&admin).await;
+    let member = target.login("viewer", PASSWORD).await.cookie();
+    let mut backup = export(&target, &admin).await;
+    sample(&mut backup);
+    let template = "/replay?from=${(b)yyyyMMddHHmmss}&to=${(e)yyyyMMddHHmmss}";
+    backup["live_channels"][0]["logo"] = json!("https://tv.invalid/logo.png");
+    backup["live_channels"][0]["sources"][1]["catchup_source"] = json!(template);
+    {
+        let conn = target.state.conn().unwrap();
+        conn.execute_batch(
+            "INSERT INTO channels(id,name,group_name,logo,url) VALUES
+             (75,'Old','Old','','https://tv.invalid/hd'),
+             (76,'Other','Other','','https://tv.invalid/other');
+             INSERT INTO channel_sources(id,channel_id,url,label,position,latency_ms,last_ok_at,fail_count) VALUES
+             (81,75,'https://tv.invalid/sd','Old line',2,23,98765,4),
+             (82,76,'https://tv.invalid/sd','Different owner',0,17,12345,1);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO channel_favorites(user_id,channel_id,created_at) VALUES(?,75,12345)",
+            [member_id],
+        )
+        .unwrap();
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            restore(&target, &admin, backup.clone()).await.status,
+            StatusCode::OK
+        );
+    }
+    let saved = export(&target, &admin).await;
+    assert_eq!(saved["live_channels"].as_array().unwrap().len(), 2);
+    assert_eq!(saved["live_channels"][0], backup["live_channels"][0]);
+    let local_line = &saved["live_channels"][1]["sources"][0];
+    assert_eq!(local_line["label"], "Different owner");
+    assert_eq!(local_line["headers_json"], "{}");
+    for key in ["latency_ms", "last_ok_at", "fail_count"] {
+        assert!(local_line.get(key).is_none());
+    }
+    let denied = target.request("GET", EXPORT, Some(&member), None).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    assert!(!String::from_utf8_lossy(&denied.body).contains("fixture-secret"));
+
+    // Before M9 the backup had no live channel section. Restoring it can still change aliases.
+    backup.as_object_mut().unwrap().remove("live_channels");
+    backup["app_settings"]["epg_aliases"] = json!([{"from":"Old TV","to":"News HD"}]);
+    assert_eq!(
+        restore(&target, &admin, backup.clone()).await.status,
+        StatusCode::OK
+    );
+    let legacy = export(&target, &admin).await;
+    assert_eq!(
+        legacy["app_settings"]["epg_aliases"],
+        backup["app_settings"]["epg_aliases"]
+    );
+    assert_eq!(legacy["live_channels"], saved["live_channels"]);
+    let conn = target.state.conn().unwrap();
+    let retained: (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT s.id,s.latency_ms,s.last_ok_at,s.fail_count FROM channel_sources s
+             JOIN channel_favorites f ON f.channel_id=s.channel_id
+             WHERE f.user_id=? AND f.channel_id=75 AND s.url='https://tv.invalid/sd'",
+            [member_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(retained, (81, 23, 98765, 4));
 }

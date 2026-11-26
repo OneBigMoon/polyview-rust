@@ -1820,6 +1820,132 @@ test("live group chips show channel counts and pan the timeline", async () => {
   assert.equal(app.elements.get("player-title").textContent, "一台");
 });
 
+function protectedGuideFixture() {
+  const now = 1800000000;
+  const first = { id: 40, hls: false, catchup: false, label: "主线", latency_ms: 18, last_ok_at: now, fail_count: 0 };
+  const replay = { id: 41, hls: false, catchup_hls: true, catchup: true, label: "备线", latency_ms: null, fail_count: 3 };
+  const channels = [
+    { id: 1, name: "新闻", group_name: "央视", sources: [first, replay, { ...replay, id: 42, label: "第三线" }] },
+    { id: 2, name: "地方台", group_name: "本地", sources: [{ ...first, id: 51, last_ok_at: null, latency_ms: null }] },
+  ];
+  const liveUrl = `/api/epg?start=${now - 21600}&end=${now + 86400}`;
+  const routes = { "/api/channels": channels, [liveUrl]: { programs: [{ channel_id: 1, start: now, stop: now + 3600, title: "直播新闻" }] } };
+  const app = environment(routes);
+  app.context.Date = class extends Date { static now() { return now * 1000; } };
+  app.state.page = "live";
+  app.state.user = { role: "member" };
+  return { app, now, channels, routes };
+}
+
+test("members navigate the seven-day archive and replay only capable lines through their protected streams", async () => {
+  const { app, now, routes } = protectedGuideFixture();
+  const page = await app.live();
+  assert.doesNotMatch(page.textContent, /直播线路管理|测活\/测速|清理失效线路|导入频道列表|各线路状态/);
+  pageClass(page, "epg-program")[0].dispatchEvent("click");
+  assert.equal(app.elements.get("video-player").src, "/api/channels/lines/40/stream");
+  pageButton(app.elements.get("player-timeshift"), "-5分").dispatchEvent("click");
+  assert.equal(app.elements.get("video-player").src, "/api/channels/lines/40/stream?start=-300");
+  app.closePlayer();
+  const date = pageNodes(pageClass(page, "guide-date")[0]).find((node) => node.tagName === "SELECT");
+  const oldest = date.children.at(-1);
+  const cutoff = now - 7 * 86400;
+  const nextMidnight = new Date(Number(oldest.value) * 1000);
+  nextMidnight.setDate(nextMidnight.getDate() + 1);
+  const start = cutoff + 60, stop = start + 300;
+  const historyUrl = `/api/epg?start=${cutoff}&end=${nextMidnight.getTime() / 1000}`;
+  routes[historyUrl] = { programs: [
+    { channel_id: 1, start: cutoff - 600, stop: cutoff + 60, title: "回看窗口以外" },
+    { channel_id: 1, start, stop, title: "早间新闻" },
+    { channel_id: 2, start, stop, title: "无回看模板" },
+  ] };
+  date.value = oldest.value;
+  await date.listeners.change[0]();
+  const content = app.elements.get("content");
+  assert.ok(app.calls.some(({ url }) => url === historyUrl));
+  assert.doesNotMatch(content.textContent, /回看窗口以外|无回看模板/);
+  const programs = pageClass(content, "epg-program");
+  assert.equal(programs.length, 1);
+  assert.match(programs[0].textContent, /回看 · 早间新闻/);
+  programs[0].dispatchEvent("click");
+  assert.equal(app.elements.get("player-kind").textContent, "节目回看");
+  assert.equal(app.elements.get("player-title").textContent, "新闻 · 早间新闻");
+  assert.equal(app.hlsInstances.at(-1).source, `/api/channels/lines/41/stream?start=${start}&end=${stop}`);
+  app.hlsInstances.at(-1).emit("error", { fatal: true });
+  assert.equal(app.hlsInstances.at(-1).source, `/api/channels/lines/42/stream?start=${start}&end=${stop}`);
+  pageButton(app.elements.get("player-timeshift"), "返回直播").dispatchEvent("click");
+  assert.equal(app.elements.get("video-player").src, "/api/channels/lines/40/stream");
+  app.closePlayer();
+  await pageButton(content, "回到现在").listeners.click[0]();
+  assert.match(content.textContent, /直播新闻/);
+  assert.equal(app.state.guideDay, "live");
+});
+
+test("administrator inspects health, probes all lines and confirms group cleanup", async () => {
+  const { app, channels, routes } = protectedGuideFixture();
+  app.state.user.role = "admin";
+  const probePath = "/api/channels/probe", cleanupPath = "/api/channels/cleanup";
+  routes[probePath] = { checked: 4, healthy: 2, failed: 2 };
+  routes[cleanupPath] = { removed: 2 };
+  const fetch = app.context.fetch;
+  app.context.fetch = (url, options) => {
+    if (url === cleanupPath) channels[0].sources.splice(1);
+    return fetch(url, options);
+  };
+  function health(page) {
+    const panel = pageClass(page, "channel-health")[0];
+    const details = pageNodes(panel).find((node) => node.tagName === "DETAILS");
+    details.open = true;
+    details.dispatchEvent("toggle");
+    return panel;
+  }
+  let panel = health(await app.live());
+  assert.match(panel.textContent, /可用 · 18 ms/);
+  assert.match(panel.textContent, /连续失败 3 次/);
+  assert.match(panel.textContent, /未测活/);
+  await pageButton(panel, "一键测活/测速").listeners.click[0]();
+  assert.match(app.elements.get("toast").textContent, /已检测 4 条线路，2 条可用，2 条失败/);
+  panel = health(app.elements.get("content"));
+  const scope = pageNodes(panel).find((node) => node.tagName === "SELECT");
+  scope.value = "央视";
+  scope.dispatchEvent("change");
+  assert.doesNotMatch(pageClass(panel, "channel-health-list")[0].textContent, /地方台/);
+  app.context.window.confirm = () => false;
+  await pageButton(panel, "清理失效线路").listeners.click[0]();
+  assert.equal(app.calls.filter(({ url }) => url === cleanupPath).length, 0);
+  app.context.window.confirm = (message) => message.includes("央视") && message.includes("3 次");
+  await pageButton(panel, "清理失效线路").listeners.click[0]();
+  assert.match(app.elements.get("toast").textContent, /已清理 2 条失效线路/);
+  assert.doesNotMatch(health(app.elements.get("content")).textContent, /连续失败/);
+  const mutations = app.calls.filter(({ options }) => options.method === "POST");
+  assert.deepEqual(mutations.map(({ url, options }) => [url, JSON.parse(options.body)]), [[probePath, {}], [cleanupPath, { group: "央视" }]]);
+  assert.ok(mutations.every(({ options }) => options.headers["X-PolyView-Request"] === "1"));
+});
+
+test("guide errors retain date navigation and failed operator probes can be retried", async () => {
+  const { app, routes } = protectedGuideFixture();
+  app.state.user.role = "admin";
+  const original = app.context.fetch;
+  const fail = { ok: false, status: 502, text: async () => JSON.stringify({ error: "连接失败" }) };
+  let failProbe = true;
+  app.context.fetch = (url, options) => url.startsWith("/api/epg?") || (url === "/api/channels/probe" && failProbe) ? fail : original(url, options);
+  routes["/api/channels/probe"] = { checked: 0, healthy: 0, failed: 0 };
+  const page = await app.live();
+  assert.match(page.textContent, /节目单加载失败：连接失败/);
+  assert.equal(pageClass(page, "guide-date").length, 1);
+  const panel = pageClass(page, "channel-health")[0];
+  const scope = pageNodes(panel).find((node) => node.tagName === "SELECT");
+  scope.value = "本地";
+  scope.dispatchEvent("change");
+  const probe = pageButton(panel, "一键测活/测速");
+  await probe.listeners.click[0]();
+  assert.equal(probe.disabled, false);
+  assert.match(panel.textContent, /连接失败/);
+  failProbe = false;
+  await probe.listeners.click[0]();
+  const retry = app.calls.find(({ url }) => url === "/api/channels/probe");
+  assert.deepEqual(JSON.parse(retry.options.body), { group: "本地" });
+});
+
 const tvboxPaths = { config_path: "/feeds/config", catalog_path: "/feeds/catalog", live_path: "/feeds/live" };
 
 test("settings tabs render one panel at a time", async () => {

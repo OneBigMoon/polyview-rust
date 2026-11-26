@@ -1,5 +1,9 @@
+mod playlist;
 mod resolved;
 
+pub(crate) use playlist::{
+    live_headers, live_url, parse_playlist, validate_catchup, validate_channel_metadata,
+};
 pub(crate) use resolved::{PreparedDownload, prepare_catalog_download};
 
 use crate::{
@@ -49,7 +53,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS channel_sources_channel
             ON channel_sources(channel_id, position);
         INSERT OR IGNORE INTO channel_sources(channel_id, url, label, position)
-            SELECT id, url, '', 0 FROM channels;
+            SELECT id, url, '', 0 FROM channels c
+            WHERE NOT EXISTS (SELECT 1 FROM channel_sources s WHERE s.channel_id=c.id);
         CREATE TABLE IF NOT EXISTS downloads (
             id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             title TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
@@ -58,6 +63,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
         );
         CREATE INDEX IF NOT EXISTS downloads_user ON downloads(user_id, id);",
     )?;
+    crate::ensure_column(conn, "channels", "tvg_id", "TEXT NOT NULL DEFAULT ''")?;
+    for (name, definition) in [
+        ("headers_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("catchup_mode", "TEXT NOT NULL DEFAULT ''"),
+        ("catchup_source", "TEXT NOT NULL DEFAULT ''"),
+        ("latency_ms", "INTEGER"),
+        ("last_ok_at", "INTEGER"),
+        ("fail_count", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        crate::ensure_column(conn, "channel_sources", name, definition)?;
+    }
     for (name, definition) in [
         ("kind", "TEXT NOT NULL DEFAULT 'direct'"),
         ("attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -88,6 +104,14 @@ pub fn router() -> Router<Shared> {
 
 #[derive(Debug, Serialize)]
 struct ChannelSource {
+    id: Option<i64>,
+    stream_url: Option<String>,
+    hls: bool,
+    catchup: bool,
+    catchup_hls: Option<bool>,
+    latency_ms: Option<i64>,
+    last_ok_at: Option<i64>,
+    fail_count: i64,
     url: String,
     label: String,
 }
@@ -99,6 +123,8 @@ pub(crate) struct Channel {
     group_name: String,
     logo: String,
     url: String,
+    tvg_id: String,
+    catchup: bool,
     pub favorite: bool,
     sources: Vec<ChannelSource>,
 }
@@ -109,6 +135,10 @@ pub(crate) struct PlaylistChannel {
     group_name: String,
     logo: String,
     url: String,
+    tvg_id: String,
+    headers_json: String,
+    catchup_mode: String,
+    catchup_source: String,
 }
 
 async fn list_channels(
@@ -116,47 +146,90 @@ async fn list_channels(
     user: AuthUser,
 ) -> Result<Json<Vec<Channel>>, AppError> {
     let conn = state.conn()?;
-    Ok(Json(channels_for_user(&conn, user.id, false)?))
+    Ok(Json(channels_for_user(&conn, &user, false)?))
 }
 
 pub(crate) fn channels_for_user(
     conn: &Connection,
-    user_id: i64,
+    user: &AuthUser,
     favorites_only: bool,
 ) -> Result<Vec<Channel>, AppError> {
     let mut query = conn.prepare(
-        "SELECT c.id,c.name,c.group_name,c.logo,c.url,f.channel_id IS NOT NULL
+        "SELECT c.id,c.name,c.group_name,c.logo!='',c.url,f.channel_id IS NOT NULL,c.tvg_id
         FROM channels c LEFT JOIN channel_favorites f ON f.channel_id=c.id AND f.user_id=?1
         WHERE NOT ?2 OR f.channel_id IS NOT NULL
         ORDER BY CASE WHEN ?2 THEN f.created_at END DESC,c.group_name,c.name,c.id",
     )?;
     let mut channels = query
-        .query_map(params![user_id, favorites_only], |row| {
+        .query_map(params![user.id, favorites_only], |row| {
             Ok(Channel {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 group_name: row.get(2)?,
-                logo: row.get(3)?,
+                logo: if row.get::<_, bool>(3)? {
+                    format!("/api/channels/{}/logo", row.get::<_, i64>(0)?)
+                } else {
+                    String::new()
+                },
                 url: row.get(4)?,
                 favorite: row.get(5)?,
+                tvg_id: row.get(6)?,
+                catchup: false,
                 sources: Vec::new(),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut sources = conn.prepare(
-        "SELECT url,label FROM channel_sources WHERE channel_id=?1 ORDER BY position,id",
+        "SELECT id,url,label,headers_json!='{}',catchup_source,latency_ms,last_ok_at,fail_count
+         FROM channel_sources WHERE channel_id=?1 ORDER BY position,id",
     )?;
     for channel in &mut channels {
         channel.sources = sources
             .query_map([channel.id], |row| {
+                let id: i64 = row.get(0)?;
+                let upstream: String = row.get(1)?;
+                let has_headers: bool = row.get(3)?;
+                let template: String = row.get(4)?;
+                let stream_url = format!("/api/channels/lines/{id}/stream");
+                let hls = playlist::is_hls(&upstream);
+                let url = if user.role == "admin" && !has_headers && !upstream.contains(['?', '#'])
+                {
+                    upstream
+                } else {
+                    stream_url.clone()
+                };
                 Ok(ChannelSource {
-                    url: row.get(0)?,
-                    label: row.get(1)?,
+                    id: Some(id),
+                    stream_url: Some(stream_url),
+                    hls,
+                    catchup: !template.is_empty(),
+                    catchup_hls: playlist::catchup_hls(&template),
+                    latency_ms: row.get(5)?,
+                    last_ok_at: row.get(6)?,
+                    fail_count: row.get(7)?,
+                    url,
+                    label: row.get(2)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        if channel.sources.is_empty() {
+        if let Some(first) = channel.sources.first() {
+            channel.url.clone_from(&first.url);
+            channel.catchup = channel.sources.iter().any(|line| line.catchup);
+        } else {
+            // SQL-only legacy entries can lack a line until the next startup backfill.
+            let hls = playlist::is_hls(&channel.url);
+            if user.role != "admin" || channel.url.contains(['?', '#']) {
+                channel.url.clear();
+            }
             channel.sources.push(ChannelSource {
+                id: None,
+                stream_url: None,
+                hls,
+                catchup: false,
+                catchup_hls: None,
+                latency_ms: None,
+                last_ok_at: None,
+                fail_count: 0,
                 url: channel.url.clone(),
                 label: String::new(),
             });
@@ -208,6 +281,11 @@ pub(crate) fn merge_playlist(
     };
     for ((name, group_name), entries) in groups {
         let first = entries[0];
+        let logo = entries.iter().find(|e| !e.logo.is_empty()).map(|e| &e.logo);
+        let tvg_id = entries
+            .iter()
+            .find(|e| !e.tvg_id.is_empty())
+            .map(|e| &e.tvg_id);
         let mut id = tx
             .query_row(
                 "SELECT id FROM channels WHERE name=?1 AND group_name=?2 ORDER BY id LIMIT 1",
@@ -215,7 +293,6 @@ pub(crate) fn merge_playlist(
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
-        let mut migrate = false;
         if id.is_none() {
             for entry in &entries {
                 if let Some(found) = tx
@@ -227,45 +304,51 @@ pub(crate) fn merge_playlist(
                     .optional()?
                 {
                     id = Some(found);
-                    migrate = true;
                     break;
                 }
             }
         }
         let id = if let Some(id) = id {
-            if migrate {
-                tx.execute(
-                    "UPDATE channels SET name=?1,group_name=?2,logo=?3 WHERE id=?4",
-                    params![name, group_name, first.logo, id],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE channels SET logo=CASE WHEN logo='' THEN ?1 ELSE logo END WHERE id=?2",
-                    params![first.logo, id],
-                )?;
-            }
+            tx.execute(
+                "UPDATE channels SET name=?1,group_name=?2,logo=COALESCE(?3,logo),
+                 tvg_id=COALESCE(?4,tvg_id) WHERE id=?5",
+                params![name, group_name, logo, tvg_id, id],
+            )?;
             id
         } else {
             tx.execute(
-                "INSERT INTO channels(name,group_name,logo,url) VALUES (?1,?2,?3,?4)",
-                params![name, group_name, first.logo, first.url],
+                "INSERT INTO channels(name,group_name,logo,tvg_id,url)
+                 VALUES (?1,?2,COALESCE(?3,''),COALESCE(?4,''),?5)",
+                params![name, group_name, logo, tvg_id, first.url],
             )?;
             counts.added += 1;
             tx.last_insert_rowid()
         };
-        let mut position: i64 = tx.query_row(
+        let next_position: i64 = tx.query_row(
             "SELECT COALESCE(MAX(position),-1)+1 FROM channel_sources WHERE channel_id=?1",
             [id],
             |row| row.get(0),
         )?;
-        for entry in entries {
-            if tx.execute(
-                "INSERT OR IGNORE INTO channel_sources(channel_id,url,label,position) VALUES (?1,?2,'',?3)",
-                params![id, entry.url, position],
-            )? > 0
-            {
-                position += 1;
-            }
+        let mut upsert = tx.prepare_cached(
+            "INSERT INTO channel_sources(channel_id,url,position,headers_json,catchup_mode,catchup_source)
+             VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(channel_id,url) DO UPDATE SET
+             latency_ms=CASE WHEN headers_json=excluded.headers_json THEN latency_ms END,
+             last_ok_at=CASE WHEN headers_json=excluded.headers_json THEN last_ok_at END,
+             fail_count=CASE WHEN headers_json=excluded.headers_json THEN fail_count ELSE 0 END,
+             headers_json=excluded.headers_json,catchup_mode=excluded.catchup_mode,
+             catchup_source=excluded.catchup_source
+             WHERE headers_json!=excluded.headers_json OR catchup_mode!=excluded.catchup_mode
+                OR catchup_source!=excluded.catchup_source",
+        )?;
+        for (offset, entry) in entries.into_iter().enumerate() {
+            upsert.execute(params![
+                id,
+                entry.url,
+                next_position + offset as i64,
+                entry.headers_json,
+                entry.catchup_mode,
+                entry.catchup_source
+            ])?;
         }
     }
     Ok(counts)
@@ -300,103 +383,6 @@ pub(crate) fn http_url(raw: &str) -> Result<Url, AppError> {
         ));
     }
     Ok(parsed)
-}
-
-fn attribute(info: &str, key: &str) -> String {
-    let pattern = format!("{key}=\"");
-    if let Some(start) = info.find(&pattern) {
-        return info[start + pattern.len()..]
-            .split('"')
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-    }
-    String::new()
-}
-
-pub(crate) fn parse_playlist(text: &str) -> Result<Vec<PlaylistChannel>, AppError> {
-    let mut channels = Vec::new();
-    let mut pending: Option<(String, String, String)> = None;
-    let mut saw_header = false;
-    for (number, raw) in text.lines().enumerate() {
-        let line = raw.trim().trim_start_matches('\u{feff}');
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with("#EXTM3U") {
-            saw_header = true;
-            continue;
-        }
-        if let Some(info) = line.strip_prefix("#EXTINF:") {
-            if pending.is_some() {
-                return Err(AppError::bad_request(format!(
-                    "Missing channel URL near line {}",
-                    number + 1
-                )));
-            }
-            let mut quoted = false;
-            let comma = info.char_indices().find_map(|(i, c)| {
-                if c == '"' {
-                    quoted = !quoted;
-                }
-                (c == ',' && !quoted).then_some(i)
-            });
-            let (attributes, name) = match comma {
-                Some(i) => (&info[..i], info[i + 1..].trim().to_owned()),
-                None => {
-                    return Err(AppError::bad_request(format!(
-                        "Invalid channel metadata on line {}",
-                        number + 1
-                    )));
-                }
-            };
-            let name = if name.is_empty() {
-                attribute(attributes, "tvg-name")
-            } else {
-                name
-            };
-            if name.is_empty() || name.len() > 300 {
-                return Err(AppError::bad_request(
-                    "Every channel needs a name of at most 300 characters",
-                ));
-            }
-            let logo = attribute(attributes, "tvg-logo");
-            if !logo.is_empty() {
-                http_url(&logo)?;
-            }
-            pending = Some((name, attribute(attributes, "group-title"), logo));
-        } else if !line.starts_with('#') {
-            let (name, group_name, logo) = pending.take().ok_or_else(|| {
-                AppError::bad_request(format!(
-                    "Missing EXTINF metadata before line {}",
-                    number + 1
-                ))
-            })?;
-            let url = http_url(line)?.to_string();
-            if !channels
-                .iter()
-                .any(|channel: &PlaylistChannel| channel.url == url)
-            {
-                channels.push(PlaylistChannel {
-                    name,
-                    group_name,
-                    logo,
-                    url,
-                });
-            }
-            if channels.len() > 10_000 {
-                return Err(AppError::bad_request(
-                    "Import at most 10,000 channels at a time",
-                ));
-            }
-        }
-    }
-    if !saw_header || pending.is_some() || channels.is_empty() {
-        return Err(AppError::bad_request(
-            "Provide a complete M3U playlist with #EXTM3U, #EXTINF and HTTP(S) channel URLs",
-        ));
-    }
-    Ok(channels)
 }
 
 #[derive(Debug, Serialize)]

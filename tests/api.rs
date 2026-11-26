@@ -6,6 +6,12 @@ mod calendar;
 mod download_metadata;
 #[path = "cases/download_settings.rs"]
 mod download_settings;
+#[path = "cases/live_formats.rs"]
+mod live_formats;
+#[path = "cases/live_probes.rs"]
+mod live_probes;
+#[path = "cases/live_relay.rs"]
+mod live_relay;
 #[path = "cases/live_sources.rs"]
 mod live_sources;
 #[path = "cases/member_feeds.rs"]

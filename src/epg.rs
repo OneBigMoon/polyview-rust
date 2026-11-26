@@ -46,6 +46,7 @@ const CHANNEL_ALIASES: &[(&str, &str)] = &[
     ("法国24", "France 24"),
 ];
 const EPG_STALE_SECONDS: i64 = 6 * 60 * 60;
+const CATCHUP_SECONDS: i64 = 7 * 24 * 3600;
 pub(crate) const ALIASES_KEY: &str = "epg_aliases";
 
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
@@ -96,12 +97,12 @@ struct Program {
 
 async fn guide(
     State(state): State<Shared>,
-    _user: AuthUser,
+    user: AuthUser,
     Query(query): Query<GuideQuery>,
 ) -> Result<Json<Value>, AppError> {
     let start = query.start.unwrap_or_else(|| now() - 3600);
     let end = query.end.unwrap_or_else(|| now() + 7 * 3600);
-    if end <= start || end - start > 48 * 3600 {
+    if end <= start || end.saturating_sub(start) > 48 * 3600 {
         return Err(AppError::bad_request(
             "EPG range must be positive and no longer than 48 hours",
         ));
@@ -130,14 +131,16 @@ async fn guide(
     let updated_at = setting_optional(&conn, "epg_updated_at")?
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    let url = setting(&conn, "epg_url")?;
-    Ok(Json(json!({
+    let mut result = json!({
         "updated_at": updated_at,
         "stale": now() - updated_at > EPG_STALE_SECONDS,
-        "url": url,
         "matched_channels": matched,
         "programs": programs,
-    })))
+    });
+    if user.role == "admin" {
+        result["url"] = Value::String(setting(&conn, "epg_url")?);
+    }
+    Ok(Json(result))
 }
 
 async fn config(State(state): State<Shared>, user: AuthUser) -> Result<Json<Value>, AppError> {
@@ -280,16 +283,39 @@ async fn refresh_epg(state: &Shared) -> Result<Value, AppError> {
         ));
     }
     let conn = state.conn()?;
-    let custom = crate::settings::get_setting_json::<Vec<ChannelAlias>>(&conn, ALIASES_KEY)?
+    let updated_at = now();
+    let (matched, programs) = store_feeds(&conn, &feeds, updated_at)?;
+    Ok(json!({
+        "updated_at": updated_at,
+        "feeds": feeds.len(),
+        "matched_channels": matched,
+        "programs": programs,
+        "errors": errors,
+    }))
+}
+
+fn store_feeds(
+    conn: &Connection,
+    feeds: &[ParsedEpg],
+    updated_at: i64,
+) -> Result<(usize, usize), AppError> {
+    let custom = crate::settings::get_setting_json::<Vec<ChannelAlias>>(conn, ALIASES_KEY)?
         .into_iter()
         .map(|alias| (normalize(&alias.from), normalize(&alias.to)))
         .collect::<HashMap<_, _>>();
     let channels = {
-        let mut statement = conn.prepare("SELECT id,name FROM channels ORDER BY id")?;
+        let mut statement = conn.prepare("SELECT id,name,tvg_id FROM channels ORDER BY id")?;
         statement
             .query_map([], |row| {
                 let name: String = row.get(1)?;
-                Ok((row.get::<_, i64>(0)?, channel_key(&name, &custom)))
+                let tvg_id: String = row.get(2)?;
+                let prefer_id = !tvg_id.is_empty() && !custom.contains_key(&normalize(&name));
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    channel_key(&name, &custom),
+                    tvg_id,
+                    prefer_id,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?
     };
@@ -297,23 +323,42 @@ async fn refresh_epg(state: &Shared) -> Result<Value, AppError> {
     let mut programs = 0usize;
     let mut covered: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM epg_programs", [])?;
-    for parsed in &feeds {
-        for (channel_id, key) in &channels {
-            let Some(xml_id) = find_channel(key, &parsed.aliases, &parsed.canonical) else {
-                continue;
+    let cutoff = updated_at - CATCHUP_SECONDS;
+    tx.execute(
+        "DELETE FROM epg_programs WHERE start < ?1 OR stop > ?2",
+        params![cutoff, updated_at],
+    )?;
+    for parsed in feeds {
+        for (channel_id, key, tvg_id, prefer_id) in &channels {
+            let items = if *prefer_id {
+                parsed.programs.get(tvg_id)
+            } else {
+                None
             };
-            let Some(items) = parsed.programs.get(xml_id) else {
+            let Some(items) = items.or_else(|| {
+                find_channel(key, &parsed.aliases, &parsed.canonical)
+                    .and_then(|xml_id| parsed.programs.get(xml_id))
+            }) else {
                 continue;
             };
             matched.insert(*channel_id);
             let ranges = covered.entry(*channel_id).or_default();
             for item in items {
+                if item.start < cutoff {
+                    continue;
+                }
                 if ranges
                     .iter()
                     .any(|(start, stop)| item.start < *stop && item.stop > *start)
                 {
                     continue;
+                }
+                // A fresh listing supersedes overlapping archived schedules, including retitles.
+                if item.start < updated_at && item.stop > cutoff {
+                    tx.execute(
+                        "DELETE FROM epg_programs WHERE channel_id=?1 AND start<?2 AND stop>?3",
+                        params![channel_id, item.stop, item.start],
+                    )?;
                 }
                 programs += tx.execute(
                     "INSERT OR IGNORE INTO epg_programs(channel_id,start,stop,title,description)
@@ -330,20 +375,13 @@ async fn refresh_epg(state: &Shared) -> Result<Value, AppError> {
             }
         }
     }
-    let updated_at = now();
     tx.execute(
         "INSERT INTO settings(key,value) VALUES ('epg_updated_at',?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [updated_at.to_string()],
     )?;
     tx.commit()?;
-    Ok(json!({
-        "updated_at": updated_at,
-        "feeds": feeds.len(),
-        "matched_channels": matched.len(),
-        "programs": programs,
-        "errors": errors,
-    }))
+    Ok((matched.len(), programs))
 }
 
 async fn fetch_epg(client: &reqwest::Client, url: &str) -> Result<ParsedEpg, AppError> {
@@ -607,6 +645,44 @@ mod tests {
 
     fn default_key(name: &str) -> String {
         channel_key(name, &HashMap::new())
+    }
+
+    #[test]
+    fn refresh_keeps_one_week_of_history_and_replaces_corrected_slots_by_tvg_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE channels (id INTEGER PRIMARY KEY, name TEXT, tvg_id TEXT);
+             INSERT INTO channels VALUES (1,'Different channel name','feed.17');",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        crate::settings::init_schema(&conn).unwrap();
+        let now = parse_xmltv_time("19700110120000 +0000").unwrap();
+        let feed = |programs: &str| parse_xmltv(&format!("<tv>{programs}</tv>")).unwrap();
+        let original = feed(
+            r#"<programme channel="feed.17" start="19700102100000 +0000" stop="19700102110000 +0000"><title>Expired</title></programme>
+               <programme channel="feed.17" start="19700103120000 +0000" stop="19700103130000 +0000"><title>Oldest replay</title></programme>
+               <programme channel="feed.17" start="19700109080000 +0000" stop="19700109090000 +0000"><title>Wrong title</title></programme>
+               <programme channel="feed.17" start="19700111100000 +0000" stop="19700111110000 +0000"><title>Withdrawn future slot</title></programme>"#,
+        );
+        assert_eq!(store_feeds(&conn, &[original], now - 3600).unwrap(), (1, 3));
+        let revised = feed(
+            r#"<programme channel="feed.17" start="19700109081500 +0000" stop="19700109090000 +0000"><title>Corrected</title></programme>"#,
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                store_feeds(&conn, std::slice::from_ref(&revised), now).unwrap(),
+                (1, 1)
+            );
+            let titles = conn
+                .prepare("SELECT title FROM epg_programs ORDER BY start")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(titles, ["Oldest replay", "Corrected"]);
+        }
     }
 
     #[test]

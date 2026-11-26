@@ -33,6 +33,9 @@ pub fn router() -> Router<Shared> {
         .route("/tvbox/{token}/vod", get(catalog))
         .route("/tvbox/{token}/source/{source_id}", get(source_catalog))
         .route("/tvbox/{token}/live.m3u", get(live))
+        .route("/tvbox/{token}/lines/{id}/stream", get(live_stream))
+        .route("/tvbox/{token}/grants/{grant}", get(live_grant))
+        .route("/tvbox/{token}/channels/{id}/logo", get(live_logo))
         .route("/tvbox/{token}/media/{id}", get(stream).head(stream))
 }
 
@@ -464,33 +467,46 @@ fn m3u_attribute(raw: &str) -> String {
 async fn live(
     State(state): State<Shared>,
     Path(token): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     require_token(&state, &token)?;
+    let origin = origin(&state, &headers)?;
     let conn = state.conn()?;
-    let mut query =
-        conn.prepare("SELECT name,group_name,logo,url FROM channels ORDER BY group_name,name,id")?;
+    let mut query = conn.prepare(
+        "SELECT c.id,c.name,c.group_name,c.logo<>'',s.id,s.catchup_source<>'' FROM channels c
+         JOIN channel_sources s ON s.id=(SELECT id FROM channel_sources WHERE channel_id=c.id ORDER BY position,id LIMIT 1)
+         ORDER BY c.group_name,c.name,c.id",
+    )?;
     let rows = query.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,
+            row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, bool>(5)?,
         ))
     })?;
     let mut playlist = String::from("#EXTM3U\n");
     for row in rows {
-        let (name, group, logo, url) = row?;
-        if !Url::parse(&url)
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
-        {
-            continue;
-        }
+        let (channel, name, group, has_logo, line, has_catchup) = row?;
+        let stream = format!("{origin}/tvbox/{token}/lines/{line}/stream");
+        let catchup = if has_catchup {
+            format!(
+                " catchup=\"default\" catchup-days=\"7\" catchup-source=\"{stream}?start={{utc}}&end={{utcend}}\""
+            )
+        } else {
+            String::new()
+        };
+        let logo = if has_logo {
+            format!("{origin}/tvbox/{token}/channels/{channel}/logo")
+        } else {
+            String::new()
+        };
         playlist.push_str(&format!(
-            "#EXTINF:-1 tvg-logo=\"{}\" group-title=\"{}\",{}\n{}\n",
-            m3u_attribute(&logo),
+            "#EXTINF:-1 tvg-logo=\"{logo}\" group-title=\"{}\"{catchup},{}\n{stream}\n",
             m3u_attribute(&group),
             m3u_attribute(&name),
-            url.replace(['\r', '\n'], "")
         ));
     }
     Ok((
@@ -501,6 +517,33 @@ async fn live(
         playlist,
     )
         .into_response())
+}
+
+async fn live_stream(
+    State(state): State<Shared>,
+    Path((token, id)): Path<(String, i64)>,
+    Query(query): Query<crate::playback::CatchupQuery>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let user = require_token(&state, &token)?;
+    crate::playback::line_stream(&state, user, Some(&token), id, query, headers).await
+}
+
+async fn live_grant(
+    State(state): State<Shared>,
+    Path((token, grant)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let user = require_token(&state, &token)?;
+    crate::playback::forward_grant(&state, user, Some(&token), &grant, headers).await
+}
+
+async fn live_logo(
+    State(state): State<Shared>,
+    Path((token, id)): Path<(String, i64)>,
+) -> Result<Response, AppError> {
+    require_token(&state, &token)?;
+    crate::playback::channel_logo(&state, id).await
 }
 
 async fn stream(
@@ -776,6 +819,14 @@ mod tests {
                     "新闻\"台",
                     "http://example.org/live.m3u8"
                 ],
+            )
+            .unwrap();
+        state
+            .conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO channel_sources(channel_id,url) SELECT id,url FROM channels",
+                [],
             )
             .unwrap();
         let Json(feed) = account_feed(State(state.clone()), user()).await.unwrap();

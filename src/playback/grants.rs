@@ -4,6 +4,7 @@ use super::{
 };
 use axum::{Router, extract::Path, routing::get};
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
@@ -32,7 +33,7 @@ pub(crate) fn no_redirect_client() -> Result<&'static reqwest::Client, AppError>
         .map_err(|_| AppError::internal("Could not initialize protected HTTP client"))
 }
 
-fn same_origin(first: &Url, second: &Url) -> bool {
+pub(super) fn same_origin(first: &Url, second: &Url) -> bool {
     first.scheme() == second.scheme()
         && first.host_str() == second.host_str()
         && first.port_or_known_default() == second.port_or_known_default()
@@ -97,17 +98,25 @@ struct Resources {
 
 struct Session {
     token: Uuid,
+    route: Cow<'static, str>,
+    live_root: Option<Url>,
     headers: HeaderMap,
     resources: Mutex<Resources>,
 }
 
 impl Session {
-    fn new(url: Url, headers: HeaderMap) -> Result<(Arc<Self>, String), AppError> {
-        let session = Arc::new(Self {
+    fn empty(headers: HeaderMap, route: Cow<'static, str>, live_root: Option<Url>) -> Arc<Self> {
+        Arc::new(Self {
             token: Uuid::new_v4(),
+            route,
+            live_root,
             headers,
             resources: Mutex::default(),
-        });
+        })
+    }
+
+    fn new(url: Url, headers: HeaderMap) -> Result<(Arc<Self>, String), AppError> {
+        let session = Self::empty(headers, GRANT_ROUTE.into(), None);
         let path = session.register(url, true)?;
         Ok((session, path))
     }
@@ -143,7 +152,8 @@ impl Session {
             })
             .unwrap_or("ts");
         Ok(format!(
-            "{GRANT_ROUTE}/{}-{index}.{ext}",
+            "{}/{}-{index}.{ext}",
+            self.route,
             self.token.simple()
         ))
     }
@@ -175,13 +185,23 @@ impl Session {
         )
         .await?;
         relay_response(response, requested_playlist, |bytes, base| {
-            rewrite_links(bytes, ad_block, |raw| {
-                let url = playlist_url(base, raw)?;
-                let trusted = trusted && same_origin(base, &url);
-                self.register(url, trusted)
-            })
+            self.rewrite(bytes, base, trusted, ad_block)
         })
         .await
+    }
+
+    fn rewrite(
+        &self,
+        bytes: &[u8],
+        base: &Url,
+        trusted: bool,
+        ad_block: bool,
+    ) -> Result<String, AppError> {
+        rewrite_links(bytes, ad_block, true, |raw| {
+            let url = playlist_url(base, raw)?;
+            let trusted = trusted && same_origin(base, &url);
+            self.register(url, trusted)
+        })
     }
 }
 
@@ -227,8 +247,16 @@ pub(crate) fn grant_url(
     headers: &HeaderMap,
 ) -> Result<String, AppError> {
     let (session, path) = Session::new(http_url(url)?, headers.clone())?;
+    store_session(
+        &mut state.playback_grants.0.lock().unwrap(),
+        user_id,
+        session,
+    );
+    Ok(path)
+}
+
+fn store_session(sessions: &mut VecDeque<BrowserGrant>, user_id: i64, session: Arc<Session>) {
     let now = Instant::now();
-    let mut sessions = state.playback_grants.0.lock().unwrap();
     sessions.retain(|grant| grant.expires > now);
     if sessions
         .iter()
@@ -247,7 +275,52 @@ pub(crate) fn grant_url(
         expires: now + GRANT_LIFETIME,
         session,
     });
-    Ok(path)
+}
+
+pub(super) async fn live_stream(
+    state: &Shared,
+    user_id: i64,
+    feed_token: Option<&str>,
+    url: Url,
+    private: HeaderMap,
+    mut range: HeaderMap,
+) -> Result<Response, AppError> {
+    let requested_playlist = super::playlist_path(&url);
+    if requested_playlist {
+        range.remove(header::RANGE);
+        range.remove(header::IF_RANGE);
+    }
+    let (upstream, trusted) = fetch_media(url.clone(), Some(&private), &range).await?;
+    relay_response(upstream, requested_playlist, |bytes, base| {
+        // Media playlists are polled frequently. Keep segment and key handles stable across reloads.
+        let route = grant_route(feed_token);
+        let mut sessions = state.playback_grants.0.lock().unwrap();
+        let session = sessions
+            .iter()
+            .find(|grant| {
+                grant.owner == user_id
+                    && grant.expires > Instant::now()
+                    && grant.session.route == route
+                    && grant.session.live_root.as_ref() == Some(&url)
+                    && grant.session.headers == private
+            })
+            .map(|grant| grant.session.clone())
+            .unwrap_or_else(|| {
+                let session = Session::empty(private, route, Some(url));
+                store_session(&mut sessions, user_id, session.clone());
+                session
+            });
+        drop(sessions);
+        session.rewrite(bytes, base, trusted, false)
+    })
+    .await
+}
+
+fn grant_route(feed_token: Option<&str>) -> Cow<'static, str> {
+    match feed_token {
+        Some(token) => format!("/tvbox/{token}/grants").into(),
+        None => GRANT_ROUTE.into(),
+    }
 }
 
 pub(super) async fn proxy(
@@ -256,7 +329,18 @@ pub(super) async fn proxy(
     Path(token): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let (id, index) = parse_token(&token)?;
+    forward_grant(&state, user.id, None, &token, headers).await
+}
+
+pub(crate) async fn forward_grant(
+    state: &Shared,
+    user_id: i64,
+    feed_token: Option<&str>,
+    token: &str,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let route = grant_route(feed_token);
+    let (id, index) = parse_token(token)?;
     let session = state
         .playback_grants
         .0
@@ -264,11 +348,14 @@ pub(super) async fn proxy(
         .unwrap()
         .iter()
         .find(|grant| {
-            grant.owner == user.id && grant.session.token == id && grant.expires > Instant::now()
+            grant.owner == user_id
+                && grant.session.token == id
+                && grant.session.route == route
+                && grant.expires > Instant::now()
         })
         .map(|grant| grant.session.clone())
         .ok_or_else(missing_grant)?;
-    let ad_block = play_settings(&*state.conn()?)?.ad_block;
+    let ad_block = session.live_root.is_none() && play_settings(&*state.conn()?)?.ad_block;
     session.forward(index, headers, ad_block).await
 }
 

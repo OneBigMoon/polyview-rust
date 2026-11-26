@@ -1793,6 +1793,31 @@ textarea {
 
 
 /* Live guide */
+.guide-date {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0;
+}
+.guide-date select, .channel-health select { width: auto; }
+.channel-health { margin-bottom: 16px; }
+.channel-health summary { width: fit-content; cursor: pointer; }
+.channel-health-list {
+  max-height: 20rem;
+  overflow: auto;
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+.channel-health-list li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px 16px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
 .live-guide {
   overflow: hidden;
   border: 1px solid var(--line);
@@ -1981,6 +2006,10 @@ textarea {
 .epg-program:hover {
   border-color: var(--accent-border);
   background: var(--accent-soft);
+}
+.epg-program.catchup {
+  border-color: var(--accent-border);
+  color: var(--accent);
 }
 .epg-program strong {
   overflow: hidden;

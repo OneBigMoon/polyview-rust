@@ -1,7 +1,10 @@
 mod grants;
+mod live;
 
 pub use grants::PlaybackGrants;
+pub(crate) use grants::forward_grant;
 pub(crate) use grants::{DownloadRelay, fetch_media, grant_url, no_redirect_client};
+pub(crate) use live::{CatchupQuery, channel_logo, line_stream};
 
 use crate::{AppError, Shared, auth::AuthUser, settings::play_settings};
 use axum::{
@@ -25,6 +28,8 @@ pub fn router() -> Router<Shared> {
     Router::new()
         .route("/api/playback", get(proxy))
         .route("/api/playback/grants/{token}", get(grants::proxy))
+        .route("/api/channels/lines/{id}/stream", get(live::stream))
+        .route("/api/channels/{id}/logo", get(live::logo))
         .route("/api/image", get(image))
 }
 
@@ -84,12 +89,47 @@ fn playlist_path(url: &Url) -> bool {
 }
 
 fn rewrite_playlist(bytes: &[u8], base: &Url, ad_block: bool) -> Result<String, AppError> {
-    rewrite_links(bytes, ad_block, |raw| proxy_url(base, raw))
+    rewrite_links(bytes, ad_block, false, |raw| proxy_url(base, raw))
+}
+
+fn playback_tag(line: &str) -> bool {
+    let tag = line.split(':').next().unwrap_or(line);
+    matches!(
+        tag,
+        "#EXTM3U"
+            | "#EXT-X-VERSION"
+            | "#EXT-X-INDEPENDENT-SEGMENTS"
+            | "#EXT-X-START"
+            | "#EXT-X-MEDIA"
+            | "#EXT-X-STREAM-INF"
+            | "#EXT-X-I-FRAME-STREAM-INF"
+            | "#EXT-X-SESSION-KEY"
+            | "#EXT-X-TARGETDURATION"
+            | "#EXT-X-MEDIA-SEQUENCE"
+            | "#EXT-X-DISCONTINUITY-SEQUENCE"
+            | "#EXT-X-ENDLIST"
+            | "#EXT-X-PLAYLIST-TYPE"
+            | "#EXT-X-I-FRAMES-ONLY"
+            | "#EXT-X-BYTERANGE"
+            | "#EXT-X-DISCONTINUITY"
+            | "#EXT-X-KEY"
+            | "#EXT-X-MAP"
+            | "#EXT-X-PROGRAM-DATE-TIME"
+            | "#EXT-X-GAP"
+            | "#EXT-X-BITRATE"
+            | "#EXT-X-PART-INF"
+            | "#EXT-X-SERVER-CONTROL"
+            | "#EXT-X-PART"
+            | "#EXT-X-PRELOAD-HINT"
+            | "#EXT-X-RENDITION-REPORT"
+            | "#EXT-X-SKIP"
+    )
 }
 
 fn rewrite_links(
     bytes: &[u8],
     ad_block: bool,
+    private: bool,
     mut link: impl FnMut(&str) -> Result<String, AppError>,
 ) -> Result<String, AppError> {
     let text =
@@ -102,6 +142,9 @@ fn rewrite_links(
     let mut lines = text.lines();
     let mut preserve = 0;
     while let Some(raw_line) = lines.next() {
+        if output.len() > MAX_PLAYLIST_BYTES * 4 {
+            return Err(source_error("Rewritten HLS playlist is too large"));
+        }
         let line = raw_line.trim();
         if preserve > 0 {
             preserve -= 1;
@@ -136,6 +179,26 @@ fn rewrite_links(
         if !line.starts_with('#') {
             output.push_str(&link(line)?);
         } else {
+            if private {
+                // Optional metadata and IPTV player options can contain signed URLs or headers.
+                if let Some(duration) = line.strip_prefix("#EXTINF:") {
+                    let duration = duration.split(',').next().unwrap_or_default().trim();
+                    if !duration
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+                    {
+                        return Err(source_error("Invalid protected playlist duration"));
+                    }
+                    output.push_str("#EXTINF:");
+                    output.push_str(duration);
+                    output.push_str(",\n");
+                    continue;
+                }
+                if !playback_tag(line) {
+                    continue;
+                }
+            }
+            let tag_start = output.len();
             let mut rest = line;
             while let Some(start) = rest.find("URI=\"") {
                 let value_start = start + 5;
@@ -148,9 +211,17 @@ fn rewrite_links(
                 output.push_str(&rest[..value_start]);
                 output.push_str(&link(&rest[value_start..end])?);
                 output.push('"');
+                if output.len() > MAX_PLAYLIST_BYTES * 4 {
+                    return Err(source_error("Rewritten HLS playlist is too large"));
+                }
                 rest = &rest[end + 1..];
             }
             output.push_str(rest);
+            if private && output[tag_start..].contains("://") {
+                return Err(source_error(
+                    "Unsupported external reference in protected playlist",
+                ));
+            }
         }
         output.push('\n');
     }
@@ -199,9 +270,11 @@ fn binary_content_type(upstream: &HeaderMap) -> Result<HeaderValue, AppError> {
                 | "binary/octet-stream"
                 | "application/mp4"
                 | "application/x-mpegts"
+                | "application/x-flv"
         )
     {
-        return Ok(raw.clone());
+        return HeaderValue::from_str(&content_type)
+            .map_err(|_| source_error("Source returned an invalid media type"));
     }
     if content_type == "text/plain" {
         return Ok(HeaderValue::from_static("application/octet-stream"));
@@ -241,6 +314,10 @@ async fn image(
         .send()
         .await
         .map_err(|_| source_error("Could not connect to the image source"))?;
+    raster_response(upstream).await
+}
+
+async fn raster_response(upstream: reqwest::Response) -> Result<Response, AppError> {
     if upstream.status() != StatusCode::OK {
         return Err(source_error("Image source returned an unsuccessful status"));
     }

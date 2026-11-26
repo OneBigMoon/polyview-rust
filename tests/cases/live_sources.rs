@@ -223,10 +223,16 @@ async fn disabled_subscription_discards_an_in_flight_playlist() {
 async fn custom_alias_precedes_builtin_mapping_during_xmltv_refresh() {
     let app = TestApp::new();
     let admin = app.setup().await;
-    let feed = r#"<tv><channel id="a"><display-name>世界地理</display-name></channel>
+    let (start, from, until): (i64, String, String) = app.state.conn().unwrap().query_row(
+        "SELECT unixepoch(), strftime('%Y%m%d%H%M%S','now'), strftime('%Y%m%d%H%M%S','now','+1 hour')", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    let feed = format!(
+        r#"<tv><channel id="a"><display-name>世界地理</display-name></channel>
         <channel id="b"><display-name>My feed</display-name></channel>
-        <programme channel="a" start="19700101000000 +0000" stop="19700101010000 +0000"><title>Default</title></programme>
-        <programme channel="b" start="19700101000000 +0000" stop="19700101010000 +0000"><title>Override</title></programme></tv>"#;
+        <programme channel="a" start="{from} +0000" stop="{until} +0000"><title>Default</title></programme>
+        <programme channel="b" start="{from} +0000" stop="{until} +0000"><title>Override</title></programme></tv>"#
+    );
     let (base, server) =
         serve(Router::new().route("/guide", get(move || async move { feed }))).await;
     let playlist = "#EXTM3U\n#EXTINF:-1,CCTV 世界地理\nhttps://stream.invalid/world\n";
@@ -281,7 +287,12 @@ async fn custom_alias_precedes_builtin_mapping_during_xmltv_refresh() {
             .json();
         assert_eq!(refreshed["matched_channels"], 1);
         let guide = app
-            .request("GET", "/api/epg?start=0&end=3600", Some(&admin), None)
+            .request(
+                "GET",
+                &format!("/api/epg?start={start}&end={}", start + 3600),
+                Some(&admin),
+                None,
+            )
             .await
             .json();
         assert_eq!(guide["programs"].as_array().unwrap().len(), 1);

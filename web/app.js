@@ -26,6 +26,8 @@
     onlineObserver: null,
     liveGroup: "all",
     epgOnlyCurrent: false,
+    guideDay: "live",
+    healthGroup: "",
     settingsTab: "account",
     sourceSettingsTab: "sources",
     showAllChannels: false,
@@ -639,20 +641,35 @@
     }
   }
   function liveSources(item) {
-    const sources = (item.sources || [])
-      .map((source) => (typeof source === "string" ? source : source.url))
-      .filter(Boolean);
-    return sources.length ? sources : item.url ? [item.url] : [];
+    const lines = (item.sources || []).map((line) => typeof line === "string" ? { url: line } : line)
+      .filter((line) => line && (line.id != null || line.url));
+    return lines.length ? lines : item.url ? [{ url: item.url }] : [];
   }
+  const supportsCatchup = (line) => line?.id != null && line.catchup === true;
   function liveUrl(player, index) {
-    const source = player.sources[index];
-    if (!player.shiftSeconds || !source) return source;
-    const url = new URL(source);
-    url.searchParams.set("start", String(-player.shiftSeconds));
-    return url.href;
+    const line = player.sources[index];
+    if (!line) return null;
+    if (line.id != null) {
+      const path = `/api/channels/lines/${encodeURIComponent(line.id)}/stream`;
+      if (player.program) return `${path}?start=${player.program.start}&end=${player.program.stop}`;
+      return player.shiftSeconds ? `${path}?start=${-player.shiftSeconds}` : path;
+    }
+    let url = line.url;
+    if (player.shiftSeconds) {
+      const shifted = new URL(url);
+      shifted.searchParams.set("start", String(-player.shiftSeconds));
+      url = shifted.href;
+    }
+    return `/api/playback?url=${encodeURIComponent(url)}`;
   }
   function paintTimeshift(player) {
     const bar = $("player-timeshift");
+    if (player.program) {
+      bar.replaceChildren(button("返回直播", "subtle small-button", () => {
+        if (state.player === player) play(player.item, true, player.playlist, player.playlistIndex);
+      }));
+      return;
+    }
     bar.replaceChildren(...[0, 5, 15, 30].map((minutes) => {
       const active = player.shiftSeconds === minutes * 60;
       return button(minutes ? `-${minutes}分` : "直播", `filter-chip${active ? " active" : ""}`, () => {
@@ -675,7 +692,7 @@
     control.disabled = true;
     try {
       const index = await Promise.any(player.sources.map(async (_, i) => {
-        const url = `/api/playback?url=${encodeURIComponent(liveUrl(player, i))}`;
+        const url = liveUrl(player, i);
         const response = await fetch(url, { method: "GET", cache: "no-store", signal: controller?.signal });
         response.body?.cancel().catch(() => {});
         if (!response.ok) throw new Error();
@@ -954,9 +971,7 @@
         ? `正在连接线路 ${player.sourceIndex + 1}/${player.sources.length}…`
         : "直播由服务器转发，请确认服务器能访问频道地址。"
       : "使用播放器控制开始播放。按 Esc 关闭。";
-    const upstream = player.live
-      ? liveUrl(player, player.sourceIndex)
-      : alternative?.url ?? player.item.remote_url;
+    const upstream = alternative?.url ?? player.item.remote_url;
     const line = alternative || player.item;
     const status = $("player-message");
     let source, hlsSource;
@@ -974,6 +989,14 @@
         return;
       }
       status.textContent = "播放地址已解析，正在载入视频…";
+    } else if (player.live) {
+      const liveLine = player.sources[player.sourceIndex];
+      source = liveUrl(player, player.sourceIndex);
+      if (!source) {
+        status.textContent = "频道没有可播放的线路。";
+        return;
+      }
+      hlsSource = (player.program ? liveLine.catchup_hls : null) ?? liveLine.hls ?? /\.m3u8(?:[?#]|$)/i.test(liveLine.url || "");
     } else {
       source = upstream ? `/api/playback?url=${encodeURIComponent(upstream)}` : `/api/library/${encodeURIComponent(player.item.id)}/stream`;
       hlsSource = /\.m3u8(?:[?#]|$)/i.test(upstream || source);
@@ -1000,7 +1023,7 @@
     video.onerror = () => fail("视频无法播放，请检查媒体地址或文件格式。");
     if (player.live)
       video.onplaying = () => {
-        if (current()) $("player-message").textContent = "正在直播。";
+        if (current()) $("player-message").textContent = player.program ? "正在回看。" : "正在直播。";
       };
     if (hlsSource && !nativeHls && window.Hls?.isSupported()) {
       const hls = new window.Hls({
@@ -1101,7 +1124,7 @@
       );
     });
   }
-  function play(item, live = false, playlist = [], playlistIndex = 0, autoplay = false) {
+  function play(item, live = false, playlist = [], playlistIndex = 0, autoplay = false, program = null) {
     if (state.player) closePlayer();
     state.player = {
       item,
@@ -1109,7 +1132,8 @@
       autoplay,
       resumePosition: n(item.position),
       sourcePending: false,
-      sources: live ? liveSources(item) : [],
+      program,
+      sources: live ? liveSources(item).filter((line) => !program || supportsCatchup(line)) : [],
       playlist,
       playlistIndex,
       sourceIndex: 0,
@@ -1125,9 +1149,9 @@
       introChecked: false,
       finishing: false,
     };
-    $("player-title").textContent = item.title || item.name || "正在播放";
+    $("player-title").textContent = program ? `${item.name} · ${program.title}` : item.title || item.name || "正在播放";
     $("player-kind").textContent = live
-      ? "LIVE NOW"
+      ? (program ? "节目回看" : "LIVE NOW")
       : item.series || "NOW PLAYING";
     $("player-dialog").classList.toggle("live-mode", live);
     $("player-stage").classList.toggle("live-mode", live);
@@ -1246,6 +1270,22 @@
     if ($("player-dialog").open) $("player-dialog").close();
   }
   const EPG_MINUTE_PX = 2;
+  const CATCHUP_SECONDS = 7 * 86400;
+  function guideDays(now) {
+    const midnight = new Date(now * 1000);
+    midnight.setHours(0, 0, 0, 0);
+    const days = [];
+    let end = new Date(midnight);
+    end.setDate(end.getDate() + 1);
+    while (end.getTime() / 1000 > now - CATCHUP_SECONDS) {
+      const key = String(midnight.getTime() / 1000);
+      days.push({ key, label: `${midnight.getMonth() + 1} 月 ${midnight.getDate()} 日`,
+        start: Math.max(Number(key), now - CATCHUP_SECONDS), end: end.getTime() / 1000 });
+      end = new Date(midnight);
+      midnight.setDate(midnight.getDate() - 1);
+    }
+    return days;
+  }
   function guideStart(now = Date.now() / 1000) {
     return Math.floor(now / 300) * 300;
   }
@@ -1270,6 +1310,7 @@
   function guideView(start, end, now = Math.floor(Date.now() / 1000), allChannels = state.channels) {
     const refreshGuide = () => $("live-guide")?.replaceChildren(guideView(start, end, now, allChannels));
     const guide = state.epg || {};
+    const trackWidth = (end - start) / 60 * EPG_MINUTE_PX;
     const programs = Array.isArray(guide.programs) ? guide.programs : [];
     const byChannel = new Map();
     programs.forEach((program) => {
@@ -1316,6 +1357,10 @@
       },
     );
     const jumpNow = button("回到现在", "subtle small-button", () => {
+      if (state.guideDay !== "live") {
+        state.guideDay = "live";
+        return render();
+      }
       if (scroller)
         scroller.scrollLeft = ((now - start) / 60) * EPG_MINUTE_PX;
     });
@@ -1323,7 +1368,7 @@
     const toolbar = make("div", { class: "epg-toolbar" }, [
       make("div", { class: "epg-meta" }, [
         make("span", {
-          text: `从当前节目开始 · ${
+          text: `${state.guideDay === "live" ? "从当前节目开始" : "节目回看"} · ${
             updated
               ? `节目单更新于 ${clockTime(updated)} · ${guide.matched_channels || 0} 个频道`
               : "尚未更新节目单"
@@ -1333,7 +1378,7 @@
       make("div", { class: "epg-actions" }, [
         panBack,
         panForward,
-        currentOnly,
+        state.guideDay === "live" ? currentOnly : null,
         jumpNow,
         admin() ? button("刷新节目单", "subtle small-button", refreshEpg) : null,
       ]),
@@ -1341,13 +1386,13 @@
     scroller = make("div", { class: "epg-scroll" });
     const inner = make("div", {
       class: "epg-inner",
-      style: `width:${170 + 1440 * EPG_MINUTE_PX}px`,
+      style: `width:${170 + trackWidth}px`,
     });
     const rulerRow = make("div", { class: "epg-row epg-ruler-row" });
     rulerRow.append(make("div", { class: "epg-channel epg-corner", text: "频道" }));
     const ruler = make("div", {
       class: "epg-track epg-ruler",
-      style: `width:${1440 * EPG_MINUTE_PX}px`,
+      style: `width:${trackWidth}px`,
     });
     for (
       let hour = Math.ceil(start / 3600) * 3600;
@@ -1392,12 +1437,14 @@
       ]));
       const track = make("div", {
         class: "epg-track",
-        style: `width:${1440 * EPG_MINUTE_PX}px`,
+        style: `width:${trackWidth}px`,
       });
+      const catchup = (channel.sources || []).some(supportsCatchup);
       const items = (byChannel.get(channel.id) || []).filter(
         (program) =>
-          program.stop > now &&
-          (!state.epgOnlyCurrent ||
+          program.stop > start && program.start < end &&
+          (program.stop > now || (catchup && program.start >= now - CATCHUP_SECONDS)) &&
+          (state.guideDay !== "live" || !state.epgOnlyCurrent ||
             (now >= program.start && now < program.stop)),
       );
       if (!items.length) {
@@ -1406,12 +1453,14 @@
       items.forEach((program) => {
         const left = Math.max(0, ((program.start - start) / 60) * EPG_MINUTE_PX);
         const right = Math.min(
-          1440 * EPG_MINUTE_PX,
+          trackWidth,
           ((program.stop - start) / 60) * EPG_MINUTE_PX,
         );
-        if (right - left < 2) return;
+        if (right <= left) return;
+        const past = program.stop <= now;
         const classes = [
           "epg-program",
+          past ? "catchup" : "",
           now >= program.start && now < program.stop ? "current" : "",
         ]
           .filter(Boolean)
@@ -1426,10 +1475,10 @@
               title: `${program.title} ${clockTime(program.start)}-${clockTime(program.stop)}${
                 program.description ? `\n${program.description}` : ""
               }`,
-              on: { click: () => play(channel, true, channels, channelIndex) },
-              },
-              [
-                make("strong", { text: program.title }),
+              on: { click: () => play(channel, true, channels, channelIndex, false, past ? program : null) },
+            },
+            [
+                make("strong", { text: `${past ? "回看 · " : ""}${program.title}` }),
                 make("small", {
                   text: `${clockTime(program.start)} - ${clockTime(program.stop)}`,
                 }),
@@ -1468,18 +1517,77 @@
         : empty("◉", "没有匹配的频道", "换一个分组或搜索词试试。"),
     ]);
   }
+  function channelHealth(channels) {
+    const groups = [...new Set(channels.map((channel) => channel.group_name).filter(Boolean))];
+    if (!groups.includes(state.healthGroup)) state.healthGroup = "";
+    const scope = make("select", { "aria-label": "测活和清理范围", on: { change: () => {
+      state.healthGroup = scope.value;
+      paintLines();
+    } } }, [make("option", { value: "", text: "全部分组" }),
+      ...groups.map((group) => make("option", { value: group, text: group }))]);
+    scope.value = state.healthGroup;
+    const rows = make("ul", { class: "channel-health-list" });
+    const details = make("details", { on: { toggle: paintLines } }, [make("summary", { text: "各线路状态与延迟" }), rows]);
+    function paintLines() {
+      if (!details.open) return;
+      const items = [];
+      for (const channel of channels) {
+        if (scope.value && channel.group_name !== scope.value) continue;
+        (channel.sources || []).forEach((line, index) => {
+          const health = line.fail_count > 0 ? `连续失败 ${line.fail_count} 次`
+            : line.last_ok_at != null || line.latency_ms != null ? "可用" : "未测活";
+          const label = line.label || `线路 ${index + 1}`;
+          const latency = line.latency_ms == null ? "" : ` · ${line.latency_ms} ms`;
+          const lastOk = line.last_ok_at ? ` · 上次成功 ${new Date(line.last_ok_at * 1000).toLocaleString()}` : "";
+          items.push(make("li", {}, [make("strong", { text: `${channel.name} · ${label}` }),
+            make("span", { class: line.fail_count > 0 ? "form-error" : "hint", text: `${health}${latency}${lastOk}` })]));
+        });
+      }
+      rows.replaceChildren(...items);
+    }
+    const status = make("p", { class: "hint", role: "status" });
+    const probe = button("一键测活/测速", "subtle", () => change(false));
+    const cleanup = button("清理失效线路", "subtle", () => change(true));
+    async function change(remove) {
+      if (probe.disabled || !admin()) return;
+      const group = scope.value;
+      if (remove && !window.confirm(`清理${group || "全部分组"}中连续失败至少 3 次的线路？`)) return;
+      probe.disabled = cleanup.disabled = scope.disabled = true;
+      status.textContent = remove ? "正在清理失效线路…" : "正在检测线路…";
+      try {
+        const result = await api(`/api/channels/${remove ? "cleanup" : "probe"}`, {
+          method: "POST", body: group ? { group } : {},
+        });
+        toast(remove ? `已清理 ${result.removed} 条失效线路` : `已检测 ${result.checked} 条线路，${result.healthy} 条可用，${result.failed} 条失败`);
+        if (state.page === "live") await render();
+      } catch (error) {
+        status.textContent = error.message;
+        toast(error.message, true);
+      } finally {
+        probe.disabled = cleanup.disabled = scope.disabled = false;
+      }
+    }
+    return make("section", { class: "panel channel-health" }, [make("h2", { text: "直播线路管理" }),
+      make("div", { class: "head-actions" }, [scope, probe, cleanup]), status, details]);
+  }
   async function live() {
+    const sequence = renderSequence;
     const result = await api("/api/channels");
     const allChannels = Array.isArray(result) ? result : result?.channels || [];
-    state.channels = allChannels;
     const now = Math.floor(Date.now() / 1000);
-    const start = guideStart(now);
-    const end = start + 86400;
+    const days = allChannels.some((channel) => channel.sources?.some(supportsCatchup)) ? guideDays(now) : [];
+    const day = days.find((entry) => entry.key === state.guideDay);
+    const start = day?.start ?? guideStart(now);
+    const end = day?.end ?? start + 86400;
+    let epg;
     try {
-      state.epg = await api(`/api/epg?start=${now - 6 * 3600}&end=${end}`);
+      epg = await api(`/api/epg?start=${day ? start : now - 6 * 3600}&end=${end}`);
     } catch (error) {
-      state.epg = { programs: [], updated_at: 0, error: error.message };
+      epg = { programs: [], error: error.message };
     }
+    if (sequence !== renderSequence) return;
+    state.guideDay = day?.key ?? "live";
+    state.epg = epg;
     const visible = channelsWithPrograms(allChannels, state.epg?.programs || []);
     const withoutEpg = allChannels.length - visible.length;
     state.channels = state.showAllChannels ? allChannels : visible;
@@ -1502,10 +1610,21 @@
                 },
               )
             : null,
-          admin() ? button("导入 M3U", "primary", importM3u) : null,
+          admin() ? button("导入频道列表", "primary", importM3u) : null,
         ]),
       ),
     );
+    if (admin() && allChannels.length) root.append(channelHealth(allChannels));
+    if (days.length) {
+      const select = make("select", { on: { change: () => {
+        state.guideDay = select.value;
+        return render();
+      } } }, [make("option", { value: "live", text: "当前与接下来" }),
+        ...days.map((entry) => make("option", { value: entry.key, text: entry.label }))]);
+      select.value = state.guideDay;
+      root.append(make("label", { class: "guide-date" }, ["节目单日期（近七天）", select]));
+    }
+    if (epg?.error) root.append(make("p", { class: "form-error", role: "alert", text: `节目单加载失败：${epg.error}` }));
     if (!state.channels.length && !allChannels.some((channel) => channel.favorite)) {
       const hasChannels = allChannels.length > 0;
       root.append(
@@ -1515,10 +1634,10 @@
           hasChannels
             ? "当前频道还没有可显示的节目，请刷新节目单或显示全部频道。"
             : admin()
-              ? "导入一个 M3U 播放列表，把电视带回家。"
-              : "请让管理员导入 M3U 播放列表。",
+              ? "导入 M3U 或 TXT 频道列表，把电视带回家。"
+              : "请让管理员导入频道列表。",
           admin() && !hasChannels
-            ? button("导入 M3U", "primary", importM3u)
+            ? button("导入频道列表", "primary", importM3u)
             : withoutEpg > 0
               ? button("显示全部频道", "subtle", () => {
                   state.showAllChannels = true;
@@ -1541,14 +1660,14 @@
         id: "import-playlist",
         required: true,
         maxlength: 1900000,
-        "aria-label": "M3U 频道列表",
+        "aria-label": "M3U 或 TXT 频道列表",
         placeholder:
           "#EXTM3U\n#EXTINF:-1,频道名称\nhttps://example.com/live.m3u8",
       });
       const file = make("input", {
         type: "file",
-        accept: ".m3u,.m3u8,text/plain",
-        "aria-label": "上传 M3U 文件",
+        accept: ".m3u,.m3u8,.txt,text/plain",
+        "aria-label": "上传频道列表文件",
         on: {
           change: async (event) => {
             const selected = event.target.files[0];
@@ -1574,12 +1693,12 @@
         },
         [
           make("div", { class: "dialog-top" }, [
-            make("h2", { id: "import-title", text: "导入 M3U 频道" }),
+            make("h2", { id: "import-title", text: "导入频道列表" }),
             icon("✕", "关闭频道导入", () => dialog.close()),
           ]),
           make("p", {
             class: "hint",
-            text: "粘贴多行播放列表，或选择本地 M3U / M3U8 文件。",
+            text: "粘贴频道列表，或选择本地 M3U、M3U8 或 TXT 分组文件。",
           }),
           make(
             "form",

@@ -6,6 +6,7 @@ use crate::{
     catalog::{SourceInput, adult_sources_enabled, validate_source},
     epg::{self, ChannelAlias},
     live_sources::SourceConfig,
+    network,
     notify::NotifySettings,
     source_subscriptions::{self, SubscriptionBackup},
 };
@@ -36,6 +37,12 @@ struct Backup {
         deserialize_with = "present",
         skip_serializing_if = "Option::is_none"
     )]
+    live_channels: Option<Vec<LiveChannel>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     source_subscriptions: Option<SubscriptionBackup>,
     epg_config: EpgConfig,
     app_settings: SiteSettings,
@@ -46,6 +53,28 @@ struct SourceEntry<T> {
     id: i64,
     #[serde(flatten)]
     config: T,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveChannel {
+    name: String,
+    group_name: String,
+    logo: String,
+    tvg_id: String,
+    url: String,
+    sources: Vec<LiveLine>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveLine {
+    url: String,
+    label: String,
+    position: i64,
+    headers_json: String,
+    catchup_mode: String,
+    catchup_source: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,6 +132,7 @@ async fn export(State(state): State<Shared>, user: AuthUser) -> Result<Json<Back
         exported_at: crate::now(),
         catalog_sources: export_catalog(&tx)?,
         live_sources: export_live(&tx)?,
+        live_channels: Some(export_channels(&tx)?),
         source_subscriptions: Some(source_subscriptions::export_config(&tx)?),
         epg_config: EpgConfig {
             url: tx.query_row("SELECT value FROM settings WHERE key='epg_url'", [], |r| {
@@ -165,6 +195,95 @@ fn export_live(conn: &Connection) -> Result<Vec<SourceEntry<SourceConfig>>, AppE
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+fn export_channels(conn: &Connection) -> Result<Vec<LiveChannel>, AppError> {
+    let mut channels =
+        conn.prepare("SELECT id,name,group_name,logo,tvg_id,url FROM channels ORDER BY url")?;
+    let mut sources = conn.prepare(
+        "SELECT url,label,position,headers_json,catchup_mode,catchup_source FROM channel_sources
+         WHERE channel_id=? ORDER BY position,id",
+    )?;
+    let rows = channels.query_map([], |r| {
+        let lines = sources.query_map([r.get::<_, i64>(0)?], |line| {
+            Ok(LiveLine {
+                url: line.get(0)?,
+                label: line.get(1)?,
+                position: line.get(2)?,
+                headers_json: line.get(3)?,
+                catchup_mode: line.get(4)?,
+                catchup_source: line.get(5)?,
+            })
+        })?;
+        Ok(LiveChannel {
+            name: r.get(1)?,
+            group_name: r.get(2)?,
+            logo: r.get(3)?,
+            tvg_id: r.get(4)?,
+            url: r.get(5)?,
+            sources: lines.collect::<Result<_, _>>()?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn restore_channels(conn: &Connection, channels: &[LiveChannel]) -> Result<(), AppError> {
+    let mut save_channel = conn.prepare(
+        "INSERT INTO channels(name,group_name,logo,tvg_id,url) VALUES(?,?,?,?,?)
+         ON CONFLICT(url) DO UPDATE SET name=excluded.name,group_name=excluded.group_name,
+         logo=excluded.logo,tvg_id=excluded.tvg_id RETURNING id",
+    )?;
+    let mut save_line = conn.prepare(
+        "INSERT INTO channel_sources(channel_id,url,label,position,headers_json,catchup_mode,catchup_source)
+         VALUES(?,?,?,?,?,?,?) ON CONFLICT(channel_id,url) DO UPDATE SET label=excluded.label,
+         position=excluded.position,headers_json=excluded.headers_json,
+         catchup_mode=excluded.catchup_mode,catchup_source=excluded.catchup_source",
+    )?;
+    let mut seen_channels = HashSet::new();
+    for channel in channels {
+        network::validate_channel_metadata(
+            &channel.name,
+            &channel.group_name,
+            &channel.tvg_id,
+            &channel.logo,
+        )?;
+        let url = network::live_url(&channel.url)?;
+        let id: i64 = save_channel.query_row(
+            params![
+                channel.name,
+                channel.group_name,
+                channel.logo,
+                channel.tvg_id,
+                url.as_str()
+            ],
+            |r| r.get(0),
+        )?;
+        if !seen_channels.insert(id) {
+            return Err(AppError::bad_request("Duplicate backup channel"));
+        }
+        let mut seen_lines = HashSet::new();
+        for line in &channel.sources {
+            let url = network::live_url(&line.url)?;
+            network::live_headers(&line.headers_json)?;
+            network::validate_catchup(&line.catchup_mode, &line.catchup_source)?;
+            if line.position < 0 || line.label.chars().any(char::is_control) {
+                return Err(AppError::bad_request("Invalid channel line metadata"));
+            }
+            save_line.execute(params![
+                id,
+                url.as_str(),
+                line.label,
+                line.position,
+                line.headers_json,
+                line.catchup_mode,
+                line.catchup_source
+            ])?;
+            if !seen_lines.insert(url) {
+                return Err(AppError::bad_request("Duplicate line in backup channel"));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn import(
     State(state): State<Shared>,
     user: AuthUser,
@@ -194,6 +313,9 @@ async fn import(
     restore_live(&tx, backup.live_sources)?;
     if let Some((config, manual_urls)) = subscriptions {
         source_subscriptions::restore_config(&tx, config, &manual_urls)?;
+    }
+    if let Some(channels) = backup.live_channels {
+        restore_channels(&tx, &channels)?;
     }
     tx.commit()?;
     state.playback_grants.clear();

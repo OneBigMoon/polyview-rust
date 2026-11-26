@@ -114,9 +114,15 @@ async fn disabled_members_lose_sessions_login_and_every_tvbox_feed() {
     );
     assert_eq!(app.login("viewer", PASSWORD).await.status, StatusCode::OK);
     assert_eq!(
-        app.request("GET", feed["live_path"].as_str().unwrap(), None, None)
-            .await
-            .status,
+        app.request_with_headers(
+            "GET",
+            feed["live_path"].as_str().unwrap(),
+            None,
+            None,
+            &[("host", "nas.test")]
+        )
+        .await
+        .status,
         StatusCode::OK
     );
 }

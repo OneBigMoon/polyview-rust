@@ -1,3 +1,5 @@
+mod probe;
+
 use crate::{
     AppError, Shared,
     auth::{AuthUser, require_admin},
@@ -31,6 +33,8 @@ pub fn router() -> Router<Shared> {
         .route("/api/live-sources", get(list).post(create))
         .route("/api/live-sources/{id}", put(update).delete(remove))
         .route("/api/live-sources/refresh", post(refresh))
+        .route("/api/channels/probe", post(probe::run))
+        .route("/api/channels/cleanup", post(probe::cleanup))
 }
 
 #[derive(Deserialize, Serialize)]

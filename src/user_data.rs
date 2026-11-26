@@ -290,7 +290,7 @@ async fn favorites(State(state): State<Shared>, user: AuthUser) -> Result<Json<V
     let local = stmt
         .query_map([user.id], crate::library::media_row)?
         .collect::<Result<Vec<_>, _>>()?;
-    let channels = network::channels_for_user(&conn, user.id, true)?;
+    let channels = network::channels_for_user(&conn, &user, true)?;
     Ok(Json(
         json!({"catalog":catalog,"local":local,"channels":channels}),
     ))

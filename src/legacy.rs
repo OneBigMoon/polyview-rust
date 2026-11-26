@@ -1057,7 +1057,7 @@ mod tests {
             INSERT INTO search_history VALUES(9,'Disabled',1700000000000);").unwrap();
         state.conn().unwrap().execute_batch("INSERT INTO users(id,username,password_hash,role,created_at) VALUES(91,'matched','existing','user',1);
             INSERT INTO catalog_sources(id,name,url) VALUES(15,'Matched source','https://example.org/cms');
-            INSERT INTO channels VALUES(4,'News','A','','https://example.org/a'),(8,'News','B','','https://example.org/b');
+            INSERT INTO channels(id,name,group_name,logo,url) VALUES(4,'News','A','','https://example.org/a'),(8,'News','B','','https://example.org/b');
             INSERT INTO channel_sources(channel_id,url) VALUES(4,'https://example.org/alt');").unwrap();
 
         let report = import_legacy(&state, &path, None).unwrap();
