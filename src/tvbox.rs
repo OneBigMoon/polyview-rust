@@ -31,6 +31,11 @@ pub fn router() -> Router<Shared> {
         .route("/api/tvbox/token", post(rotate_token))
         .route("/tvbox/{token}/config.json", get(config))
         .route("/tvbox/{token}/vod", get(catalog))
+        .route("/tvbox/{token}/telegram/vod", get(telegram_catalog))
+        .route(
+            "/tvbox/{token}/telegram/stream/{chat}/{id}",
+            get(telegram_stream),
+        )
         .route("/tvbox/{token}/source/{source_id}", get(source_catalog))
         .route("/tvbox/{token}/live.m3u", get(live))
         .route("/tvbox/{token}/lines/{id}/stream", get(live_stream))
@@ -175,7 +180,7 @@ async fn config(
     Query(query): Query<ConfigQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    require_token(&state, &token)?;
+    let owner = require_token(&state, &token)?;
     let origin = origin(&state, &headers)?;
     let mut sites = vec![json!({
         "key": "polyview_local", "name": "PolyView 媒体库", "type": 1,
@@ -194,6 +199,13 @@ async fn config(
                 })
             }),
     );
+    if crate::telegram::stream::has_session(&*state.conn()?, owner)? {
+        sites.push(json!({
+            "key": "polyview_telegram", "name": "Telegram", "type": 1,
+            "api": format!("{origin}/tvbox/{token}/telegram/vod"),
+            "searchable": 0, "quickSearch": 0, "filterable": 0
+        }));
+    }
     let config = json!({
         "sites": sites,
         "lives": [{"name":"PolyView 直播", "type":0, "url":format!("{origin}/tvbox/{token}/live.m3u")}],
@@ -339,6 +351,113 @@ struct VodItem {
 
 fn protocol_label(raw: &str) -> String {
     raw.replace(['$', '#', '\n', '\r'], " ")
+}
+
+fn telegram_item(message: crate::telegram::browse::Message, feed: &str) -> Value {
+    let chat = message.chat_id;
+    let id = message.id;
+    let name = if message.file_name.is_empty() {
+        message
+            .text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map_or_else(
+                || format!("Telegram 视频 {id}"),
+                |line| line.trim().to_owned(),
+            )
+    } else {
+        message.file_name
+    };
+    json!({
+        "vod_id": format!("{chat}:{id}"), "type_id": chat.to_string(),
+        "vod_name": name, "vod_pic": message.thumbnail.unwrap_or_default(),
+        "vod_content": message.text, "vod_play_from": "Telegram",
+        "vod_play_url": format!("播放${feed}/stream/{chat}/{id}")
+    })
+}
+
+async fn telegram_catalog(
+    State(state): State<Shared>,
+    Path(token): Path<String>,
+    Query(query): Query<CatalogQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    use crate::telegram::browse;
+    let owner = require_token(&state, &token)?;
+    let feed = format!("{}/tvbox/{token}/telegram", origin(&state, &headers)?);
+    let page = query.pg.unwrap_or(1).max(1);
+    let mut list = Vec::new();
+    let mut classes = Vec::new();
+    let mut has_next = false;
+    if let Some(ids) = query.ids.filter(|ids| !ids.is_empty()) {
+        if ids.len() > 2000 || ids.split(',').count() > PAGE_SIZE {
+            return Err(AppError::bad_request("Too many Telegram video IDs"));
+        }
+        for id in ids.split(',') {
+            let invalid = || AppError::bad_request("Invalid Telegram video ID");
+            let (chat, post) = id.split_once(':').ok_or_else(invalid)?;
+            let message = browse::message(
+                &state,
+                owner,
+                chat.parse().map_err(|_| invalid())?,
+                post.parse().map_err(|_| invalid())?,
+            )
+            .await?;
+            if message.is_video {
+                list.push(telegram_item(message, &feed));
+            }
+        }
+    } else if let Some(chat) = query.t.filter(|id| !id.is_empty()) {
+        let chat = chat
+            .parse()
+            .map_err(|_| AppError::bad_request("Invalid Telegram chat ID"))?;
+        let word = query.wd.as_deref().unwrap_or_default();
+        // TVBox uses page numbers while Telegram uses exclusive message cursors.
+        // Bound the upstream work of any single unaided random-page request.
+        if page > 100 || word.chars().count() > 200 {
+            return Err(AppError::bad_request("Telegram catalog query is too large"));
+        }
+        let mut cursor = 0;
+        for current in 1..=page {
+            let result = browse::messages(&state, owner, chat, word, cursor).await?;
+            let next = result
+                .next_offset
+                .filter(|&id| id > 0 && (cursor == 0 || id < cursor));
+            if current == page {
+                has_next = next.is_some() && page < 100;
+                list.extend(
+                    result
+                        .messages
+                        .into_iter()
+                        .filter(|m| m.is_video)
+                        .map(|m| telegram_item(m, &feed)),
+                );
+                break;
+            }
+            let Some(next) = next else { break };
+            cursor = next;
+        }
+    } else {
+        classes = browse::chats(&state, owner)
+            .await?
+            .into_iter()
+            .map(|c| json!({"type_id":c.id.to_string(),"type_name":c.title}))
+            .collect();
+    }
+    Ok(Json(
+        json!({"code":1, "msg":"ok", "page":page, "pagecount":page.saturating_add(usize::from(has_next)),
+        "limit":list.len(), "total":list.len(), "class":classes, "list":list}),
+    ))
+}
+
+async fn telegram_stream(
+    State(state): State<Shared>,
+    Path((token, chat, id)): Path<(String, i64, i64)>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let owner = require_token(&state, &token)?;
+    crate::telegram::stream::serve(&state, owner, chat, id, &method, &headers).await
 }
 
 fn local_items(state: &Shared, token: &str, origin: &str) -> Result<Vec<VodItem>, AppError> {
@@ -604,11 +723,14 @@ mod tests {
         library::init_schema(&conn).unwrap();
         network::init_schema(&conn).unwrap();
         catalog::init_schema(&conn).unwrap();
+        crate::settings::init_schema(&conn).unwrap();
+        crate::telegram::init_schema(&conn).unwrap();
         init_schema(&conn).unwrap();
         conn.execute("INSERT INTO users(id,username,password_hash,role,created_at) VALUES(1,'viewer','unused','user',0)",[]).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
             playback_grants: Default::default(),
+            telegram_native: Default::default(),
             download_runtime: Default::default(),
             download_dir: media_dir.join("downloads"),
             media_dir,

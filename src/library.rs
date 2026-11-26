@@ -607,6 +607,7 @@ mod tests {
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
             playback_grants: Default::default(),
+            telegram_native: Default::default(),
             download_runtime: Default::default(),
             media_dir: media.clone(),
             download_dir: media.join("downloads"),

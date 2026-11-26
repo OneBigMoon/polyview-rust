@@ -8,6 +8,8 @@ description = "A self-hosted NAS media library and live TV hub"
 
 [dependencies]
 argon2 = "0.5.3"
+base64 = "0.22"
+libloading = "0.7.4"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 axum = "0.8.9"
 futures-util = "0.3.32"

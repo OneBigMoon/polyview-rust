@@ -55,6 +55,7 @@ fn sample(backup: &mut Value) {
     backup["app_settings"] = json!({
         "adult_sources_enabled":true,"epg_aliases":[{"from":"News HD","to":"News"}],
         "downloads":downloads,
+        "telegram_native":{"api_id":1234,"api_hash":"0123456789abcdef0123456789abcdef"},
         "calendar":{"enabled":false,"api_url":"https://calendar.invalid/feed"},
         "notify":{"bark_url":"https://alerts.invalid/private/token","webhook_post_url":"","webhook_get_url":""},
         "play":{"ad_block":true,"play_ua":"Fixture","play_referer":"","image_referer":""},

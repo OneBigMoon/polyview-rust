@@ -38,6 +38,7 @@ pub type Shared = Arc<AppState>;
 pub struct AppState {
     pub db: Mutex<Connection>,
     pub playback_grants: playback::PlaybackGrants,
+    pub telegram_native: telegram::native::NativeRuntime,
     pub download_runtime: network::DownloadRuntime,
     pub media_dir: PathBuf,
     pub download_dir: PathBuf,

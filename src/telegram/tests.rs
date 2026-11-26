@@ -52,6 +52,7 @@ test -f "${4#type=bolt,path=}/$2.fixture"
         let state = Arc::new(AppState {
             db: std::sync::Mutex::new(conn),
             playback_grants: Default::default(),
+            telegram_native: Default::default(),
             download_runtime: Default::default(),
             media_dir: temp.path().join("media"),
             download_dir: temp.path().join("downloads"),

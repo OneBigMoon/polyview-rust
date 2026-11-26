@@ -997,6 +997,10 @@
         return;
       }
       hlsSource = (player.program ? liveLine.catchup_hls : null) ?? liveLine.hls ?? /\.m3u8(?:[?#]|$)/i.test(liveLine.url || "");
+    } else if (player.item.telegram) {
+      const { chat, message } = player.item.telegram;
+      source = `/api/telegram/stream/${encodeURIComponent(chat)}/${encodeURIComponent(message)}`;
+      hlsSource = false;
     } else {
       source = upstream ? `/api/playback?url=${encodeURIComponent(upstream)}` : `/api/library/${encodeURIComponent(player.item.id)}/stream`;
       hlsSource = /\.m3u8(?:[?#]|$)/i.test(upstream || source);
@@ -1187,6 +1191,7 @@
     if (
       !current ||
       current.live ||
+      current.item.telegram ||
       current.sourcePending ||
       !Number.isFinite(video.currentTime) ||
       !Number.isFinite(video.duration) ||
@@ -3230,16 +3235,23 @@
       const [label, cls] = status(job);
       const total = n(job.total_bytes),
         written = n(job.bytes_written);
+      const percent = job.percent ?? (total > 0 ? 100 * written / total : null);
+      const transfer = [];
+      if (job.kind === "telegram") {
+        if (percent != null) transfer.push(`${Math.round(Math.min(100, Math.max(0, n(percent))))}%`);
+        if (job.bytes_per_second > 0 && statusGroup(job) === "running") transfer.push(`${telegramBytes(job.bytes_per_second)}/s`);
+      }
       const row = make("article", { class: "download-row" }, [
         make("div", { class: "download-title" }, [
           make("strong", { text: job.title }),
-          make("small", { text: job.kind === "telegram" ? "Telegram 视频" : job.error || job.relative_path || "视频下载" }),
+          make("small", { text: job.kind === "telegram" ? ["Telegram 视频", ...transfer].join(" · ") : job.error || job.relative_path || "视频下载" }),
         ]),
-        total
+        total || percent != null
           ? make("progress", {
               class: "download-progress",
-              max: total,
-              value: written,
+              max: total || 100,
+              value: total ? written : percent,
+              "aria-label": `${job.title} 下载进度`,
             })
           : make("span", {
               class: "small muted",
@@ -3262,13 +3274,250 @@
     });
     return list;
   }
-  async function telegramPanel(current, refreshQueue) {
+  function telegramBytes(bytes) {
+    const size = Math.max(0, n(bytes));
+    if (size < 1024) return `${size} B`;
+    if (size < 1048576) return `${(size / 1024).toFixed(1)} KiB`;
+    if (size < 1073741824) return `${(size / 1048576).toFixed(1)} MiB`;
+    return `${(size / 1073741824).toFixed(1)} GiB`;
+  }
+
+  // Keep a submitted operation tied to the account, panel and channel that created it.
+  async function telegramAction(control, current, action) {
+    if (!current() || control.disabled) return;
+    control.disabled = true;
+    try { await action(); }
+    catch (_) { if (current()) toast("操作失败，请检查授权状态后重试。", true); }
+    finally { control.disabled = false; }
+  }
+  function telegramButton(label, current, action) {
+    const control = button(label, "subtle small-button", () => telegramAction(control, current, action));
+    return control;
+  }
+  function telegramForm(label, name, hint, current, submit) {
+    const field = make("input", { name, type: "text", required: true, placeholder: hint, "aria-label": hint });
+    const control = button(label, "subtle small-button", null, { type: "submit" });
+    return make("form", { class: "form-row", on: { submit: (event) => {
+      event.preventDefault();
+      return telegramAction(control, current, () => submit(field));
+    } } }, [field, control]);
+  }
+  async function telegramKeywords(container, chat, current) {
+    const path = "/api/telegram/subscriptions";
+    const list = make("div", { class: "telegram-rules" });
+    const form = telegramForm("订阅关键词", "telegram_keyword", "匹配新视频的关键词", current, async (field) => {
+      await api(path, { method: "POST", body: { chat_id: chat.id, keyword: field.value.trim() } });
+      if (current()) { field.value = ""; await load(); }
+    });
+    container.append(make("summary", { text: "频道关键词订阅" }), form, list);
+    let revision = 0;
+    async function load() {
+      const request = ++revision;
+      const active = () => current() && request === revision;
+      try {
+        const rules = await api(path);
+        if (!active()) return;
+        const rows = rules.filter((rule) => rule.chat_id === chat.id).map((rule) => {
+          const endpoint = `${path}/${encodeURIComponent(rule.id)}`;
+          const update = async (options) => { await api(endpoint, options); if (active()) await load(); };
+          return make("div", { class: "telegram-rule" }, [make("strong", { text: rule.keyword }),
+            make("span", { class: "muted", text: rule.enabled ? "自动加入下载" : "已暂停" }),
+            telegramButton(rule.enabled ? "暂停订阅" : "恢复订阅", active, () => update({ method: "PUT", body: { enabled: !rule.enabled } })),
+            telegramButton("删除订阅", active, () => update({ method: "DELETE" })),
+          ]);
+        });
+        list.replaceChildren(...(rows.length ? rows : [make("p", { class: "hint", text: "此频道还没有关键词订阅。" })]));
+      } catch (_) { if (active()) list.replaceChildren(make("p", { role: "status", text: "无法读取关键词订阅。" }), telegramButton("重试读取订阅", active, load)); }
+    }
+    await load();
+  }
+
+  function telegramMessage(chat, msg, current, refreshQueue) {
+    const title = msg.file_name || (msg.is_video ? `视频 #${msg.id}` : `资源 #${msg.id}`);
+    const row = make("article", { class: "telegram-message" });
+    if (msg.thumbnail?.startsWith("data:image/jpeg;base64,")) row.append(make("img", { src: msg.thumbnail, alt: "", loading: "lazy" }));
+    const info = make("div", { class: "telegram-message-info" }, make("h4", { text: title }));
+    const metadata = [msg.file_size > 0 && telegramBytes(msg.file_size), msg.duration > 0 && `${Math.floor(msg.duration / 60)}:${String(msg.duration % 60).padStart(2, "0")}`, msg.media_group_id && "相册"].filter(Boolean);
+    if (metadata.length) info.append(make("span", { class: "small muted", text: metadata.join(" · ") }));
+    if (msg.text) info.append(make("p", { text: msg.text }));
+    const links = make("div", { class: "telegram-links" });
+    for (const raw of msg.cloud_urls || []) {
+      let url;
+      try { url = new URL(raw); } catch (_) { continue; }
+      if (["https:", "http:"].includes(url.protocol)) links.append(make("a", { href: url.href, target: "_blank", rel: "noopener noreferrer", text: url.href }));
+    }
+    if (links.children.length) info.append(links);
+    if (msg.is_video) {
+      const queue = async (single) => {
+        const result = await api(`/api/telegram/chats/${encodeURIComponent(chat.id)}/messages/${encodeURIComponent(msg.id)}/download`, { method: "POST", body: single ? { single: true } : {} });
+        if (!current()) return;
+        toast(result.queued ? `已加入 ${result.queued} 个下载任务` : "视频已在下载队列中");
+        await refreshQueue();
+      };
+      const actions = make("div", { class: "head-actions" }, [telegramButton("在线播放", current, () => play({ title, telegram: { chat: chat.id, message: msg.id } }, false, [], 0, true)),
+        telegramButton("下载视频", current, () => queue(true))]);
+      if (msg.media_group_id) actions.append(telegramButton("下载整个相册", current, () => queue(false)));
+      info.append(actions);
+    }
+    row.append(info);
+    return row;
+  }
+
+  async function telegramChannel(container, chat, current, favorite, refreshQueue) {
+    const search = make("input", { type: "search", name: "telegram_query", placeholder: "搜索视频与资源", "aria-label": "搜索视频与资源" });
+    const results = make("div", { class: "telegram-messages", "aria-live": "polite" });
+    const keywords = make("details", { class: "telegram-keywords" });
+    let query = "", offsets = [0], revision = 0;
+    const form = make("form", { class: "form-row", on: { submit: (event) => {
+      event.preventDefault();
+      query = search.value.trim(); offsets = [0]; return load();
+    } } }, [search, button("搜索消息", "subtle small-button", null, { type: "submit" })]);
+    container.replaceChildren(make("div", { class: "telegram-channel-head" }, [make("h3", { text: chat.title }),
+      telegramButton(chat.favorite ? "取消收藏频道" : "收藏频道", current, () => favorite(chat))]), form, results, keywords);
+    async function load() {
+      if (!current()) return;
+      const request = ++revision;
+      const active = () => current() && request === revision;
+      results.textContent = "正在读取频道消息…";
+      try {
+        const params = new URLSearchParams({ q: query, offset: offsets[offsets.length - 1] });
+        const page = await api(`/api/telegram/chats/${encodeURIComponent(chat.id)}/messages?${params}`);
+        if (!active()) return;
+        results.replaceChildren(...page.messages.map((msg) => telegramMessage(chat, msg, active, refreshQueue)));
+        if (!page.messages.length) {
+          const partial = offsets.length > 1 || page.next_offset != null;
+          results.textContent = partial ? "本页没有匹配的视频或资源。" : query ? "没有匹配的视频或资源。" : "这个频道暂无视频或资源。";
+        }
+        const pager = make("div", { class: "head-actions" });
+        if (offsets.length > 1) pager.append(telegramButton("上一页消息", active, () => { offsets.pop(); return load(); }));
+        if (page.next_offset != null && !offsets.includes(page.next_offset)) pager.append(telegramButton("下一页消息", active, () => { offsets.push(page.next_offset); return load(); }));
+        if (pager.children.length) results.append(pager);
+      } catch (_) { if (active()) results.replaceChildren(make("p", { text: "无法读取此频道消息，请检查频道访问权限。" }), telegramButton("重试消息", active, load)); }
+    }
+    await Promise.all([load(), telegramKeywords(keywords, chat, current)]);
+  }
+
+  async function telegramBrowser(container, current, refreshQueue) {
+    const path = "/api/telegram/favorites";
+    const sidebar = make("aside", { class: "telegram-sidebar", "aria-label": "Telegram 频道" });
+    const chats = make("div", { class: "telegram-chats" });
+    const detail = make("section", { class: "telegram-channel" });
+    const workspace = make("div", { class: "telegram-workspace" }, [sidebar, detail]);
+    let selected, revision = 0, chatRevision = 0, entries = [];
+    sidebar.append(make("h3", { text: "频道与群组" }), chats,
+      telegramForm("添加收藏源", "telegram_channel", "@频道名或频道 ID", current, async (field) => {
+        await api(path, { method: "PUT", body: { channel: field.value.trim() } });
+        if (current()) { field.value = ""; await load(); }
+      }));
+    container.replaceChildren(workspace);
+    async function favorite(chat) {
+      if (chat.favorite) await api(`${path}/${encodeURIComponent(chat.id)}`, { method: "DELETE" });
+      else await api(path, { method: "PUT", body: { channel: String(chat.id) } });
+      if (current()) await load();
+    }
+    async function select(chat) {
+      if (!current()) return;
+      const request = ++chatRevision;
+      selected = chat.id;
+      chats.replaceChildren(...entries.map((entry) => button(`${entry.favorite ? "★ " : ""}${entry.title}`, `telegram-chat${selected === entry.id ? " active" : ""}`, () => select(entry), { "aria-pressed": String(selected === entry.id) })));
+      await telegramChannel(detail, chat, () => current() && request === chatRevision, favorite, refreshQueue);
+    }
+    async function load() {
+      const request = ++revision;
+      const active = () => current() && request === revision;
+      ++chatRevision;
+      chats.textContent = "正在读取频道…";
+      detail.replaceChildren();
+      try {
+        const loaded = await api("/api/telegram/chats");
+        if (!active()) return;
+        entries = loaded;
+        if (!entries.length) { chats.textContent = "暂无频道，可添加收藏源。"; return; }
+        await select(entries.find((entry) => entry.id === selected) || entries[0]);
+      } catch (_) { if (active()) chats.replaceChildren(make("p", { text: "无法读取频道列表。" }), telegramButton("重试频道列表", active, load)); }
+    }
+    await load();
+  }
+
+  async function telegramNativeSettings(current) {
+    const path = "/api/settings/telegram/native";
+    const panel = make("details", { class: "panel" }, make("summary", { text: "Telegram 原生 API 设置" }));
+    const status = make("p", { role: "status" });
+    const apiId = make("input", { type: "password", inputmode: "numeric", pattern: "[1-9][0-9]*", name: "api_id", required: true, autocomplete: "new-password" });
+    const hash = make("input", { type: "password", pattern: "[0-9a-fA-F]{32}", name: "api_hash", required: true, autocomplete: "new-password" });
+    const submit = button("保存 API 凭据", "primary", null, { type: "submit" });
+    const describe = (saved) => { status.textContent = saved.configured ? "已配置。重新保存将同时替换 API ID 与 Hash。" : "请填写 Telegram 应用的 API ID 与 Hash。"; };
+    panel.append(status, make("form", { class: "form-row", on: { submit: async (event) => {
+      event.preventDefault();
+      if (!current() || submit.disabled) return;
+      submit.disabled = true;
+      try {
+        const saved = await api(path, { method: "PUT", body: { api_id: Number(apiId.value), api_hash: hash.value.trim() } });
+        if (current()) { describe(saved); toast("Telegram API 凭据已保存，可刷新授权状态"); }
+      } catch (_) { if (current()) status.textContent = "保存失败，请检查 API 凭据和管理员权限。"; }
+      finally { apiId.value = ""; hash.value = ""; submit.disabled = false; }
+    } } }, [make("label", {}, ["API ID", apiId]), make("label", {}, ["API Hash", hash]), submit]));
+    try { const saved = await api(path); if (current()) describe(saved); }
+    catch (_) { if (current()) status.textContent = "无法读取配置状态。"; }
+    return panel;
+  }
+
+  async function telegramNativePanel(current, refreshQueue) {
+    const path = "/api/telegram/native/login";
+    const status = make("p", { role: "status" });
+    const actions = make("div", { class: "head-actions" });
+    const content = make("div");
+    const panel = make("section", { class: "panel telegram-panel" }, [make("h2", { text: "Telegram 资源库" }), status, actions, content]);
+    const labels = {
+      unconfigured: "请管理员先在 Telegram 原生 API 设置中配置凭据。",
+      idle: "连接自己的 Telegram 账户后，可浏览频道视频和资源。",
+      confirm: `请在运行 PolyView 的电脑桌面核对账户 ${state.user?.username || ""}（${state.user?.id}），确认是本人发起的连接。`,
+      scan: "请在手机 Telegram 的「设置 → 设备 → 连接桌面设备」中，扫描 PolyView 宿主机桌面显示的二维码，再在宿主机确认绑定的账户。",
+      official: "本次原生连接已停止。请在官方 Telegram 客户端完成额外验证。该客户端的会话独立于 PolyView。若扫码仍要求两步密码，可通过下方 tdl 方式在宿主机授权，导入单条视频。",
+      authorized: "已连接 Telegram。", declined: "宿主机已拒绝此次连接。",
+      expired: "此次连接申请已过期，请重新连接。", error: "连接失败，请检查宿主机桌面和 Telegram 服务后重试。",
+    };
+    let timer, busy = false, version = 0;
+    async function load(method = "GET") {
+      if (busy || !current()) return;
+      clearTimeout(timer);
+      busy = true;
+      const revision = ++version;
+      const active = () => current() && revision === version;
+      content.replaceChildren();
+      actions.replaceChildren();
+      status.textContent = "正在检查原生授权…";
+      try {
+        const result = await api(path, { method });
+        if (!active()) return;
+        status.textContent = labels[result.state] || labels.error;
+        if (["confirm", "scan"].includes(result.state)) {
+          actions.append(button("取消连接申请", "subtle", () => load("DELETE")));
+          timer = setTimeout(() => load(), 2500);
+        } else if (result.state === "authorized") {
+          await telegramBrowser(content, active, refreshQueue);
+        } else if (["idle", "error", "expired", "declined", "official"].includes(result.state)) {
+          actions.append(button("连接 Telegram", "primary", () => load("POST")));
+        }
+      } catch (_) {
+        if (active()) status.textContent = method === "POST" ? "暂时无法发起连接，宿主机可能正在处理其他授权，请稍后刷新再试。" : "无法读取原生授权状态，请检查连接后刷新。";
+      }
+      finally {
+        busy = false;
+        if (active()) actions.append(button("刷新连接状态", "subtle", () => load()));
+      }
+    }
+    await load();
+    return panel;
+  }
+
+  function telegramPanel(current, refreshQueue) {
     const path = "/api/telegram/login";
-    const panel = make("section", { class: "panel telegram-panel" });
+    const panel = make("details", { class: "panel telegram-panel" });
     const statusLine = make("p", { role: "status" });
     const controls = make("div", { class: "form-row" });
     const requests = make("div");
-    panel.append(make("h2", { text: "Telegram 视频" }), statusLine, controls, requests);
+    panel.append(make("summary", { text: "通过 tdl 导入单条视频链接（旧版）" }), statusLine, controls, requests);
     let busy = false;
     async function load(method = "GET") {
       if (busy || !current()) return;
@@ -3324,7 +3573,7 @@
         if (current()) controls.append(button("刷新授权状态", "subtle", () => load()));
       }
     }
-    await load();
+    panel.addEventListener("toggle", () => { if (panel.open) return load(); });
     return panel;
   }
   async function downloadParameters(current) {
@@ -3478,9 +3727,10 @@
           on: { click: () => { state.downloadFilter = key; paintQueue(); } },
         }))), downloadList(change));
     }
-    const [, telegram, parameters] = await Promise.all([refresh(), telegramPanel(current, refresh),
-      admin() ? downloadParameters(current) : null]);
-    root.append(add, telegram);
+    const [, native, telegram, parameters, credentials] = await Promise.all([refresh(), telegramNativePanel(current, refresh),
+      telegramPanel(current, refresh), admin() ? downloadParameters(current) : null, admin() ? telegramNativeSettings(current) : null]);
+    root.append(native, add, telegram);
+    if (credentials) root.append(credentials);
     if (parameters) root.append(parameters);
     root.append(queue);
     return root;

@@ -83,6 +83,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
         ("attempt_token", "TEXT NOT NULL DEFAULT ''"),
         ("retry_at", "INTEGER NOT NULL DEFAULT 0"),
         ("resolved_media", "TEXT"),
+        ("bytes_per_second", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         crate::ensure_column(conn, "downloads", name, definition)?;
     }
@@ -394,6 +395,8 @@ pub(crate) struct Download {
     status: String,
     bytes_written: i64,
     total_bytes: Option<i64>,
+    bytes_per_second: i64,
+    percent: Option<f64>,
     error: Option<String>,
     relative_path: String,
     kind: String,
@@ -411,13 +414,19 @@ fn public_download_url<S: serde::Serializer>(url: &str, serializer: S) -> Result
 }
 
 fn download_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Download> {
+    let written: i64 = row.get(4)?;
+    let total: Option<i64> = row.get(5)?;
     Ok(Download {
         id: row.get(0)?,
         title: row.get(1)?,
         url: row.get(2)?,
         status: row.get(3)?,
-        bytes_written: row.get(4)?,
-        total_bytes: row.get(5)?,
+        bytes_written: written,
+        total_bytes: total,
+        bytes_per_second: row.get(15)?,
+        percent: total
+            .filter(|n| *n > 0)
+            .map(|n| (100.0 * written as f64 / n as f64).clamp(0.0, 100.0)),
         error: row.get(6)?,
         relative_path: row.get(7)?,
         kind: row.get(8)?,
@@ -432,7 +441,7 @@ fn download_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Download> {
     })
 }
 
-const DOWNLOAD_COLUMNS: &str = "id,title,url,status,bytes_written,total_bytes,error,relative_path,kind,attempts,cover,year,description,user_id,attempt_token";
+const DOWNLOAD_COLUMNS: &str = "id,title,url,status,bytes_written,total_bytes,error,relative_path,kind,attempts,cover,year,description,user_id,attempt_token,CASE WHEN status='running' THEN bytes_per_second ELSE 0 END";
 
 pub(crate) fn download_by_id(
     conn: &Connection,
@@ -935,7 +944,7 @@ fn published_download_size(part: &std::path::Path, final_path: &std::path::Path)
 fn claim_job(state: &Shared) -> Result<Option<Download>, AppError> {
     let conn = state.conn()?;
     Ok(conn.query_row(&format!("UPDATE downloads SET status='running', attempts=attempts+1, attempt_token=?1,
-        bytes_written=0,total_bytes=NULL,error=NULL WHERE id=(SELECT id FROM downloads WHERE status='queued'
+        bytes_written=0,total_bytes=NULL,bytes_per_second=0,error=NULL WHERE id=(SELECT id FROM downloads WHERE status='queued'
         AND retry_at <= CAST(unixepoch('subsec')*1000 AS INTEGER) ORDER BY id LIMIT 1) RETURNING {DOWNLOAD_COLUMNS}"),
         [uuid::Uuid::new_v4().to_string()], download_row).optional()?)
 }
@@ -1037,15 +1046,36 @@ async fn transfer_attempt(
     let part = work.path().join("video.part");
     let mut extension = None;
     if job.kind == "telegram" {
-        let command = {
-            let conn = state.conn().map_err(|e| e.1)?;
-            if !is_running(&conn, job)? {
-                return Ok(false);
-            }
-            crate::telegram::tdl_command(&conn, settings, job.user_id)
-                .map_err(|_| "Telegram authorization is required")?
-        };
-        let video = crate::telegram::media::download(command, &job.url, work.path()).await?;
+        let mut last_saved = Instant::now();
+        let mut last_bytes = 0;
+        let video =
+            crate::telegram::media::download(
+                state,
+                job.user_id,
+                settings,
+                &job.url,
+                work.path(),
+                |written, total| {
+                    let elapsed = last_saved.elapsed();
+                    if last_bytes > 0
+                        && elapsed < Duration::from_millis(250)
+                        && Some(written) != total
+                    {
+                        return Ok(());
+                    }
+                    let rate = (written.saturating_sub(last_bytes) as f64
+                        / elapsed.as_secs_f64().max(0.001)) as i64;
+                    state.conn().map_err(|e| e.1)?.execute(
+                    "UPDATE downloads SET bytes_written=?1,total_bytes=?2,bytes_per_second=?3
+                     WHERE id=?4 AND attempt_token=?5 AND status='running'",
+                    params![written, total, rate, job.id, job.attempt_token],
+                ).map_err(|e| e.to_string())?;
+                    last_saved = Instant::now();
+                    last_bytes = written;
+                    Ok(())
+                },
+            )
+            .await?;
         extension = Some(
             video
                 .extension()
@@ -1350,6 +1380,7 @@ mod tests {
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
             playback_grants: Default::default(),
+            telegram_native: Default::default(),
             download_runtime: Default::default(),
             media_dir,
             download_dir,

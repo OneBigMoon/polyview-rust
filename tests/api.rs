@@ -34,8 +34,16 @@ mod source_ops;
 mod source_subscriptions;
 #[path = "cases/suggest.rs"]
 mod suggest;
+#[path = "cases/telegram_browse.rs"]
+mod telegram_browse;
 #[path = "cases/telegram_media.rs"]
 mod telegram_media;
+#[path = "cases/telegram_queue.rs"]
+mod telegram_queue;
+#[path = "cases/telegram_stream.rs"]
+mod telegram_stream;
+#[path = "cases/telegram_web_login.rs"]
+mod telegram_web_login;
 #[path = "cases/tracking_resolve.rs"]
 mod tracking_resolve;
 #[path = "cases/user_data.rs"]
@@ -88,6 +96,10 @@ impl Reply {
 
 impl TestApp {
     fn new() -> Self {
+        Self::new_with_native(Default::default())
+    }
+
+    fn new_with_native(telegram_native: polyview::telegram::native::NativeRuntime) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let media_dir = temp.path().join("media");
         fs::create_dir_all(media_dir.join("downloads")).unwrap();
@@ -98,6 +110,7 @@ impl TestApp {
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
             playback_grants: Default::default(),
+            telegram_native,
             download_runtime: Default::default(),
             media_dir,
             download_dir,

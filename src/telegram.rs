@@ -1,4 +1,9 @@
+pub(crate) mod browse;
+pub mod login;
 pub(crate) mod media;
+pub mod native;
+pub(crate) mod stream;
+pub mod subscriptions;
 
 use crate::{
     AppError, Shared,
@@ -26,6 +31,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
             phase TEXT NOT NULL CHECK(phase IN ('idle','waiting','verified','failed'))
         );",
     )?;
+    login::init_schema(conn)?;
+    browse::init_schema(conn)?;
+    subscriptions::init_schema(conn)?;
     Ok(())
 }
 
@@ -43,6 +51,10 @@ pub fn router() -> Router<Shared> {
         .route("/api/telegram/login/requests", get(requests))
         .layer(Extension(locks))
         .merge(media::router())
+        .merge(login::router())
+        .merge(browse::router())
+        .merge(stream::router())
+        .merge(subscriptions::router())
 }
 
 fn signed_in(conn: &Connection, headers: &HeaderMap) -> Result<AuthUser, AppError> {

@@ -3228,6 +3228,7 @@ function m6DownloadsFixture(routes, user = { id: 12, role: "member" }) {
     if (method !== "GET") assert.equal(options.headers["X-PolyView-Request"], "1");
     const route = routes[url] ?? (url === "/api/downloads" ? [] : { state: "idle" });
     const data = typeof route === "function" ? await route(method, options.body && JSON.parse(options.body)) : route;
+    if (data instanceof Response) return data;
     return { ok: true, status: 200, text: async () => JSON.stringify(data) };
   };
   return app;
@@ -3335,6 +3336,7 @@ test("Telegram request, cancellation, host authorization and video import are sc
     "/api/downloads": () => app.state.user.id === 12 ? jobs : [],
   });
   const page = await app.downloads();
+  await openLegacyTelegram(page);
   await m6Click(page, "申请连接");
   assert.match(page.textContent, /等待服务器管理员/);
   await m6Click(page, "取消申请");
@@ -3348,6 +3350,7 @@ test("Telegram request, cancellation, host authorization and video import are sc
   assert.doesNotMatch(page.textContent, /private-qr|private-stdout|12345/);
   app.state.user = { id: 13, role: "member" };
   const second = await app.downloads();
+  await openLegacyTelegram(second);
   pageButton(second, "申请连接");
   assert.equal(m6Field(second, "telegram_url"), undefined);
   assert.equal(app.state.downloads.length, 0);
@@ -3395,6 +3398,7 @@ test("administrator sees official host commands and updates download settings wi
     },
   }, { id: 1, role: "admin" });
   const page = await app.downloads();
+  await openLegacyTelegram(page);
   assert.match(page.textContent, /tdl -n family_u4 login/);
   assert.match(page.textContent, /TDL_PROXY/);
   const proxy = m6Field(page, "telegram_proxy");
@@ -3415,6 +3419,180 @@ test("administrator sees official host commands and updates download settings wi
   await m6Submit(page, "保存下载设置");
   assert.equal(changes[2].telegram_proxy, "");
   assert.doesNotMatch(page.textContent, /fixture:password/);
+});
+
+async function openLegacyTelegram(page) {
+  const panel = pageClass(page, "telegram-panel").find((node) => node.tagName === "DETAILS");
+  panel.open = true;
+  await panel.listeners.toggle[0]();
+}
+
+const nativeLogin = "/api/telegram/native/login";
+const nativeSettings = "/api/settings/telegram/native";
+const telegramChats = "/api/telegram/chats";
+const telegramRules = "/api/telegram/subscriptions";
+
+test("native Telegram login polls host confirmation, cancels and handles official verification without collecting codes", async () => {
+  let state = "idle", scheduled;
+  const app = m6DownloadsFixture({ [nativeLogin]: (method) => {
+    if (method === "POST") state = "confirm";
+    if (method === "DELETE") state = "idle";
+    return { state, message: "provider-private-output", qr: "tg://login?token=secret" };
+  } }, { id: 9, username: "family", role: "member" });
+  app.context.setTimeout = (callback, delay) => { if (delay === 2500) scheduled = callback; return 1; };
+  const page = await app.downloads();
+  await m6Click(page, "连接 Telegram");
+  assert.match(page.textContent, /电脑桌面核对账户 family（9）/);
+  state = "scan";
+  await scheduled();
+  assert.match(page.textContent, /扫描 PolyView 宿主机桌面/);
+  await m6Click(page, "取消连接申请");
+  assert.equal(state, "idle");
+  for (const [next, expected] of [["declined", /已拒绝/], ["expired", /已过期/], ["official", /官方 Telegram 客户端/], ["unconfigured", /管理员先/]]) {
+    state = next;
+    await m6Click(page, "刷新连接状态");
+    assert.match(page.textContent, expected);
+    assert.doesNotMatch(page.textContent, /tg:\/\/|provider-private-output/);
+  }
+  const nativePanel = pageClass(page, "telegram-panel").find((panel) => panel.tagName === "SECTION");
+  assert.ok(!pageNodes(nativePanel).some((node) => node.tagName === "INPUT"));
+  assert.ok(!app.calls.some(({url}) => url === nativeSettings || url === telegramChats));
+  assert.ok(app.calls.filter(({url}) => url === nativeLogin).every(({options}) => options.body === undefined));
+});
+
+test("native API settings require an administrator and clear both write-only fields", async () => {
+  const secret = "0123456789abcdef0123456789abcdef", writes = [];
+  const app = m6DownloadsFixture({ [nativeSettings]: (method, body) => {
+    if (method === "PUT") writes.push(body);
+    return { configured: true };
+  } }, { id: 1, role: "admin" });
+  const page = await app.downloads();
+  const id = m6Field(page, "api_id"), hash = m6Field(page, "api_hash");
+  for (const field of [id, hash]) { assert.equal(field.attributes.type, "password"); assert.equal(field.value, ""); }
+  id.value = "1234"; hash.value = secret;
+  await m6Submit(page, "保存 API 凭据");
+  assert.deepEqual(writes, [{ api_id: 1234, api_hash: secret }]);
+  assert.equal(id.value, ""); assert.equal(hash.value, "");
+  assert.ok(!page.textContent.includes(secret));
+});
+
+test("Telegram channel browsing searches, pages, streams same-origin media and enqueues singles or complete albums", async () => {
+  const chat = { id: -100123, title: "资料馆", favorite: true };
+  const endpoint = `${telegramChats}/${chat.id}/messages`;
+  const video = { id: 17, is_video: true, file_name: "旅行.mp4", text: "旅行手记", file_size: 1048576, duration: 95,
+    thumbnail: "data:image/jpeg;base64,dGd0ZXN0", media_group_id: "123456", cloud_urls: [] };
+  const cloud = "https://pan.quark.cn/s/example";
+  const jobs = [], batches = [];
+  const app = m6DownloadsFixture({ [nativeLogin]: { state: "authorized" }, [telegramChats]: [chat], [telegramRules]: [],
+    [`${endpoint}?q=&offset=0`]: { messages: [video], next_offset: 17 },
+    [`${endpoint}?q=&offset=17`]: { messages: [{ id: 12, is_video: false, text: "旅行资料", cloud_urls: [cloud, "javascript:alert(1)"] }], next_offset: null },
+    [`${endpoint}?q=${encodeURIComponent("无结果")}&offset=0`]: { messages: [], next_offset: null },
+    [`${endpoint}/17/download`]: (_, body) => {
+      batches.push(body);
+      if (!jobs.length) jobs.push({ id: 1, kind: "telegram", title: video.file_name, status: "running", bytes_written: 50, total_bytes: 200, bytes_per_second: 2048 });
+      return { queued: body.single ? 1 : 2 };
+    }, "/api/downloads": () => jobs,
+  });
+  const page = await app.downloads();
+  assert.equal(pageButton(page, "★ 资料馆").attributes["aria-pressed"], "true");
+  assert.match(page.textContent, /1\.0 MiB · 1:35 · 相册/);
+  assert.equal(pageNodes(pageClass(page, "telegram-message")[0]).find((node) => node.tagName === "IMG").attributes.src, video.thumbnail);
+  await m6Click(page, "在线播放");
+  assert.equal(app.elements.get("video-player").src, "/api/telegram/stream/-100123/17");
+  app.closePlayer();
+  assert.ok(!app.calls.some(({url}) => url.startsWith("/api/library/") || url.startsWith("/api/playback")));
+  await m6Click(page, "下载视频");
+  await m6Click(page, "下载整个相册");
+  assert.deepEqual(batches, [{ single: true }, {}]);
+  assert.match(page.textContent, /25% · 2\.0 KiB\/s/);
+  assert.match(app.elements.get("toast").textContent, /已加入 2 个下载任务/);
+  await m6Click(page, "下一页消息");
+  assert.match(page.textContent, /旅行资料/);
+  assert.deepEqual(pageNodes(page).filter((node) => node.tagName === "A").map((node) => node.attributes.href), [cloud]);
+  assert.ok(!pageNodes(page).some((node) => node.tagName === "BUTTON" && node.textContent === "在线播放"));
+  await m6Click(page, "上一页消息");
+  m6Field(page, "telegram_query").value = "无结果";
+  await m6Submit(page, "搜索消息");
+  assert.match(page.textContent, /没有匹配的视频或资源/);
+});
+
+test("Telegram favorite sources and per-channel keyword subscriptions persist create, pause, resume and delete", async () => {
+  const chat = { id: -100222, title: "电影", favorite: false };
+  let chats = [], rules = [];
+  const changes = [];
+  const app = m6DownloadsFixture({ [nativeLogin]: { state: "authorized" }, [telegramChats]: () => chats,
+    "/api/telegram/favorites": (method, body) => { changes.push([method, body]); chat.favorite = true; chats = [chat]; },
+    [`/api/telegram/favorites/${chat.id}`]: (method) => { changes.push([method]); chat.favorite = false; },
+    [`${telegramChats}/${chat.id}/messages?q=&offset=0`]: { messages: [], next_offset: null },
+    [telegramRules]: (method, body) => {
+      if (method === "POST") rules.push({ id: 3, ...body, enabled: true });
+      return [...rules, { id: 9, chat_id: 100, keyword: "另一个频道", enabled: true }];
+    }, [`${telegramRules}/3`]: (method, body) => { if (method === "DELETE") rules = []; else rules[0].enabled = body.enabled; },
+  });
+  const page = await app.downloads();
+  assert.match(page.textContent, /暂无频道/);
+  m6Field(page, "telegram_channel").value = "@movies";
+  await m6Submit(page, "添加收藏源");
+  assert.match(page.textContent, /这个频道暂无视频或资源/);
+  await m6Click(page, "取消收藏频道");
+  await m6Click(page, "收藏频道");
+  assert.deepEqual(changes, [["PUT", { channel: "@movies" }], ["DELETE"], ["PUT", { channel: String(chat.id) }]]);
+  m6Field(page, "telegram_keyword").value = "纪录片";
+  await m6Submit(page, "订阅关键词");
+  assert.deepEqual(rules, [{ id: 3, chat_id: chat.id, keyword: "纪录片", enabled: true }]);
+  assert.doesNotMatch(page.textContent, /另一个频道/);
+  await m6Click(page, "暂停订阅"); assert.equal(rules[0].enabled, false);
+  await m6Click(page, "恢复订阅"); assert.equal(rules[0].enabled, true);
+  await m6Click(page, "删除订阅"); assert.equal(rules.length, 0);
+  assert.match(page.textContent, /还没有关键词订阅/);
+});
+
+test("Telegram denied requests offer retry and stale responses cannot replace the selected channel", async () => {
+  const a = { id: -1001, title: "频道一" }, b = { id: -1002, title: "频道二" };
+  let denied = true, delayed, finish;
+  const app = m6DownloadsFixture({ [nativeLogin]: { state: "authorized" }, [telegramRules]: [],
+    [telegramChats]: () => denied ? Response.json({ error: "internal detail" }, { status: 403 }) : [a, b],
+    [`${telegramChats}/${a.id}/messages?q=&offset=0`]: () => delayed ? new Promise((resolve) => { finish = resolve; }) : Response.json({}, { status: 503 }),
+    [`${telegramChats}/${b.id}/messages?q=&offset=0`]: { messages: [{ id: 8, text: "第二频道的资源" }] },
+  });
+  const page = await app.downloads();
+  assert.match(page.textContent, /无法读取频道列表/);
+  assert.doesNotMatch(page.textContent, /internal detail/);
+  denied = false;
+  await m6Click(page, "重试频道列表");
+  assert.match(page.textContent, /无法读取此频道消息/);
+  delayed = true;
+  const stale = m6Click(page, "重试消息");
+  await m6Click(page, b.title);
+  finish({ messages: [{ id: 7, text: "旧请求" }] });
+  await stale;
+  assert.match(page.textContent, /第二频道的资源/);
+  assert.doesNotMatch(page.textContent, /旧请求/);
+  app.state.user = { id: 19, role: "member" };
+  const count = app.calls.length;
+  await m6Click(page, "收藏频道");
+  assert.equal(app.calls.length, count);
+});
+
+test("failed Telegram album imports preserve the selected video and allow another attempt", async () => {
+  const chat = { id: -100123, title: "资源频道" }, endpoint = `${telegramChats}/${chat.id}/messages`;
+  let denied = true;
+  const app = m6DownloadsFixture({ [nativeLogin]: { state: "authorized" }, [telegramChats]: [chat], [telegramRules]: [],
+    [`${endpoint}?q=&offset=0`]: { messages: [{ id: 2, is_video: true, file_name: "影片", media_group_id: "42" }] },
+    [`${endpoint}/2/download`]: () => denied ? Response.json({ error: "provider-private-output" }, { status: 403 }) : { queued: 3 },
+  });
+  const page = await app.downloads();
+  await m6Click(page, "下载整个相册");
+  assert.match(app.elements.get("toast").textContent, /操作失败/);
+  assert.doesNotMatch(page.textContent + app.elements.get("toast").textContent, /provider-private-output/);
+  assert.equal(pageButton(page, "下载整个相册").disabled, false);
+  assert.equal(app.calls.filter(({url}) => url === "/api/downloads").length, 1);
+  denied = false;
+  await m6Click(page, "下载整个相册");
+  assert.match(app.elements.get("toast").textContent, /已加入 3 个下载任务/);
+  await m6Click(page, "在线播放");
+  await app.elements.get("video-player").onerror();
+  assert.match(app.elements.get("player-message").textContent, /视频无法播放/);
 });
 
 registerParserPanelTests({ environment, pageNodes, pageButton });
