@@ -12,10 +12,16 @@ mod live_sources;
 mod member_feeds;
 #[path = "cases/notify.rs"]
 mod notify;
+#[path = "cases/parsers.rs"]
+mod parsers;
 #[path = "cases/play_settings.rs"]
 mod play_settings;
+#[path = "cases/playback_fallback.rs"]
+mod playback_fallback;
 #[path = "cases/recommend.rs"]
 mod recommend;
+#[path = "cases/resolved_download.rs"]
+mod resolved_download;
 #[path = "cases/source_ops.rs"]
 mod source_ops;
 #[path = "cases/source_subscriptions.rs"]
@@ -24,6 +30,8 @@ mod source_subscriptions;
 mod suggest;
 #[path = "cases/telegram_media.rs"]
 mod telegram_media;
+#[path = "cases/tracking_resolve.rs"]
+mod tracking_resolve;
 #[path = "cases/user_data.rs"]
 mod user_data;
 
@@ -83,6 +91,7 @@ impl TestApp {
         init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            playback_grants: Default::default(),
             download_runtime: Default::default(),
             media_dir,
             download_dir,

@@ -1,3 +1,8 @@
+mod grants;
+
+pub use grants::PlaybackGrants;
+pub(crate) use grants::{DownloadRelay, fetch_media, grant_url, no_redirect_client};
+
 use crate::{AppError, Shared, auth::AuthUser, settings::play_settings};
 use axum::{
     Router,
@@ -19,6 +24,7 @@ const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 pub fn router() -> Router<Shared> {
     Router::new()
         .route("/api/playback", get(proxy))
+        .route("/api/playback/grants/{token}", get(grants::proxy))
         .route("/api/image", get(image))
 }
 
@@ -51,12 +57,16 @@ fn source_error(message: impl Into<String>) -> AppError {
     AppError(StatusCode::BAD_GATEWAY, message.into())
 }
 
-fn proxy_url(base: &Url, raw: &str) -> Result<String, AppError> {
+fn playlist_url(base: &Url, raw: &str) -> Result<Url, AppError> {
     let resolved = base
         .join(raw)
         .map_err(|_| source_error("Playlist contains an invalid media URL"))?;
-    let url = http_url(resolved.as_str())
-        .map_err(|_| source_error("Playlist contains an unsupported media URL"))?;
+    http_url(resolved.as_str())
+        .map_err(|_| source_error("Playlist contains an unsupported media URL"))
+}
+
+fn proxy_url(base: &Url, raw: &str) -> Result<String, AppError> {
+    let url = playlist_url(base, raw)?;
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("url", url.as_str())
         .finish();
@@ -67,7 +77,21 @@ fn cue_out(line: &str) -> bool {
     line == "#EXT-X-CUE-OUT" || line.starts_with("#EXT-X-CUE-OUT:")
 }
 
+fn playlist_path(url: &Url) -> bool {
+    url.path()
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("m3u8"))
+}
+
 fn rewrite_playlist(bytes: &[u8], base: &Url, ad_block: bool) -> Result<String, AppError> {
+    rewrite_links(bytes, ad_block, |raw| proxy_url(base, raw))
+}
+
+fn rewrite_links(
+    bytes: &[u8],
+    ad_block: bool,
+    mut link: impl FnMut(&str) -> Result<String, AppError>,
+) -> Result<String, AppError> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| source_error("HLS playlist is not valid UTF-8"))?;
     let text = text.trim_start_matches('\u{feff}').trim_start();
@@ -110,7 +134,7 @@ fn rewrite_playlist(bytes: &[u8], base: &Url, ad_block: bool) -> Result<String, 
             continue;
         }
         if !line.starts_with('#') {
-            output.push_str(&proxy_url(base, line)?);
+            output.push_str(&link(line)?);
         } else {
             let mut rest = line;
             while let Some(start) = rest.find("URI=\"") {
@@ -122,7 +146,7 @@ fn rewrite_playlist(bytes: &[u8], base: &Url, ad_block: bool) -> Result<String, 
                         source_error("Playlist contains an unterminated URI attribute")
                     })?;
                 output.push_str(&rest[..value_start]);
-                output.push_str(&proxy_url(base, &rest[value_start..end])?);
+                output.push_str(&link(&rest[value_start..end])?);
                 output.push('"');
                 rest = &rest[end + 1..];
             }
@@ -276,6 +300,7 @@ async fn proxy(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let url = http_url(&query.url)?;
+    let requested_playlist = playlist_path(&url);
     let settings = play_settings(&*state.conn()?)?;
     let mut request = state
         .client
@@ -298,6 +323,17 @@ async fn proxy(
         .await
         .map_err(|_| source_error("Media source did not respond within 30 seconds"))?
         .map_err(|_| source_error("Could not connect to the media source"))?;
+    relay_response(upstream, requested_playlist, |bytes, base| {
+        rewrite_playlist(bytes, base, settings.ad_block)
+    })
+    .await
+}
+
+async fn relay_response(
+    upstream: reqwest::Response,
+    requested_playlist: bool,
+    playlist: impl FnOnce(&[u8], &Url) -> Result<String, AppError>,
+) -> Result<Response, AppError> {
     let final_url = http_url(upstream.url().as_str())
         .map_err(|_| source_error("Media source redirected to an unsupported URL"))?;
     let status = upstream.status();
@@ -325,13 +361,14 @@ async fn proxy(
             "Media source ignored the uncompressed transfer request",
         ));
     }
-    let playlist = final_url.path().to_ascii_lowercase().ends_with(".m3u8")
+    let is_playlist = requested_playlist
+        || playlist_path(&final_url)
         || upstream
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|content_type| content_type.to_ascii_lowercase().contains("mpegurl"));
-    if playlist {
+    if is_playlist {
         if status == StatusCode::PARTIAL_CONTENT {
             return Err(source_error("A partial HLS playlist cannot be played"));
         }
@@ -356,7 +393,7 @@ async fn proxy(
         let bytes = tokio::time::timeout(REQUEST_TIMEOUT, collect)
             .await
             .map_err(|_| source_error("HLS playlist transfer timed out"))??;
-        let rewritten = rewrite_playlist(&bytes, &final_url, settings.ad_block)?;
+        let rewritten = playlist(&bytes, &final_url)?;
         downstream_headers.remove(header::CONTENT_RANGE);
         downstream_headers.remove(header::ACCEPT_RANGES);
         downstream_headers.insert(
@@ -433,6 +470,7 @@ mod tests {
             temp,
             Arc::new(AppState {
                 db: Mutex::new(conn),
+                playback_grants: Default::default(),
                 download_runtime: Default::default(),
                 media_dir: media_dir.clone(),
                 download_dir: media_dir,

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
+import { registerParserPanelTests } from "./cases/parser-panel.mjs";
 
 const application = await readFile(
   new URL("../web/app.js", import.meta.url),
@@ -438,40 +439,157 @@ test("opening an episode closes details before showing the player", async () => 
   assert.equal(dialog.open, false);
 });
 
-test("non-direct parser pages are rejected before opening the player", async () => {
-  const detail = {
-    id: "43",
-    source_id: 3,
-    title: "解析页",
-    description: "",
-    groups: [
-      {
-        name: "share",
-        direct: false,
-        episodes: [
-          { name: "第1集", url: "https://source.example/share/abc" },
-        ],
-      },
-    ],
-  };
+const fallbackPath = "/api/catalog/fallback?source_id=3&vod_id=43&episode=1&flag=share";
+const resolvePath = "/api/playback/resolve";
+
+async function parserEpisodeFixture(routes = {}) {
+  const item = { id: "43", source_id: 3, title: "故事", cover: "https://img.example/poster" };
+  const episodes = [1, 2].map((index) => ({ name: `第${index}集`, url: `https://source.example/share/${index}` }));
   const app = environment({
-    "/api/catalog/3/detail?id=43": detail,
+    "/api/catalog/3/detail?id=43": { ...item, description: "<p>简介</p>", year: "2024", groups: [{ name: "share", direct: false, episodes }] },
     "/api/tracking": [],
+    ...routes,
   });
-  await app.openCatalogDetail({ id: "43", source_id: 3, title: "解析页" });
-  const dialog = app.elements.get("catalog-dialog");
-  const find = (node) =>
-    node.tagName === "BUTTON" && node.textContent === "在线播放"
-      ? node
-      : (node.children || [])
-          .map((child) => (typeof child === "object" ? find(child) : null))
-          .find(Boolean);
-  const watch = find(dialog);
-  assert.ok(watch, "details expose a play action");
-  watch.listeners.click[0]();
-  assert.equal(dialog.open, true);
-  assert.equal(app.order.includes("open:player-dialog"), false);
-  assert.match(app.elements.get("toast").textContent, /非直链/);
+  await app.openCatalogDetail(item);
+  return { app, item, episodes, dialog: app.elements.get("catalog-dialog"), video: app.elements.get("video-player") };
+}
+
+test("catalog playback resolves the selected share URL and attaches only the protected HLS stream", async () => {
+  const grant = "/api/playback/grants/opaque";
+  const { app, episodes, dialog, video } = await parserEpisodeFixture({
+    [resolvePath]: { url: "https://media.example/title.m3u8", playback_url: grant, is_hls: true },
+  });
+  pageButton(dialog, "第2集").dispatchEvent("click");
+  assert.equal(dialog.open, false);
+  assert.equal(app.elements.get("player-dialog").open, true);
+  assert.match(app.elements.get("player-message").textContent, /正在解析/);
+  assert.equal(video.src, undefined);
+  assert.equal(app.hlsInstances.length, 0);
+  await new Promise(setImmediate);
+  assert.deepEqual(savedMutation(app, resolvePath, "POST"), { url: episodes[1].url, flag: "share" });
+  assert.equal(app.hlsInstances[0].source, grant);
+  video.onloadedmetadata();
+  assert.match(app.elements.get("player-message").textContent, /已解析/);
+});
+
+test("single and batch downloads queue original share URLs, parser flags and catalog metadata", async () => {
+  const { app, item, episodes, dialog } = await parserEpisodeFixture();
+  pageButton(dialog, "倒序").dispatchEvent("click");
+  await pageButton(dialog, "下载本集").listeners.click[0]();
+  pageButton(dialog, "选择集数").dispatchEvent("click");
+  pageButton(dialog, "全选").dispatchEvent("click");
+  await pageButton(dialog, "批量加入下载队列（2 集）").listeners.click[0]();
+  assert.deepEqual(queuedEpisodeBodies(app), [2, 2, 1].map((i) => ({
+    url: episodes[i - 1].url, title: `故事 S01E0${i}`, direct: false, flag: "share", cover: item.cover, year: "2024", description: "简介",
+  })));
+  assert.ok(!app.calls.some(({ url }) => url === resolvePath));
+});
+
+test("native and HLS failures use each backup once and resume the original playlist and progress", async () => {
+  const fixture = { source_id: 8, vod_id: "other", title: "故事" };
+  const alternate = { ...fixture, flag: "hls", url: "https://backup.example/1.m3u8", direct: true };
+  const next = { ...fixture, flag: "mp4", url: "https://last.example/1.mp4", direct: true };
+  const grant = "/api/playback/grants/original.mp4";
+  const { app, dialog, episodes, video } = await parserEpisodeFixture({
+    [resolvePath]: { playback_url: grant, is_hls: false },
+    [fallbackPath]: { items: [alternate, alternate, next] },
+  });
+  pageButton(dialog, "在线播放").dispatchEvent("click");
+  await new Promise(setImmediate);
+  assert.equal(video.src, grant);
+  video.onloadedmetadata();
+  video.currentTime = 37.25;
+  const originalError = video.onerror;
+  originalError();
+  originalError();
+  await new Promise(setImmediate);
+  const hls = app.hlsInstances[0];
+  assert.equal(hls.source, `/api/playback?url=${encodeURIComponent(alternate.url)}`);
+  video.currentTime = 0;
+  video.onloadedmetadata();
+  assert.equal(video.currentTime, 37.25);
+  hls.emit("manifest_parsed");
+  assert.equal(video.playCalls, 1);
+  video.currentTime = 50.75;
+  hls.emit("error", { fatal: false });
+  assert.ok(!hls.destroyed);
+  hls.emit("error", { fatal: true });
+  hls.emit("error", { fatal: true });
+  originalError();
+  assert.equal(video.src, `/api/playback?url=${encodeURIComponent(next.url)}`);
+  video.currentTime = 0;
+  video.onloadedmetadata();
+  assert.equal(video.currentTime, 50.75);
+  assert.equal(app.state.player.item.remote_url, episodes[0].url);
+  assert.equal(app.state.player.playlistIndex, 0);
+  const history = app.calls.filter(({ url }) => url === "/api/progress").map(({ options }) => JSON.parse(options.body));
+  assert.deepEqual(history.map(({ remote_url, episode_index, position }) => [remote_url, episode_index, position]), [
+    [episodes[0].url, 0, 37.25], [episodes[0].url, 0, 50.75],
+  ]);
+  video.onerror();
+  video.onerror();
+  assert.match(app.elements.get("player-message").textContent, /没有更多可用片源/);
+  assert.equal(app.calls.filter(({ url }) => url === fallbackPath).length, 1);
+  app.elements.get("player-next").dispatchEvent("click");
+  assert.equal(app.state.player.item.remote_url, episodes[1].url);
+});
+
+test("a failed parser tries the next parser-backed source and reports exhaustion", async () => {
+  const backup = { source_id: 8, vod_id: "b", title: "故事", flag: "other", url: "https://other.example/share/1", direct: false };
+  const { app, dialog, episodes } = await parserEpisodeFixture({ [fallbackPath]: { items: [backup, backup] } });
+  pageButton(dialog, "在线播放").dispatchEvent("click");
+  await new Promise(setImmediate);
+  const attempts = app.calls.filter(({ url }) => url === resolvePath).map(({ options }) => JSON.parse(options.body));
+  assert.deepEqual(attempts, [{ url: episodes[0].url, flag: "share" }, { url: backup.url, flag: backup.flag }]);
+  assert.equal(app.hlsInstances.length, 0);
+  assert.match(app.elements.get("player-message").textContent, /解析失败.*没有更多可用片源/);
+});
+
+test("resuming a share episode preserves its saved position when the first parser fails", async () => {
+  const record = { remote_url: "https://source.example/share/2", episode_index: 1, episode_name: "第2集", position: 42.5 };
+  const backup = { source_id: 8, vod_id: "b", title: "故事", flag: "mp4", url: "https://other.example/2.mp4", direct: true };
+  const { app, dialog, video } = await parserEpisodeFixture({
+    "/api/progress?source_id=3&media_id=43": [record],
+    "/api/catalog/fallback?source_id=3&vod_id=43&episode=2&flag=share": { items: [backup] },
+  });
+  pageButton(dialog, "倒序").dispatchEvent("click");
+  pageButton(dialog, "续播 第2集（00:42）").dispatchEvent("click");
+  await new Promise(setImmediate);
+  assert.equal(video.src, `/api/playback?url=${encodeURIComponent(backup.url)}`);
+  video.onloadedmetadata();
+  assert.equal(video.currentTime, record.position);
+  assert.equal(video.playCalls, 1);
+  assert.equal(app.state.player.playlistIndex, 0);
+});
+
+test("late resolution and fallback responses cannot attach media after playback moves on", async () => {
+  for (const delayedPath of [resolvePath, fallbackPath]) {
+    const delayed = {};
+    const pending = new Promise((resolve) => { delayed.release = resolve; });
+    const { app, dialog, video } = await parserEpisodeFixture({
+      [resolvePath]: { playback_url: "/api/playback/grants/old", is_hls: false },
+      [fallbackPath]: { items: [{ source_id: 8, vod_id: "b", flag: "hls", url: "https://old.example/b.m3u8", direct: true }] },
+    });
+    const fetch = app.context.fetch;
+    app.context.fetch = async (url, options) => {
+      const result = await fetch(url, options);
+      if (url === delayedPath) await pending;
+      return result;
+    };
+    pageButton(dialog, "在线播放").dispatchEvent("click");
+    if (delayedPath === fallbackPath) {
+      await new Promise(setImmediate);
+      video.onerror();
+    }
+    assert.ok(app.calls.some(({ url }) => url === delayedPath));
+    app.elements.get("player-close").dispatchEvent("click");
+    app.play({ id: 7, title: "本地电影" });
+    delayed.release();
+    await new Promise(setImmediate);
+    assert.equal(video.src, "/api/library/7/stream");
+    assert.equal(app.hlsInstances.length, 0);
+    assert.equal(app.elements.get("player-title").textContent, "本地电影");
+  }
 });
 
 test("imported Unicode usernames and short passwords reach login without relaxing setup", async () => {
@@ -1710,7 +1828,7 @@ test("settings tabs render one panel at a time", async () => {
   app.state.user = { id: 1, username: "root", role: "admin" };
   const page = await app.settings();
   assert.deepEqual(pageClass(page, "filter-chip").map((chip) => chip.textContent),
-    ["账户安全", "家庭成员", "在线影视源", "直播与节目单", "通知与日历", "备份与工具", "影视仓订阅"]);
+    ["账户安全", "家庭成员", "在线影视源", "解析接口", "直播与节目单", "通知与日历", "备份与工具", "影视仓订阅"]);
   const panelTitles = (view) => pageNodes(pageClass(view, "settings-panel")[0])
     .filter((node) => node.tagName === "H2").map((node) => node.textContent);
   assert.deepEqual(panelTitles(page), ["修改密码"]);
@@ -3172,3 +3290,5 @@ test("administrator sees official host commands and updates download settings wi
   assert.equal(changes[2].telegram_proxy, "");
   assert.doesNotMatch(page.textContent, /fixture:password/);
 });
+
+registerParserPanelTests({ environment, pageNodes, pageButton });

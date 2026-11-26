@@ -1,3 +1,7 @@
+mod resolved;
+
+pub(crate) use resolved::{PreparedDownload, prepare_catalog_download};
+
 use crate::{
     AppError, Shared,
     auth::{AuthUser, require_admin},
@@ -62,6 +66,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
         ("description", "TEXT NOT NULL DEFAULT ''"),
         ("attempt_token", "TEXT NOT NULL DEFAULT ''"),
         ("retry_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("resolved_media", "TEXT"),
     ] {
         crate::ensure_column(conn, "downloads", name, definition)?;
     }
@@ -398,6 +403,7 @@ pub(crate) fn parse_playlist(text: &str) -> Result<Vec<PlaylistChannel>, AppErro
 pub(crate) struct Download {
     id: i64,
     title: String,
+    #[serde(serialize_with = "public_download_url")]
     url: String,
     status: String,
     bytes_written: i64,
@@ -412,6 +418,10 @@ pub(crate) struct Download {
     user_id: i64,
     #[serde(skip)]
     attempt_token: String,
+}
+
+fn public_download_url<S: serde::Serializer>(url: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(url.split(['?', '#']).next().unwrap_or_default())
 }
 
 fn download_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Download> {
@@ -474,21 +484,27 @@ async fn list_downloads(
     Ok(Json(rows))
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct DownloadInput {
     url: String,
     title: String,
+    #[serde(default)]
+    flag: String,
+    direct: Option<bool>,
     #[serde(flatten)]
     metadata: DownloadMetadata,
 }
 
 fn download_extension(url: &Url) -> Result<String, AppError> {
-    let extension = url
+    let Some((_, extension)) = url
         .path()
-        .rsplit('.')
+        .rsplit('/')
         .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+        .and_then(|name| name.rsplit_once('.'))
+    else {
+        return Ok("mp4".into());
+    };
+    let extension = extension.to_ascii_lowercase();
     if extension == "m3u8" {
         return Ok("mp4".into());
     }
@@ -508,13 +524,17 @@ async fn create_download(
     user: AuthUser,
     Json(input): Json<DownloadInput>,
 ) -> Result<(StatusCode, Json<Download>), AppError> {
+    let direct = input.direct.unwrap_or_else(|| {
+        input.flag.is_empty() || crate::catalog::is_direct_media_url(&input.url)
+    });
+    let media = prepare_catalog_download(&state, &input.url, &input.flag, direct).await?;
     let conn = state.conn()?;
-    let id = enqueue_with_metadata(
+    let id = enqueue_prepared(
         &conn,
         &state,
         user.id,
         &input.title,
-        &input.url,
+        &media,
         &input.metadata,
     )?;
     let result = download_by_id(&conn, id, user.id)?;
@@ -528,39 +548,30 @@ pub fn enqueue_in(
     title: &str,
     raw_url: &str,
 ) -> Result<i64, AppError> {
-    enqueue_with_metadata(
+    enqueue_prepared(
         conn,
         state,
         user_id,
         title,
-        raw_url,
+        &PreparedDownload::direct(raw_url)?,
         &DownloadMetadata::default(),
     )
 }
 
-pub(crate) fn enqueue_with_metadata(
+pub(crate) fn enqueue_prepared(
     conn: &Connection,
     state: &Shared,
     user_id: i64,
     title: &str,
-    raw_url: &str,
+    media: &PreparedDownload,
     metadata: &DownloadMetadata,
 ) -> Result<i64, AppError> {
-    if raw_url.chars().any(char::is_control) {
-        return Err(AppError::bad_request(
-            "Invalid control character in download URL",
-        ));
-    }
-    let url = http_url(raw_url.trim())?;
-    let extension = download_extension(&url)?;
     insert_download(
         conn,
         state,
         user_id,
         title,
-        url.as_str(),
-        &extension,
-        Some(metadata),
+        DownloadSource::Media(media, metadata),
     )
 }
 
@@ -571,7 +582,12 @@ pub(crate) fn enqueue_telegram(
     title: &str,
     url: &str,
 ) -> Result<i64, AppError> {
-    insert_download(conn, state, user_id, title, url, "mp4", None)
+    insert_download(conn, state, user_id, title, DownloadSource::Telegram(url))
+}
+
+enum DownloadSource<'a> {
+    Media(&'a PreparedDownload, &'a DownloadMetadata),
+    Telegram(&'a str),
 }
 
 fn insert_download(
@@ -579,9 +595,7 @@ fn insert_download(
     state: &Shared,
     user_id: i64,
     title: &str,
-    url: &str,
-    extension: &str,
-    direct_metadata: Option<&DownloadMetadata>,
+    source: DownloadSource<'_>,
 ) -> Result<i64, AppError> {
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 200 {
@@ -589,17 +603,21 @@ fn insert_download(
             "Give the download a title of 1 to 200 characters",
         ));
     }
-    let relative_path = unique_relative_path(conn, state, title, extension)?;
-    let kind = if direct_metadata.is_some() {
-        "direct"
-    } else {
-        "telegram"
-    };
     let empty = DownloadMetadata::default();
-    let metadata = direct_metadata.unwrap_or(&empty);
+    let (url, extension, resolved, kind, metadata) = match source {
+        DownloadSource::Media(media, metadata) => (
+            media.original.as_str(),
+            media.extension.as_str(),
+            media.resolved.as_deref(),
+            "direct",
+            metadata,
+        ),
+        DownloadSource::Telegram(url) => (url, "mp4", None, "telegram", &empty),
+    };
+    let relative_path = unique_relative_path(conn, state, title, extension)?;
     conn.execute(
-        "INSERT INTO downloads(user_id,title,url,relative_path,created_at,kind,cover,year,description) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        params![user_id, title, url, relative_path, now(), kind, metadata.cover, metadata.year, metadata.description],
+        "INSERT INTO downloads(user_id,title,url,relative_path,created_at,kind,cover,year,description,resolved_media) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![user_id, title, url, relative_path, now(), kind, metadata.cover, metadata.year, metadata.description, resolved],
     )?;
     state.download_runtime.wake();
     Ok(conn.last_insert_rowid())
@@ -1053,11 +1071,25 @@ async fn transfer_attempt(
             .await
             .map_err(|e| e.to_string())?;
     } else {
-        let url = http_url(&job.url).map_err(|e| e.1)?;
+        let (url, private) = resolved::transfer_source(state, job)?;
         if url.path().to_ascii_lowercase().ends_with(".m3u8") {
-            transfer_hls(state, job, settings, work.path(), &part).await?;
+            let relay = crate::playback::DownloadRelay::start(url, private.unwrap_or_default())
+                .await
+                .map_err(|e| e.1)?;
+            transfer_hls(state, job, settings, work.path(), &part, &relay.url).await?;
         } else {
-            transfer_direct(state, job, &part).await?;
+            let response = if let Some(headers) = &private {
+                crate::playback::fetch_media(url, Some(headers), &Default::default())
+                    .await
+                    .map_err(|e| e.1)?
+                    .0
+            } else {
+                tokio::time::timeout(Duration::from_secs(30), state.client.get(url).send())
+                    .await
+                    .map_err(|_| "Source stopped responding for 30 seconds")?
+                    .map_err(|_| "Could not connect to the download source")?
+            };
+            transfer_direct(state, job, &part, response).await?;
         }
     }
     let file = tokio::fs::OpenOptions::new()
@@ -1075,11 +1107,12 @@ async fn transfer_attempt(
     publish_download(state, job, size, &part, extension.as_deref())
 }
 
-async fn transfer_direct(state: &Shared, job: &Download, part: &FsPath) -> Result<(), String> {
-    let response = tokio::time::timeout(Duration::from_secs(30), state.client.get(&job.url).send())
-        .await
-        .map_err(|_| "Source stopped responding for 30 seconds")?
-        .map_err(|_| "Could not connect to the download source")?;
+async fn transfer_direct(
+    state: &Shared,
+    job: &Download,
+    part: &FsPath,
+    response: reqwest::Response,
+) -> Result<(), String> {
     let response = response.error_for_status().map_err(|e| {
         format!(
             "Source returned HTTP {}",
@@ -1184,11 +1217,12 @@ async fn transfer_hls(
     settings: &DownloadSettings,
     work: &FsPath,
     part_path: &FsPath,
+    relay_url: &str,
 ) -> Result<(), String> {
     if preferred_available(&state.download_runtime, &settings.n_m3u8dl_path).await {
         let mut preferred = command(&settings.n_m3u8dl_path);
         preferred
-            .arg(&job.url)
+            .arg(relay_url)
             .arg("--save-dir")
             .arg(work)
             .arg("--tmp-dir")
@@ -1235,7 +1269,7 @@ async fn transfer_hls(
             "Mozilla/5.0",
             "-i",
         ])
-        .arg(&job.url)
+        .arg(relay_url)
         .args([
             "-map",
             "0:v?",
@@ -1329,6 +1363,7 @@ mod tests {
         crate::tracking::init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            playback_grants: Default::default(),
             download_runtime: Default::default(),
             media_dir,
             download_dir,
@@ -1467,7 +1502,7 @@ mod tests {
             Json(DownloadInput {
                 url: "https://example.com/a.mp4".into(),
                 title: "Episode 1".into(),
-                metadata: Default::default(),
+                ..Default::default()
             }),
         )
         .await
@@ -1522,7 +1557,7 @@ mod tests {
             Json(DownloadInput {
                 url: format!("http://{address}/video.mp4"),
                 title: "Video".into(),
-                metadata: Default::default(),
+                ..Default::default()
             }),
         )
         .await
@@ -1607,7 +1642,7 @@ mod tests {
             Json(DownloadInput {
                 url: format!("http://{address}/video.mp4"),
                 title: "Downloaded video".into(),
-                metadata: Default::default(),
+                ..Default::default()
             }),
         )
         .await
@@ -1666,7 +1701,7 @@ mod tests {
             Json(DownloadInput {
                 url: "https://example.com/video.mp4".into(),
                 title: "Video".into(),
-                metadata: Default::default(),
+                ..Default::default()
             }),
         )
         .await
@@ -1909,10 +1944,8 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 printf '%s\n' "$url" >> "$0.log"
-case "$url" in
-  */failed.m3u8) printf partial > "$dir/$name.MUX.mp4"; exit 1;;
-  *) printf preferred > "$dir/$name.MUX.mp4";;
-esac
+if [ -f "$0.fail" ]; then printf partial > "$dir/$name.MUX.mp4"; exit 1; fi
+printf preferred > "$dir/$name.MUX.mp4"
 "#,
         );
         let fallback = stub(
@@ -1936,11 +1969,19 @@ printf fallback > "$last"
             ("failed", "fallback"),
             ("unavailable", "fallback"),
         ] {
+            if title == "failed" {
+                std::fs::write(format!("{primary}.fail"), "").unwrap();
+            }
             if title == "unavailable" {
                 settings.n_m3u8dl_path = temp.path().join("missing").to_str().unwrap().to_owned();
                 configure(&state, &settings);
             }
-            let id = queue(&state, 1, title, &format!("http://127.0.0.1/{title}.m3u8"));
+            let id = queue(
+                &state,
+                1,
+                title,
+                &format!("http://127.0.0.1/{title}.m3u8?token=secret"),
+            );
             wait_for(|| job_for(&state, id, 1).status == "completed").await;
             let job = job_for(&state, id, 1);
             assert_eq!(job.attempts, 1);
@@ -1950,14 +1991,17 @@ printf fallback > "$last"
             );
         }
         let calls = std::fs::read_to_string(format!("{primary}.log")).unwrap();
-        assert_eq!(
-            calls.lines().collect::<Vec<_>>(),
-            [
-                "probe",
-                "http://127.0.0.1/priority.m3u8",
-                "http://127.0.0.1/failed.m3u8"
-            ]
-        );
+        let mut calls = calls.lines();
+        assert_eq!(calls.next(), Some("probe"));
+        for _ in 0..2 {
+            let call = calls.next().unwrap();
+            assert!(
+                call.starts_with("http://127.0.0.1:") && call.contains("/api/playback/grants/")
+            );
+            assert!(call.ends_with(".m3u8"));
+            assert!(!call.contains("secret"));
+        }
+        assert_eq!(calls.next(), None);
         assert_eq!(
             std::fs::read_to_string(format!("{fallback}.log")).unwrap(),
             "fallback\nfallback\n"
@@ -1975,7 +2019,7 @@ printf fallback > "$last"
             Json(DownloadInput {
                 url: "https://example.com/video.mp4".into(),
                 title: "Video".into(),
-                metadata: Default::default(),
+                ..Default::default()
             }),
         )
         .await

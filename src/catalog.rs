@@ -1,3 +1,4 @@
+mod fallback;
 mod recommend;
 
 use crate::{
@@ -94,7 +95,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
                 WHERE id=NEW.id;
         END;",
     )?;
-    Ok(())
+    fallback::init_cache(conn)
 }
 
 pub fn router() -> Router<Shared> {
@@ -116,6 +117,7 @@ pub fn router() -> Router<Shared> {
         .route("/api/catalog/discover", get(discover_handler))
         .route("/api/catalog/recommend", get(recommend::handler))
         .route("/api/catalog/categories", get(categories_handler))
+        .route("/api/catalog/fallback", get(fallback::handler))
         .route("/api/catalog/{source_id}/detail", get(detail_handler))
 }
 
@@ -649,6 +651,7 @@ pub struct DiscoverResponse {
 pub struct Episode {
     pub name: String,
     pub url: String,
+    pub direct: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1118,20 +1121,22 @@ async fn detail_handler(
     Path(source_id): Path<i64>,
     Query(query): Query<DetailQuery>,
 ) -> Result<Json<CatalogDetail>, AppError> {
-    detail(&state, source_id, &query.id).await.map(Json)
+    let id = validate_text(&query.id, "Media ID", 256)?;
+    let (source, slot) = fallback::open_detail(&state, source_id, id)?;
+    let item = detail_item(&state, &source, id).await?;
+    let detail = catalog_detail(source, &item)?;
+    fallback::remember_detail(&state, slot, &item)?;
+    Ok(Json(detail))
 }
 
 pub async fn detail(state: &Shared, source_id: i64, id: &str) -> Result<CatalogDetail, AppError> {
     let id = validate_text(id, "Media ID", 256)?;
     let source = visible_source(state, source_id)?;
-    let page = fetch_items(state, &source, &[("ac", "detail"), ("ids", id)])
-        .await
-        .map_err(|message| AppError(StatusCode::BAD_GATEWAY, message))?;
-    let item = page
-        .items
-        .iter()
-        .find(|item| text(item, "vod_id") == id)
-        .ok_or_else(|| AppError::not_found("Media not found at this source"))?;
+    let item = detail_item(state, &source, id).await?;
+    catalog_detail(source, &item)
+}
+
+fn catalog_detail(source: Source, item: &Value) -> Result<CatalogDetail, AppError> {
     let summary = summary(&source, item).ok_or_else(|| {
         AppError(
             StatusCode::BAD_GATEWAY,
@@ -1140,15 +1145,28 @@ pub async fn detail(state: &Shared, source_id: i64, id: &str) -> Result<CatalogD
     })?;
     Ok(CatalogDetail {
         id: summary.id,
-        source_id,
+        source_id: source.id,
         source_name: source.name,
         title: summary.title,
         cover: summary.cover,
         description: text(item, "vod_content"),
         year: summary.year,
         remark: summary.remark,
-        groups: play_groups(&text(item, "vod_play_from"), &text(item, "vod_play_url")),
+        groups: play_groups(
+            item["vod_play_from"].as_str().unwrap_or_default(),
+            item["vod_play_url"].as_str().unwrap_or_default(),
+        ),
     })
+}
+
+async fn detail_item(state: &Shared, source: &Source, id: &str) -> Result<Value, AppError> {
+    let page = fetch_items(state, source, &[("ac", "detail"), ("ids", id)])
+        .await
+        .map_err(|message| AppError(StatusCode::BAD_GATEWAY, message))?;
+    page.items
+        .into_iter()
+        .find(|item| text(item, "vod_id") == id)
+        .ok_or_else(|| AppError::not_found("Media not found at this source"))
 }
 
 fn text(item: &Value, field: &str) -> String {
@@ -1240,7 +1258,8 @@ fn play_groups(names: &str, playlists: &str) -> Vec<PlayGroup> {
                         } else {
                             name.trim().to_string()
                         },
-                        url: url.to_string(),
+                        direct: direct_media_path(url.path()),
+                        url: url.into(),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1254,9 +1273,7 @@ fn play_groups(names: &str, playlists: &str) -> Vec<PlayGroup> {
                 } else {
                     name.to_string()
                 },
-                direct: episodes
-                    .iter()
-                    .all(|episode| is_direct_media_url(&episode.url)),
+                direct: episodes.iter().all(|episode| episode.direct),
                 episodes,
             })
         })
@@ -1264,21 +1281,19 @@ fn play_groups(names: &str, playlists: &str) -> Vec<PlayGroup> {
 }
 
 /// Known media containers that browsers, TV clients, or the download worker
-/// can fetch directly. CMS "share" or parser pages have no such suffix and
-/// need a spider/parser PolyView does not run.
+/// can fetch directly. CMS share pages typically need a configured parser.
 pub fn is_direct_media_url(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|url| direct_media_path(url.path()))
+}
+
+fn direct_media_path(path: &str) -> bool {
     const EXTENSIONS: &[&str] = &[
         "m3u8", "mp4", "m4v", "webm", "mkv", "mov", "ts", "flv", "avi", "wmv",
     ];
-    Url::parse(url).ok().is_some_and(|url| {
-        url.path()
-            .rsplit_once('.')
-            .map(|(_, extension)| {
-                EXTENSIONS
-                    .iter()
-                    .any(|known| extension.eq_ignore_ascii_case(known))
-            })
-            .unwrap_or(false)
+    path.rsplit_once('.').is_some_and(|(_, extension)| {
+        EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
     })
 }
 
@@ -1518,6 +1533,7 @@ mod tests {
         init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            playback_grants: Default::default(),
             download_runtime: Default::default(),
             media_dir: temp.path().to_path_buf(),
             download_dir: temp.path().to_path_buf(),

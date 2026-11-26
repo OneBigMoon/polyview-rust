@@ -196,6 +196,7 @@ async fn import(
         source_subscriptions::restore_config(&tx, config, &manual_urls)?;
     }
     tx.commit()?;
+    state.playback_grants.clear();
     Ok(Json(json!({"ok": true})))
 }
 

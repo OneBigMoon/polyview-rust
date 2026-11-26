@@ -672,20 +672,13 @@ fn require_target(conn: &Connection, kind: &str, url: &str) -> Result<(), AppErr
 
 impl ParserConfig {
     fn restore(self, conn: &Connection, url: &str) -> Result<(), AppError> {
-        validate_name(&self.name)?;
-        let headers: HashMap<String, String> = serde_json::from_str(&self.headers_json)
-            .map_err(|_| AppError::bad_request("Invalid parser headers"))?;
-        if self.headers_json.len() > 32_768
-            || headers.iter().any(|(name, value)| {
-                reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
-                    || reqwest::header::HeaderValue::from_str(value).is_err()
-            })
-            || self.flags.len() > 4096
-            || self.flags.chars().any(char::is_control)
-            || !(1..=120_000).contains(&self.timeout_ms)
-        {
-            return Err(AppError::bad_request("Invalid parser configuration"));
-        }
+        crate::parsers::validate_config(
+            &self.name,
+            url,
+            &self.headers_json,
+            &self.flags,
+            self.timeout_ms,
+        )?;
         conn.execute(
             "INSERT INTO parsers(url_template,name,headers_json,flags,priority,timeout_ms,enabled)
              VALUES(?,?,?,?,?,?,?) ON CONFLICT(url_template) DO UPDATE SET name=excluded.name,

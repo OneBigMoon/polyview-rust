@@ -8,6 +8,7 @@ pub mod library;
 pub mod live_sources;
 pub mod network;
 pub mod notify;
+pub mod parsers;
 pub mod playback;
 pub mod settings;
 pub mod source_subscriptions;
@@ -36,6 +37,7 @@ pub type Shared = Arc<AppState>;
 
 pub struct AppState {
     pub db: Mutex<Connection>,
+    pub playback_grants: playback::PlaybackGrants,
     pub download_runtime: network::DownloadRuntime,
     pub media_dir: PathBuf,
     pub download_dir: PathBuf,
@@ -144,6 +146,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     settings::init_schema(conn)?;
     live_sources::init_schema(conn)?;
     source_subscriptions::init_schema(conn)?;
+    parsers::init_schema(conn)?;
     Ok(())
 }
 
@@ -151,6 +154,7 @@ pub fn router(state: Shared) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(script))
+        .route("/parser-settings.js", get(parser_settings_script))
         .route("/style.css", get(styles))
         .route("/three-bg.js", get(three_background))
         .route("/vendor/three.module.min.js", get(three_module))
@@ -161,6 +165,7 @@ pub fn router(state: Shared) -> Router {
         .merge(network::router())
         .merge(epg::router())
         .merge(playback::router())
+        .merge(parsers::router())
         .merge(catalog::router())
         .merge(tracking::router())
         .merge(tvbox::router())
@@ -213,6 +218,12 @@ async fn script() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../web/app.js"),
+    )
+}
+async fn parser_settings_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/parser-settings.js"),
     )
 }
 async fn styles() -> impl IntoResponse {

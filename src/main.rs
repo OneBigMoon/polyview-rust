@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state: Shared = Arc::new(AppState {
         db: Mutex::new(conn),
+        playback_grants: Default::default(),
         download_runtime: Default::default(),
         media_dir,
         download_dir,

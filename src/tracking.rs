@@ -1,8 +1,8 @@
 use crate::{
     AppError, Shared,
     auth::AuthUser,
-    catalog::{self, CatalogDetail},
-    ensure_column, network, notify, now,
+    catalog::{self, CatalogDetail, PlayGroup},
+    ensure_column, network, notify, now, parsers,
 };
 use axum::{
     Json, Router,
@@ -318,106 +318,170 @@ async fn check_one(state: &Shared, id: i64, user_id: i64) -> Result<usize, AppEr
     if subscription.paused {
         return Ok(0);
     }
-    let detail = catalog::detail(state, subscription.source_id, &subscription.media_id).await;
-    let result = detail.and_then(|detail| apply_detail(state, id, user_id, detail));
+    let result = match catalog::detail(state, subscription.source_id, &subscription.media_id).await
+    {
+        Ok(detail) => apply_detail(state, id, user_id, detail).await,
+        Err(error) => Err(error),
+    };
     if let Err(ref error) = result {
         let updated = state.conn()?.execute(
-            "UPDATE tracking_subscriptions SET last_checked=?,error=? WHERE id=? AND user_id=? AND paused=0",
-            params![now(), error.1, id, user_id],
+            "UPDATE tracking_subscriptions SET last_checked=?,error=?
+             WHERE id=? AND user_id=? AND source_id=? AND media_id=? AND paused=0",
+            params![
+                now(),
+                error.1,
+                id,
+                user_id,
+                subscription.source_id,
+                subscription.media_id
+            ],
         )?;
-        if updated == 0 && owned_subscription(state, id, user_id)?.paused {
+        if updated == 0 {
             return Ok(0);
         }
     }
     result
 }
 
-fn apply_detail(
+struct CheckState {
+    watched: i64,
+    automatic: bool,
+    total: i64,
+    notified: i64,
+}
+
+fn check_state(
+    conn: &Connection,
+    id: i64,
+    user_id: i64,
+    detail: &CatalogDetail,
+) -> Result<Option<CheckState>, AppError> {
+    Ok(conn
+        .query_row(
+            "SELECT watched_episodes,auto_download,total_episodes,notified_episodes
+             FROM tracking_subscriptions WHERE id=? AND user_id=? AND source_id=? AND media_id=? AND paused=0",
+            params![id, user_id, detail.source_id, detail.id],
+            |row| Ok(CheckState {
+                watched: row.get(0)?,
+                automatic: row.get(1)?,
+                total: row.get(2)?,
+                notified: row.get(3)?,
+            }),
+        )
+        .optional()?)
+}
+
+fn tracking_group<'a>(
+    conn: &Connection,
+    groups: &'a [PlayGroup],
+) -> Result<&'a PlayGroup, AppError> {
+    if let Some(group) = groups.iter().find(|group| group.direct) {
+        return Ok(group);
+    }
+    for group in groups {
+        if parsers::has_matching_parser(conn, &group.name)? {
+            return Ok(group);
+        }
+    }
+    Err(AppError(
+        StatusCode::BAD_GATEWAY,
+        "Source has no directly playable HTTP(S) episodes or matching parser".into(),
+    ))
+}
+
+async fn apply_detail(
     state: &Shared,
     id: i64,
     user_id: i64,
     detail: CatalogDetail,
 ) -> Result<usize, AppError> {
-    let mut conn = state.conn()?;
-    let tx = conn.transaction()?;
-    let (paused, watched, automatic, old_total, notified): (bool, i64, bool, i64, i64) = tx.query_row(
-        "SELECT paused,watched_episodes,auto_download,total_episodes,notified_episodes FROM tracking_subscriptions WHERE id=? AND user_id=?",
-        params![id, user_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-    ).optional()?.ok_or_else(|| AppError::not_found("Subscription not found"))?;
-    if paused {
-        return Ok(0);
-    }
-    let episodes = &detail
-        .groups
-        .iter()
-        .find(|group| group.direct && !group.episodes.is_empty())
-        .ok_or_else(|| {
-            AppError(
-                StatusCode::BAD_GATEWAY,
-                "Source has no directly playable HTTP(S) episodes; parsing-only sources cannot be tracked for download".into(),
-            )
-        })?
-        .episodes;
-    if episodes.len() > 10_000 {
-        return Err(AppError::bad_request(
-            "A subscription supports at most 10,000 episodes",
-        ));
-    }
-    let total = episodes.len() as i64;
-    let send_update = total > old_total && total > notified;
-    tx.execute(
-        "UPDATE tracking_subscriptions SET title=?,cover=?,total_episodes=?,notified_episodes=?,last_checked=?,error=NULL WHERE id=? AND user_id=?",
-        params![detail.title, detail.cover, total, if send_update { total } else { notified }, now(), id, user_id],
-    )?;
-    let mut queued = 0;
-    if automatic {
-        let metadata = network::DownloadMetadata {
-            cover: detail.cover,
-            year: detail.year,
-            description: detail.description,
+    let (snapshot, group, known) = {
+        let conn = state.conn()?;
+        let Some(snapshot) = check_state(&conn, id, user_id, &detail)? else {
+            return Ok(0);
         };
+        let group = tracking_group(&conn, &detail.groups)?;
+        if group.episodes.len() > 10_000 {
+            return Err(AppError::bad_request(
+                "A subscription supports at most 10,000 episodes",
+            ));
+        }
+        let known = if snapshot.automatic {
+            conn.prepare("SELECT episode_key FROM tracking_downloads WHERE subscription_id=?")?
+                .query_map([id], |row| row.get(0))?
+                .collect::<Result<HashSet<String>, _>>()?
+        } else {
+            HashSet::new()
+        };
+        (snapshot, group, known)
+    };
+    let total = group.episodes.len() as i64;
+    let mut prepared = Vec::new();
+    if snapshot.automatic {
         let mut seen = HashSet::new();
-        for (index, episode) in episodes.iter().enumerate() {
+        for (index, episode) in group.episodes.iter().enumerate() {
             let ordinal = index as i64 + 1;
-            // Episode names survive refreshed signed URLs; duplicate labels use their stable playlist position.
+            // Names survive refreshed URLs. Duplicate labels use their stable playlist position.
             let name = episode.name.trim().to_lowercase();
             let key = if name.is_empty() || !seen.insert(name.clone()) {
                 format!("position:{ordinal}")
             } else {
                 format!("name:{name}")
             };
-            if ordinal <= watched {
+            if ordinal <= snapshot.watched || known.contains(&key) {
                 continue;
             }
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM tracking_downloads WHERE subscription_id=? AND episode_key=?)",
+            let media =
+                network::prepare_catalog_download(state, &episode.url, &group.name, episode.direct)
+                    .await?;
+            prepared.push((ordinal, key, media));
+        }
+    }
+
+    // An HTTP request may overlap another check, or a change to the user's subscription.
+    // Recheck eligibility and claim each episode in the same transaction as its download.
+    let mut conn = state.conn()?;
+    let tx = conn.transaction()?;
+    let Some(current) = check_state(&tx, id, user_id, &detail)? else {
+        return Ok(0);
+    };
+    let send_update = total > current.total && total > current.notified;
+    tx.execute(
+        "UPDATE tracking_subscriptions SET title=?,cover=?,total_episodes=?,notified_episodes=?,last_checked=?,error=NULL WHERE id=? AND user_id=?",
+        params![detail.title, detail.cover, total, if send_update { total } else { current.notified }, now(), id, user_id],
+    )?;
+    let mut queued = 0;
+    if current.automatic && !prepared.is_empty() {
+        let metadata = network::DownloadMetadata {
+            cover: detail.cover,
+            year: detail.year,
+            description: detail.description,
+        };
+        let title_prefix: String = detail.title.chars().take(180).collect();
+        for (ordinal, key, media) in prepared {
+            if ordinal <= current.watched {
+                continue;
+            }
+            let claimed = tx.execute(
+                "INSERT INTO tracking_downloads(subscription_id,episode_key) VALUES(?,?)
+                 ON CONFLICT(subscription_id,episode_key) DO NOTHING",
                 params![id, key],
-                |row| row.get(0),
             )?;
-            if exists {
+            if claimed == 0 {
                 continue;
             }
-            let title = format!(
-                "{} S01E{ordinal:02}",
-                detail.title.chars().take(180).collect::<String>()
-            );
-            let download_id = network::enqueue_with_metadata(
-                &tx,
-                state,
-                user_id,
-                &title,
-                &episode.url,
-                &metadata,
-            )?;
+            let title = format!("{title_prefix} S01E{ordinal:02}");
+            let download_id =
+                network::enqueue_prepared(&tx, state, user_id, &title, &media, &metadata)?;
             tx.execute(
-                "INSERT INTO tracking_downloads(subscription_id,episode_key,download_id) VALUES(?,?,?)",
-                params![id, key, download_id],
+                "UPDATE tracking_downloads SET download_id=? WHERE subscription_id=? AND episode_key=?",
+                params![download_id, id, key],
             )?;
             queued += 1;
         }
     }
     tx.commit()?;
+    drop(conn);
     if send_update {
         notify::send_in_background(
             state,
@@ -480,13 +544,15 @@ mod tests {
         let download_dir = media_dir.join("downloads");
         std::fs::create_dir(&download_dir).unwrap();
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE users(id INTEGER PRIMARY KEY); INSERT INTO users VALUES(1),(2);").unwrap();
-        catalog::init_schema(&conn).unwrap();
-        network::init_schema(&conn).unwrap();
-        init_schema(&conn).unwrap();
-        crate::settings::init_schema(&conn).unwrap();
+        crate::init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO users(id,username,password_hash,role,created_at) VALUES
+             (1,'user1','','user',0),(2,'user2','','user',0)",
+        )
+        .unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            playback_grants: Default::default(),
             download_runtime: Default::default(),
             media_dir,
             download_dir,

@@ -890,7 +890,52 @@
       toast("已跳过片头");
     }
   }
-  function attachPlayerSource() {
+  async function recoverCatalogSource(player, message) {
+    const video = $("video-player");
+    const item = player.item;
+    const attempt = ++player.attempt;
+    const current = () => state.player === player && player.attempt === attempt;
+    if (player.metadataReady && Number.isFinite(video.currentTime)) {
+      player.resumePosition = video.currentTime;
+      saveProgress(true);
+    }
+    player.metadataReady = false;
+    player.sourcePending = true;
+    destroyHls();
+    video.pause();
+    const status = $("player-message");
+    status.textContent = message;
+    if (item.source_id == null || item.media_id == null || item.episode_index == null) return;
+    if (!player.fallbacks) {
+      const query = new URLSearchParams({ source_id: item.source_id, vod_id: item.media_id, episode: item.episode_index + 1 });
+      if (item.flag) query.set("flag", item.flag);
+      status.textContent = "正在查找本集的备用片源…";
+      try {
+        const result = await api(`/api/catalog/fallback?${query}`);
+        if (!current()) return;
+        const key = (url, direct, flag) => JSON.stringify([url, direct === false ? flag : null]);
+        const seen = new Set([key(item.remote_url, item.direct, item.flag)]);
+        player.fallbacks = (result.items || []).filter((entry) => {
+          if (!entry?.url) return false;
+          const id = key(entry.url, entry.direct, entry.flag);
+          if (seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        });
+      } catch (_) {
+        if (current()) status.textContent = `${message} 获取备用片源失败。`;
+        return;
+      }
+    }
+    const next = player.fallbacks.shift();
+    if (!next) {
+      status.textContent = `${message} 没有更多可用片源。`;
+      return;
+    }
+    player.autoplay = true;
+    attachPlayerSource(next);
+  }
+  async function attachPlayerSource(alternative) {
     const player = state.player;
     if (!player) return;
     const video = $("video-player");
@@ -911,11 +956,29 @@
       : "使用播放器控制开始播放。按 Esc 关闭。";
     const upstream = player.live
       ? liveUrl(player, player.sourceIndex)
-      : player.item.remote_url;
-    const source = upstream
-      ? `/api/playback?url=${encodeURIComponent(upstream)}`
-      : `/api/library/${encodeURIComponent(player.item.id)}/stream`;
-    const hlsSource = /\.m3u8(?:[?#]|$)/i.test(upstream || source);
+      : alternative?.url ?? player.item.remote_url;
+    const line = alternative || player.item;
+    const status = $("player-message");
+    let source, hlsSource;
+    if (!player.live && line.direct === false) {
+      player.sourcePending = true;
+      status.textContent = "正在解析播放地址…";
+      try {
+        const result = await api("/api/playback/resolve", { method: "POST", body: { url: upstream, flag: line.flag } });
+        if (!current()) return;
+        if (!result?.playback_url || new URL(result.playback_url, location.origin).origin !== location.origin) throw new Error();
+        source = result.playback_url;
+        hlsSource = result.is_hls === true;
+      } catch (_) {
+        if (current()) return recoverCatalogSource(player, "播放地址解析失败。");
+        return;
+      }
+      status.textContent = "播放地址已解析，正在载入视频…";
+    } else {
+      source = upstream ? `/api/playback?url=${encodeURIComponent(upstream)}` : `/api/library/${encodeURIComponent(player.item.id)}/stream`;
+      hlsSource = /\.m3u8(?:[?#]|$)/i.test(upstream || source);
+    }
+    if (alternative) status.textContent = "正在切换备用片源…";
     const nativeHls =
       video.canPlayType("application/vnd.apple.mpegurl") === "probably";
     const startPlayback = () => {
@@ -929,13 +992,12 @@
               player.live ? "浏览器阻止了自动播放，请点击播放器开始直播。" : "请点击播放器继续播放。";
         });
     };
-    video.onerror = () => {
+    const fail = (message) => {
       if (!current()) return;
       if (player.live) failLiveSource();
-      else
-        $("player-message").textContent =
-          "视频无法播放，请检查文件格式或媒体目录权限。";
+      else return recoverCatalogSource(player, message);
     };
+    video.onerror = () => fail("视频无法播放，请检查媒体地址或文件格式。");
     if (player.live)
       video.onplaying = () => {
         if (current()) $("player-message").textContent = "正在直播。";
@@ -954,13 +1016,7 @@
       });
       state.hls = hls;
       hls.on(window.Hls.Events.ERROR, (_, data) => {
-        if (!data.fatal || !current()) return;
-        if (player.live) failLiveSource();
-        else {
-          $("player-message").textContent =
-            "HLS 连接失败，请确认服务器能访问媒体地址或视频编码受支持。";
-          destroyHls();
-        }
+        if (data.fatal) fail("HLS 连接失败。");
       });
       hls.on(window.Hls.Events.MANIFEST_PARSED, startPlayback);
       hls.loadSource(source);
@@ -976,11 +1032,11 @@
     if (!player.live)
       video.onloadedmetadata = () => {
         if (!current()) return;
-        if (
-          n(player.item.position) > 0 &&
-          (player.item.remote_url ? n(player.item.position) < video.duration : n(player.item.position) < video.duration - 1)
-        )
-          video.currentTime = player.item.position;
+        const position = player.resumePosition;
+        if (position > 0 && position < video.duration - (player.item.remote_url ? 0 : 1))
+          video.currentTime = position;
+        player.sourcePending = false;
+        if (alternative || line.direct === false) status.textContent = alternative ? "已切换备用片源。" : "播放地址已解析。";
         player.metadataReady = true;
         skipIntro(player);
         if (!hlsSource || nativeHls || !state.hls) startPlayback();
@@ -1051,6 +1107,8 @@
       item,
       live,
       autoplay,
+      resumePosition: n(item.position),
+      sourcePending: false,
       sources: live ? liveSources(item) : [],
       playlist,
       playlistIndex,
@@ -1105,6 +1163,7 @@
     if (
       !current ||
       current.live ||
+      current.sourcePending ||
       !Number.isFinite(video.currentTime) ||
       !Number.isFinite(video.duration) ||
       video.duration <= 0
@@ -2538,13 +2597,11 @@
       let episodeButtons = [];
       const watch = (index, position = 0, autoplay = false) => {
         const group = detail.groups[n(groups.value)];
-        if (group.direct === false) {
-          toast("该线路是非直链解析页，无法直接播放，请选择直链线路。", true);
-          return;
-        }
         const playlist = orderedEpisodes().map((episode) => ({
           title: `${detail.title} · ${episode.name}`,
           remote_url: episode.url,
+          flag: group.name,
+          direct: episode.direct ?? group.direct,
           catalog_title: detail.title,
           source_id: detail.source_id,
           media_id: detail.id,
@@ -2562,9 +2619,10 @@
       const record = progress?.[0];
       function resume() {
         // Prefer the original stream when multiple providers label their episodes differently.
-        let line = detail.groups.findIndex((group) => group.direct !== false && group.episodes.some((episode) => episode.url === record.remote_url));
-        if (line < 0) line = detail.groups.findIndex((group) => group.direct !== false && group.episodes[record.episode_index]);
-        if (line < 0) return toast("该集暂无可用直链线路。", true);
+        let line = detail.groups.findIndex((group) => group.episodes.some((episode) => episode.url === record.remote_url));
+        if (line < 0) line = detail.groups.findIndex((group) => group.direct && group.episodes[record.episode_index]);
+        if (line < 0) line = detail.groups.findIndex((group) => group.episodes[record.episode_index]);
+        if (line < 0) return toast("该集暂无可用线路。", true);
         groups.value = String(line);
         const ordered = orderedEpisodes();
         let index = ordered.findIndex((episode) => episode.url === record.remote_url);
@@ -2595,6 +2653,11 @@
       });
       function enqueueEpisode(episode) {
         const body = { url: episode.url, title: `${detail.title} ${episodeCode(episode.sourceIndex + 1)}` };
+        const group = detail.groups[n(groups.value)];
+        if ((episode.direct ?? group.direct) === false) {
+          body.direct = false;
+          body.flag = group.name;
+        }
         if (favoriteData.cover) body.cover = favoriteData.cover;
         if (favoriteData.year) body.year = String(favoriteData.year);
         if (description) body.description = description;
@@ -2602,10 +2665,6 @@
       }
       async function submitBatch() {
         if (submitting || !picked.size) return;
-        if (detail.groups[n(groups.value)].direct === false) {
-          toast("该线路是非直链解析页，无法直接下载，请选择直链线路。", true);
-          return;
-        }
         submitting = true;
         paintBatch();
         let ok = 0;
@@ -2691,10 +2750,6 @@
       fillEpisodes();
       const download = button("下载本集", "subtle", async () => {
         if (owner !== state.user) return;
-        if (detail.groups[n(groups.value)].direct === false) {
-          toast("该线路是非直链解析页，无法直接下载，请选择直链线路。", true);
-          return;
-        }
         download.disabled = true;
         const episode = selected();
         try {
@@ -4360,6 +4415,7 @@
         ? [
             ["family", "家庭成员"],
             ["sources", "在线影视源"],
+            ["parsers", "解析接口"],
             ["epg", "直播与节目单"],
             ["notify", "通知与日历"],
             ["backup", "备份与工具"],
@@ -4395,6 +4451,7 @@
     if (active === "account") body.append(accountSettings());
     else if (active === "family") body.append(await familySettings());
     else if (active === "sources") body.append(await sourceSettings());
+    else if (active === "parsers") body.append(await globalThis.polyviewParserPanel({ make, button, api, toast }));
     else if (active === "epg") body.append(...await Promise.all([epgSettings(), liveSubscriptionSettings(), channelAliasSettings()]));
     else if (active === "notify") body.append(...await notificationCalendarSettings());
     else if (active === "backup") body.append(...backupSettings());
@@ -4811,7 +4868,8 @@
   });
   async function finishEpisode(skippedOutro) {
     const player = state.player;
-    if (!player || player.live || player.finishing) return;
+    if (!player || player.live || player.sourcePending || player.finishing) return;
+    const attempt = player.attempt;
     player.finishing = true;
     try {
       if (skippedOutro) {
@@ -4820,7 +4878,7 @@
         toast("已跳过片尾");
       }
       await saveProgress(true);
-      if (player === state.player && player.playlistIndex < player.playlist.length - 1) {
+      if (player === state.player && player.attempt === attempt && player.playlistIndex < player.playlist.length - 1) {
         toast(skippedOutro ? "已跳过片尾，正在播放下一集" : "即将播放下一集");
         playPlaylist(1, true);
       }

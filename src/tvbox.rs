@@ -565,6 +565,7 @@ mod tests {
         conn.execute("INSERT INTO users(id,username,password_hash,role,created_at) VALUES(1,'viewer','unused','user',0)",[]).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            playback_grants: Default::default(),
             download_runtime: Default::default(),
             download_dir: media_dir.join("downloads"),
             media_dir,

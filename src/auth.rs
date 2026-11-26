@@ -473,6 +473,9 @@ async fn update_user(
         tx.execute("DELETE FROM sessions WHERE user_id=?", [id])?;
     }
     tx.commit()?;
+    if input.disabled == Some(true) || input.role.as_deref() == Some("user") {
+        state.playback_grants.revoke_user(id);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -492,6 +495,7 @@ async fn delete_user(
         return Err(AppError::not_found("User not found"));
     }
     tx.commit()?;
+    state.playback_grants.revoke_user(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -537,6 +541,7 @@ async fn reset_password(
     }
     tx.execute("DELETE FROM sessions WHERE user_id=?", [id])?;
     tx.commit()?;
+    state.playback_grants.revoke_user(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -588,6 +593,7 @@ async fn change_password(
         params![user.id, cookie_token(&headers).unwrap_or("")],
     )?;
     tx.commit()?;
+    state.playback_grants.revoke_user(user.id);
     Ok(StatusCode::NO_CONTENT)
 }
 
