@@ -1347,6 +1347,18 @@ textarea {
   gap: 20px;
   align-items: start;
 }
+
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 2px 0 18px;
+}
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
 .user-list {
   display: flex;
   flex-direction: column;
@@ -1417,10 +1429,17 @@ textarea {
   width: 44px;
   height: 56px;
   flex: none;
+  overflow: hidden;
   border-radius: 10px;
   background: linear-gradient(145deg, #6d4bb0, #2a1d45);
   color: #fff;
   font-size: 18px;
+}
+.series-cover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 .series-info {
   flex: 1;
@@ -1490,7 +1509,14 @@ textarea {
   color: var(--danger);
 }
 .tracking-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 14px;
   padding: 20px;
+}
+.tracking-row .catalog-actions,
+.tracking-row .tracking-progress {
+  grid-column: 1 / -1;
 }
 .tracking-row .catalog-actions {
   margin: 12px 0;
@@ -1503,6 +1529,14 @@ textarea {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+.tracking-progress .step-button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 8px;
+  font-size: 15px;
 }
 .tracking-progress label {
   display: flex;
@@ -1615,6 +1649,19 @@ textarea {
   color: var(--accent);
 }
 
+.catalog-batch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 12px 0 4px;
+}
+.episode-grid .picked {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--ink);
+}
+
 
 /* Live guide */
 .live-guide {
@@ -1710,11 +1757,13 @@ textarea {
   height: 32px;
   flex: none;
   border-radius: 9px;
-  background: var(--muted-bg);
   color: var(--faint);
   font-size: 10px;
   font-weight: 600;
   object-fit: contain;
+  padding: 2px;
+  background: #f7f8fc;
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.06);
 }
 .epg-channel-copy {
   display: block;
@@ -2137,6 +2186,21 @@ textarea {
   font-weight: 500;
   animation: toast-in 0.22s var(--ease-out);
 }
+
+.connection-banner {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  z-index: 60;
+  transform: translateX(-50%);
+  padding: 8px 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+}
 .toast.error {
   border-color: rgba(220, 38, 38, 0.28);
   background: var(--danger-soft);
@@ -2252,6 +2316,36 @@ textarea {
 }
 .auth-panel input {
   min-height: 44px;
+}
+
+.password-field {
+  position: relative;
+  display: block;
+}
+.password-field input {
+  width: 100%;
+  padding-right: 46px;
+}
+.password-reveal {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+.password-reveal svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
 }
 .auth-panel .button {
   min-height: 46px;
@@ -2628,6 +2722,28 @@ textarea {
   gap: 10px;
   margin-top: 8px;
 }
+
+.spotlight-dots {
+  display: flex;
+  gap: 7px;
+  margin-top: 12px;
+}
+.spotlight-dot {
+  width: 7px;
+  height: 7px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--line-strong);
+  cursor: pointer;
+  transition:
+    width 0.2s var(--ease-smooth),
+    background 0.2s var(--ease-smooth);
+}
+.spotlight-dot.active {
+  width: 18px;
+  background: var(--accent);
+}
 .quality-badge {
   position: absolute;
   top: 9px;
@@ -2797,6 +2913,35 @@ textarea {
 }
 .library-series {
   margin-top: 26px;
+}
+
+.library-stack {
+  margin-bottom: 22px;
+}
+.library-stack .media-grid {
+  margin-top: 14px;
+}
+.stack-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 220px;
+}
+.stack-art {
+  padding-bottom: 34px;
+  box-shadow: 6px 6px 0 color-mix(in srgb, var(--accent) 16%, var(--line));
+}
+.stack-badge {
+  position: absolute;
+  left: 9px;
+  bottom: 9px;
+  z-index: 3;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 700;
 }
 .epg-actions {
   display: flex;

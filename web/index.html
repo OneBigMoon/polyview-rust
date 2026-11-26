@@ -20,6 +20,7 @@
   </head>
   <body>
     <a class="skip-link" href="#content">跳转到内容</a>
+    <div id="connection-banner" class="connection-banner" role="status" hidden>离线模式：部分内容可能无法加载。</div>
     <canvas id="bg-canvas" class="bg-canvas" aria-hidden="true"></canvas>
     <div id="auth-screen" class="auth-screen" hidden>
       <div class="auth-art" aria-hidden="true">
@@ -51,8 +52,7 @@
               autocomplete="username"
               placeholder="输入已有用户名"
           /></label>
-          <label
-            >密码<input
+          <label>密码<span class="password-field"><input
               id="auth-password"
               name="password"
               type="password"
@@ -60,7 +60,7 @@
               maxlength="128"
               autocomplete="current-password"
               placeholder="输入密码"
-          /></label>
+          /><button id="auth-reveal" class="password-reveal" type="button" aria-label="显示密码" aria-pressed="false" title="显示密码"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3.2"/></svg></button></span></label>
           <p id="auth-error" class="form-error" role="alert" hidden></p>
           <button id="auth-submit" class="button primary" type="submit">
             进入影音空间 <span aria-hidden="true">→</span>
@@ -260,6 +260,23 @@
             aria-label="下一集"
             hidden
           ><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 6 6 6-6 6"/></svg></button>
+          <button
+            id="player-speed"
+            class="button subtle small-button"
+            type="button"
+            aria-label="播放速度 1.0 倍"
+            title="播放速度 1.0 倍"
+            hidden
+          >1.0×</button>
+          <button
+            id="player-guide-toggle"
+            class="button subtle small-button"
+            type="button"
+            aria-pressed="true"
+            aria-label="收起节目单"
+            title="收起节目单"
+            hidden
+          >收起节目单</button>
           <button
             id="player-source"
             class="button subtle small-button"

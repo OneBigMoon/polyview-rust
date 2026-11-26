@@ -25,6 +25,11 @@
     onlineObserver: null,
     liveGroup: "all",
     epgOnlyCurrent: false,
+    settingsTab: "account",
+    showAllChannels: false,
+    downloadFilter: "all",
+    expandedSeries: new Set(),
+    expandAllSeries: false,
   };
   const iconPaths = {
     play: { d: "M8 5.5v13l10.5-6.5Z", fill: true },
@@ -120,6 +125,54 @@
   const n = (v, fallback = 0) =>
     Number.isFinite(Number(v)) ? Number(v) : fallback;
   const admin = () => state.user?.role === "admin";
+  const playbackSpeeds = [1, 1.25, 1.5, 2];
+  const speedLabel = (value) =>
+    ({ 1: "1.0×", 1.25: "1.25×", 1.5: "1.5×", 2: "2.0×" })[value] ||
+    `${value}×`;
+  const storedNumber = (key, fallback) => {
+    try {
+      if (typeof localStorage === "undefined") return fallback;
+      const raw = localStorage.getItem(key);
+      if (raw === null) return fallback;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : fallback;
+    } catch (_) {
+      return fallback;
+    }
+  };
+  const storeNumber = (key, value) => {
+    try {
+      if (typeof localStorage === "undefined") return;
+      localStorage.setItem(key, String(value));
+    } catch (_) {}
+  };
+  let playbackSpeed = storedNumber("polyview-speed", 1);
+  if (!playbackSpeeds.includes(playbackSpeed)) playbackSpeed = 1;
+  const episodeCode = (number) => `S01E${String(number).padStart(2, "0")}`;
+  function syncConnection(
+    online = typeof navigator === "undefined" ? true : navigator.onLine !== false,
+  ) {
+    const banner = $("connection-banner");
+    if (banner) banner.hidden = online;
+  }
+  function paintSpeedButton() {
+    const button = $("player-speed");
+    if (!button) return;
+    button.textContent = speedLabel(playbackSpeed);
+    button.setAttribute("aria-label", `播放速度 ${playbackSpeed} 倍`);
+    button.title = button.getAttribute("aria-label");
+  }
+  function cycleSpeed() {
+    const next =
+      playbackSpeeds[
+        (playbackSpeeds.indexOf(playbackSpeed) + 1) % playbackSpeeds.length
+      ];
+    playbackSpeed = next;
+    storeNumber("polyview-speed", next);
+    const video = $("video-player");
+    if (video) video.playbackRate = next;
+    paintSpeedButton();
+  }
   const make = (tag, attrs = {}, children = []) => {
     const el = document.createElement(tag);
     Object.entries(attrs).forEach(([key, value]) => {
@@ -317,6 +370,12 @@
       ]),
     ]);
   }
+  const seriesKey = (item) =>
+    item.series_id != null
+      ? `id:${item.series_id}`
+      : item.series
+        ? `name:${item.series}`
+        : null;
   async function library() {
     const result = await api(
       `/api/library${state.query ? `?q=${encodeURIComponent(state.query)}` : ""}`,
@@ -329,6 +388,18 @@
         (state.filter === "episode" && item.kind === "episode") ||
         (state.filter === "favorite" && item.favorite),
     );
+    const seriesGroups = new Map();
+    const singles = [];
+    if (state.filter === "all") {
+      for (const item of list) {
+        const key = item.kind === "episode" && seriesKey(item);
+        if (!key) singles.push(item);
+        else {
+          if (!seriesGroups.has(key)) seriesGroups.set(key, []);
+          seriesGroups.get(key).push(item);
+        }
+      }
+    }
     const root = make("div");
     root.append(
       head(
@@ -391,6 +462,18 @@
     filters.append(
       make("span", { class: "sort-note", text: `${list.length} 项内容` }),
     );
+    if (seriesGroups.size)
+      filters.append(
+        button(
+          state.expandAllSeries ? "收起全部单集" : "展开全部单集",
+          "subtle small-button",
+          () => {
+            state.expandAllSeries = !state.expandAllSeries;
+            state.expandedSeries.clear();
+            render();
+          },
+        ),
+      );
     root.append(filters);
     const continuing = state.library
       .filter((item) => n(item.duration) > 0 && n(item.position) > 0 && n(item.position) < n(item.duration) * 0.95)
@@ -427,6 +510,76 @@
         root.append(
           empty("⌕", "没有找到相关内容", "换一个关键词，或切换媒体筛选。"),
         );
+    } else if (state.filter === "all") {
+      const grid = make("div", { class: "media-grid" });
+      if (!singles.length && !seriesGroups.size)
+        grid.append(
+          empty("⌕", "没有找到相关内容", "换一个关键词，或切换媒体筛选。"),
+        );
+      else singles.forEach((item, index) => grid.append(card(item, index)));
+      let index = 0;
+      seriesGroups.forEach((items, key) => {
+        const name = items[0].series || "剧集";
+        const watched = items.filter((item) => item.watched).length;
+        const expanded =
+          state.expandAllSeries || state.expandedSeries.has(key);
+        const summary = make("article", { class: "media-card stack-card" }, [
+          make(
+            "button",
+            {
+              type: "button",
+              class: "poster-button",
+              "aria-label": `${expanded ? "收起" : "展开"}剧集 ${name}`,
+              "aria-expanded": String(expanded),
+              on: {
+                click: () => {
+                  if (state.expandAllSeries) {
+                    state.expandAllSeries = false;
+                    state.expandedSeries = new Set(seriesGroups.keys());
+                  }
+                  if (state.expandedSeries.has(key))
+                    state.expandedSeries.delete(key);
+                  else state.expandedSeries.add(key);
+                  render();
+                },
+              },
+            },
+            make("div", { class: `poster-art stack-art tone-${index++ % 6}` }, [
+              make("span", { class: "poster-name", text: name }),
+              make("span", {
+                class: "stack-badge",
+                text: `共 ${items.length} 集 · 已看 ${watched} 集`,
+              }),
+            ]),
+          ),
+          make("div", { class: "media-meta" }, [
+            make("span", { text: "剧集" }),
+            make("span", {
+              class: "watched",
+              text: expanded ? "已展开" : "点击展开",
+            }),
+          ]),
+        ]);
+        const section = make("section", {
+          class: "library-series library-stack",
+        }, [
+          sectionTitle(
+            name,
+            items.length,
+            `共 ${items.length} 集 · 已看 ${watched} 集`,
+          ),
+          summary,
+        ]);
+        if (expanded) {
+          const episodeGrid = make("div", { class: "media-grid" });
+          items.forEach((item, episodeIndex) =>
+            episodeGrid.append(card(item, episodeIndex)),
+          );
+          section.append(episodeGrid);
+        }
+        root.append(section);
+      });
+      root.append(grid);
     } else {
       const grid = make("div", { class: "media-grid" });
       if (!list.length)
@@ -483,6 +636,18 @@
       !playlistSize || player.playlistIndex <= 0;
     $("player-next").hidden =
       !playlistSize || player.playlistIndex >= playlistSize - 1;
+    $("player-prev").setAttribute("aria-label", live ? "上一台" : "上一集");
+    $("player-next").setAttribute("aria-label", live ? "下一台" : "下一集");
+    $("player-speed").hidden = !player || live;
+    const guideToggle = $("player-guide-toggle");
+    guideToggle.hidden = !live;
+    if (live) {
+      const collapsed = Boolean(player.guideCollapsed);
+      guideToggle.textContent = collapsed ? "显示节目单" : "收起节目单";
+      guideToggle.setAttribute("aria-label", guideToggle.textContent);
+      guideToggle.title = guideToggle.textContent;
+      guideToggle.setAttribute("aria-pressed", String(!collapsed));
+    }
     video.controls = !live;
     document.body.dataset.playing = video.paused ? "0" : "1";
     if (!live) return;
@@ -554,15 +719,15 @@
     const hlsSource = /\.m3u8(?:[?#]|$)/i.test(upstream || source);
     const nativeHls =
       video.canPlayType("application/vnd.apple.mpegurl") === "probably";
-    const startLive = () => {
-      if (!player.live || !current()) return;
+    const startPlayback = () => {
+      if ((!player.live && !player.autoplay) || !current()) return;
       const result = video.play();
       if (result?.catch)
         result.catch((error) => {
           if (!current()) return;
           if (error?.name === "NotAllowedError")
             $("player-message").textContent =
-              "浏览器阻止了自动播放，请点击播放器开始直播。";
+              player.live ? "浏览器阻止了自动播放，请点击播放器开始直播。" : "请点击播放器继续播放。";
         });
     };
     video.onerror = () => {
@@ -598,15 +763,15 @@
           destroyHls();
         }
       });
-      hls.on(window.Hls.Events.MANIFEST_PARSED, startLive);
+      hls.on(window.Hls.Events.MANIFEST_PARSED, startPlayback);
       hls.loadSource(source);
       hls.attachMedia(video);
     } else {
       video.src = source;
       video.load();
       if (player.live) {
-        video.onloadedmetadata = startLive;
-        startLive();
+        video.onloadedmetadata = startPlayback;
+        startPlayback();
       }
     }
     if (!player.live)
@@ -617,12 +782,14 @@
           n(player.item.position) < video.duration - 1
         )
           video.currentTime = player.item.position;
+        if (!hlsSource || nativeHls || !state.hls) startPlayback();
       };
   }
   function playerGuide(item) {
     const box = $("player-guide");
     box.replaceChildren();
     if (!state.player?.live) {
+      if (state.player) state.player.guideAvailable = false;
       box.hidden = true;
       return;
     }
@@ -635,10 +802,12 @@
       )
       .sort((one, other) => one.start - other.start);
     if (!programs.length) {
+      state.player.guideAvailable = false;
       box.hidden = true;
       return;
     }
-    box.hidden = false;
+    state.player.guideAvailable = true;
+    box.hidden = Boolean(state.player.guideCollapsed);
     box.append(
       make(
         "div",
@@ -675,13 +844,14 @@
       );
     });
   }
-  function play(item, live = false, playlist = [], playlistIndex = 0) {
+  function play(item, live = false, playlist = [], playlistIndex = 0, autoplay = false) {
     if (state.player) closePlayer();
     state.player = {
       item,
       live,
+      autoplay,
       sources: live ? liveSources(item) : [],
-      playlist: live ? [] : playlist,
+      playlist,
       playlistIndex,
       sourceIndex: 0,
       failed: new Set(),
@@ -689,6 +859,8 @@
       lastSaved: 0,
       lastPayload: "",
       errorShown: false,
+      guideCollapsed: false,
+      guideAvailable: false,
     };
     $("player-title").textContent = item.title || item.name || "正在播放";
     $("player-kind").textContent = live
@@ -697,20 +869,25 @@
     $("player-dialog").classList.toggle("live-mode", live);
     $("player-stage").classList.toggle("live-mode", live);
     $("player-dialog").showModal();
+    const video = $("video-player");
+    video.defaultPlaybackRate = live ? 1 : playbackSpeed;
+    video.playbackRate = video.defaultPlaybackRate;
+    video.volume = Math.min(1, Math.max(0, storedNumber("polyview-volume", 1)));
+    video.muted = storedNumber("polyview-muted", 0) === 1;
     playerGuide(item);
     updatePlayerControls();
     $("player-hud-title").textContent = $("player-title").textContent;
     $("player-hud-kind").textContent = $("player-kind").textContent;
-     attachPlayerSource();
+    attachPlayerSource();
   }
 
-  function playPlaylist(offset) {
+  function playPlaylist(offset, autoplay = false) {
     const current = state.player;
-    if (!current || current.live || !current.playlist?.length) return;
+    if (!current || !current.playlist?.length) return;
     const index = current.playlistIndex + offset;
     if (index < 0 || index >= current.playlist.length) return;
     const item = current.playlist[index];
-    play(item, false, current.playlist, index);
+    play(item, current.live, current.playlist, index, autoplay);
   }
   async function saveProgress(force = false, keepalive = false) {
     const current = state.player,
@@ -833,12 +1010,13 @@
       if (!byChannel.has(program.channel_id)) byChannel.set(program.channel_id, []);
       byChannel.get(program.channel_id).push(program);
     });
-    const groups = [];
+    const groupCounts = new Map();
     state.channels.forEach((channel) => {
       const group = channel.group_name || "其他";
-      if (!groups.includes(group)) groups.push(group);
+      groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
     });
-    if (state.liveGroup !== "all" && !groups.includes(state.liveGroup))
+    const groups = [...groupCounts.keys()];
+    if (state.liveGroup !== "all" && !groupCounts.has(state.liveGroup))
       state.liveGroup = "all";
     const query = state.query.toLowerCase();
     const channels = state.channels.filter(
@@ -857,7 +1035,7 @@
       ),
       ...groups.map((group) =>
         button(
-          group,
+          `${group} ${groupCounts.get(group) || 0}`,
           `subtle small-button${state.liveGroup === group ? " active" : ""}`,
           () => {
             state.liveGroup = group;
@@ -867,6 +1045,12 @@
       ),
     ]);
     let scroller;
+    const panBack = button("← -2 小时", "subtle small-button", () => {
+      if (scroller) scroller.scrollLeft = Math.max(0, n(scroller.scrollLeft) - 240);
+    });
+    const panForward = button("+2 小时 →", "subtle small-button", () => {
+      if (scroller) scroller.scrollLeft = n(scroller.scrollLeft) + 240;
+    });
     const currentOnly = button(
       state.epgOnlyCurrent ? "显示全部节目" : "只看当前",
       "subtle small-button",
@@ -891,6 +1075,8 @@
         }),
       ]),
       make("div", { class: "epg-actions" }, [
+        panBack,
+        panForward,
         currentOnly,
         jumpNow,
         admin() ? button("刷新节目单", "subtle small-button", refreshEpg) : null,
@@ -922,7 +1108,7 @@
     }
     rulerRow.append(ruler);
     inner.append(rulerRow);
-    channels.forEach((channel) => {
+    channels.forEach((channel, channelIndex) => {
       const row = make("div", { class: "epg-row" });
       row.append(
         make(
@@ -931,7 +1117,7 @@
             type: "button",
             class: "epg-channel",
             "aria-label": `播放 ${channel.name}`,
-            on: { click: () => play(channel, true) },
+            on: { click: () => play(channel, true, channels, channelIndex) },
           },
           [
             channel.logo
@@ -982,8 +1168,8 @@
               title: `${program.title} ${clockTime(program.start)}-${clockTime(program.stop)}${
                 program.description ? `\n${program.description}` : ""
               }`,
-              on: { click: () => play(channel, true) },
-            },
+              on: { click: () => play(channel, true, channels, channelIndex) },
+              },
               [
                 make("strong", { text: program.title }),
                 make("small", {
@@ -1036,7 +1222,9 @@
     } catch (error) {
       state.epg = { programs: [], updated_at: 0, error: error.message };
     }
-    state.channels = channelsWithPrograms();
+    const visible = channelsWithPrograms(allChannels, state.epg?.programs || []);
+    const withoutEpg = allChannels.length - visible.length;
+    state.channels = state.showAllChannels ? allChannels : visible;
     const root = make(
       "div",
       {},
@@ -1044,6 +1232,18 @@
         "电视直播",
         "像翻节目单一样，挑一个正在播的节目。",
         make("div", { class: "head-actions" }, [
+          withoutEpg || state.showAllChannels
+            ? button(
+                state.showAllChannels
+                  ? "只看有节目单的频道"
+                  : `显示全部频道（含 ${withoutEpg} 个无节目单）`,
+                "subtle",
+                () => {
+                  state.showAllChannels = !state.showAllChannels;
+                  render();
+                },
+              )
+            : null,
           admin() ? button("导入 M3U", "primary", importM3u) : null,
         ]),
       ),
@@ -1055,11 +1255,18 @@
           "◉",
           hasChannels ? "节目单暂不可用" : "还没有直播频道",
           hasChannels
-            ? "当前频道还没有可显示的节目，请刷新节目单或稍后再试。"
+            ? "当前频道还没有可显示的节目，请刷新节目单或显示全部频道。"
             : admin()
               ? "导入一个 M3U 播放列表，把电视带回家。"
               : "请让管理员导入 M3U 播放列表。",
-          admin() && !hasChannels ? button("导入 M3U", "primary", importM3u) : null,
+          admin() && !hasChannels
+            ? button("导入 M3U", "primary", importM3u)
+            : withoutEpg > 0
+              ? button("显示全部频道", "subtle", () => {
+                  state.showAllChannels = true;
+                  render();
+                })
+              : null,
         ),
       );
       return root;
@@ -1334,40 +1541,69 @@
     return card;
   }
 
-  function spotlightCard(group) {
+  function spotlightCard(items) {
     const art = make("div", { class: "spotlight-art tone-0" });
-    if (group.cover)
-      art.append(
-        make("img", {
-          src: group.cover,
-          alt: "",
-          loading: "lazy",
-          referrerpolicy: "no-referrer",
-        }),
+    const title = make("h2");
+    const meta = make("p", { class: "spotlight-meta" });
+    const dots = make("div", { class: "spotlight-dots" });
+    let active = 0;
+    const paint = () => {
+      const group = items[active];
+      if (!group) return;
+      art.replaceChildren(
+        ...(group.cover
+          ? [
+              make("img", {
+                src: group.cover,
+                alt: "",
+                loading: "lazy",
+                referrerpolicy: "no-referrer",
+              }),
+            ]
+          : []),
       );
-    const quality = sourceQuality(group.sources?.[0] || group);
-    const meta = [
-      group.year,
-      `${group.sources?.length || 1} 个影视源`,
-      /4K|2K|1080P|720P|HD/i.test(quality) ? quality : "",
-      kindLabel(group.kind),
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    return make("section", { class: "spotlight", "aria-label": "焦点影片" }, [
-      art,
-      make("div", { class: "spotlight-copy" }, [
-        make("p", { class: "eyebrow", text: "本周焦点" }),
-        make("h2", { text: displayCatalogTitle(group.title, group.year) }),
-        make("p", { class: "spotlight-meta", text: meta }),
-        make("div", { class: "spotlight-actions" }, [
-          button("立即播放", "primary", () => openCatalogDetail(group)),
-          button("查看片源", "subtle", () =>
-            $("content").querySelector(".media-grid .poster-button")?.click(),
-          ),
-        ]),
+      title.textContent = displayCatalogTitle(group.title, group.year);
+      const quality = sourceQuality(group.sources?.[0] || group);
+      meta.textContent = [
+        group.year,
+        `${group.sources?.length || 1} 个影视源`,
+        /4K|2K|1080P|720P|HD/i.test(quality) ? quality : "",
+        kindLabel(group.kind),
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      dots.replaceChildren(
+        ...items.map((_, index) =>
+          make("button", {
+            type: "button",
+            class: `spotlight-dot${index === active ? " active" : ""}`,
+            "aria-pressed": String(index === active),
+            "aria-label": `查看第 ${index + 1} 部焦点影片`,
+            on: {
+              click: () => {
+                active = index;
+                paint();
+              },
+            },
+          }),
+        ),
+      );
+    };
+    paint();
+    const copy = make("div", { class: "spotlight-copy" }, [
+      make("p", { class: "eyebrow", text: "本周焦点" }),
+      title,
+      meta,
+      make("div", { class: "spotlight-actions" }, [
+        button("立即播放", "primary", () => openCatalogDetail(items[active])),
+        button("查看片源", "subtle", () => openCatalogDetail(items[active])),
       ]),
     ]);
+    if (items.length > 1) copy.append(dots);
+    return make("section", {
+      class: "spotlight",
+      "aria-label": "焦点影片",
+    }, [art, copy]);
   }
   async function online() {
     const sequence = renderSequence;
@@ -1389,7 +1625,10 @@
             ? "在账户与设置中添加 MacCMS JSON 接口，即可浏览、搜索与播放。"
             : "请管理员配置影视源。",
           admin()
-            ? button("配置影视源", "primary", () => setNav("settings"))
+            ? button("配置影视源", "primary", () => {
+                state.settingsTab = "sources";
+                setNav("settings");
+              })
             : null,
         ),
       );
@@ -1602,8 +1841,10 @@
       !state.onlineCategory &&
       !state.onlineYear &&
       groupOrder.length
-    )
-      root.insertBefore(spotlightCard(groups.get(groupOrder[0])), summary);
+    ) {
+      const featured = groupOrder.map((key) => groups.get(key)).filter((group) => group.cover).slice(0, 5);
+      root.insertBefore(spotlightCard(featured.length ? featured : [groups.get(groupOrder[0])]), summary);
+    }
     renderNextBatch();
     if (!cards.size)
       grid.append(
@@ -1891,8 +2132,6 @@
       if (preferred > 0) groups.value = String(preferred);
       const episodes = make("select", { "aria-label": "选择集数" });
       const episodeGrid = make("div", { class: "episode-grid" });
-      const selected = () =>
-        detail.groups[n(groups.value)].episodes[n(episodes.value)];
       let episodeAscending = true;
       const orderedEpisodes = () =>
         detail.groups[n(groups.value)].episodes
@@ -1902,7 +2141,12 @@
               ? one.sourceIndex - other.sourceIndex
               : other.sourceIndex - one.sourceIndex,
           );
+      const selected = () => orderedEpisodes()[n(episodes.value)];
       const watchedCount = tracked?.watched_episodes || 0;
+      let batchMode = false;
+      let submitting = false;
+      const picked = new Set();
+      let episodeButtons = [];
       const watch = (index) => {
         const group = detail.groups[n(groups.value)];
         if (group.direct === false) {
@@ -1924,26 +2168,115 @@
         sortButton.textContent = episodeAscending ? "倒序" : "正序";
         fillEpisodes();
       });
+      const batchToggle = button("选择集数", "subtle small-button", () => {
+        batchMode = !batchMode;
+        if (!batchMode) picked.clear();
+        paintBatch();
+      });
+      batchToggle.setAttribute("aria-pressed", "false");
+      const selectAllUnwatched = button("全选未看", "subtle small-button", () => {
+        picked.clear();
+        orderedEpisodes()
+          .filter((episode) => episode.sourceIndex >= watchedCount)
+          .forEach((episode) => picked.add(episode.sourceIndex));
+        paintBatch();
+      });
+      const selectAll = button("全选", "subtle small-button", () => {
+        orderedEpisodes().forEach((episode) => picked.add(episode.sourceIndex));
+        paintBatch();
+      });
+      async function submitBatch() {
+        if (submitting || !picked.size) return;
+        if (detail.groups[n(groups.value)].direct === false) {
+          toast("该线路是非直链解析页，无法直接下载，请选择直链线路。", true);
+          return;
+        }
+        submitting = true;
+        paintBatch();
+        let ok = 0;
+        let failed = 0;
+        for (const episode of orderedEpisodes()) {
+          if (!picked.has(episode.sourceIndex)) continue;
+          try {
+            await api("/api/downloads", {
+              method: "POST",
+              body: {
+                url: episode.url,
+                title: `${detail.title} ${episodeCode(episode.sourceIndex + 1)}`,
+              },
+            });
+            ok += 1;
+          } catch (_) {
+            failed += 1;
+          }
+        }
+        if (failed) toast(`已加入 ${ok} 集，${failed} 集失败`, true);
+        else toast(`已加入 ${ok} 集下载队列`);
+        submitting = false;
+        picked.clear();
+        batchMode = false;
+        fillEpisodes();
+      }
+      const batchButton = button(
+        "批量加入下载队列（0 集）",
+        "primary small-button",
+        submitBatch,
+      );
+      batchButton.disabled = true;
+      batchButton.hidden = true;
+      function paintBatch() {
+        batchButton.textContent = `批量加入下载队列（${picked.size} 集）`;
+        batchButton.disabled = submitting || picked.size === 0;
+        for (const control of [groups, sortButton, batchToggle, selectAll, selectAllUnwatched])
+          control.disabled = submitting;
+        batchToggle.textContent = batchMode ? "退出多选" : "选择集数";
+        batchToggle.setAttribute("aria-pressed", String(batchMode));
+        batchButton.hidden = !batchMode;
+        selectAll.hidden = !batchMode;
+        selectAllUnwatched.hidden = !batchMode;
+        episodeButtons.forEach(({ node, index }) => {
+          node.disabled = submitting;
+          node.classList.toggle("picked", picked.has(index));
+          if (batchMode) node.setAttribute("aria-pressed", String(picked.has(index)));
+          else node.removeAttribute("aria-pressed");
+        });
+      }
       const fillEpisodes = () => {
         episodes.replaceChildren(
           ...orderedEpisodes().map((episode, index) =>
             make("option", { value: index, text: episode.name }),
           ),
         );
+        episodeButtons = orderedEpisodes().map((episode, index) => ({
+          index: episode.sourceIndex,
+          node: button(
+            episode.sourceIndex < watchedCount
+              ? `✓ ${episode.name}`
+              : episode.name,
+            `subtle small-button${episode.sourceIndex < watchedCount ? " watched" : ""}`,
+            () => {
+              if (!batchMode) {
+                watch(index);
+                return;
+              }
+              if (picked.has(episode.sourceIndex))
+                picked.delete(episode.sourceIndex);
+              else picked.add(episode.sourceIndex);
+              paintBatch();
+            },
+          ),
+        }));
         episodeGrid.replaceChildren(
           sortButton,
-          ...orderedEpisodes().map((episode, index) =>
-            button(
-              episode.sourceIndex < watchedCount
-                ? `✓ ${episode.name}`
-                : episode.name,
-              `subtle small-button${episode.sourceIndex < watchedCount ? " watched" : ""}`,
-              () => watch(index),
-            ),
-          ),
+          ...episodeButtons.map(({ node }) => node),
         );
+        paintBatch();
       };
-      groups.addEventListener("change", fillEpisodes);
+      groups.addEventListener("change", () => {
+        picked.clear();
+        batchMode = false;
+        fillEpisodes();
+      });
       fillEpisodes();
       const download = button("下载本集", "subtle", async () => {
         if (detail.groups[n(groups.value)].direct === false) {
@@ -1951,12 +2284,13 @@
           return;
         }
         download.disabled = true;
+        const episode = selected();
         try {
           await api("/api/downloads", {
             method: "POST",
             body: {
-              url: selected().url,
-              title: `${detail.title} S01E${String(n(episodes.value) + 1).padStart(2, "0")}`,
+              url: episode.url,
+              title: `${detail.title} ${episodeCode(episode.sourceIndex + 1)}`,
             },
           });
           toast("已加入下载队列");
@@ -1972,6 +2306,12 @@
           make("label", {}, ["集数", episodes]),
           button("在线播放", "primary", () => watch(n(episodes.value))),
           download,
+        ]),
+        make("div", { class: "catalog-batch" }, [
+          batchToggle,
+          selectAllUnwatched,
+          selectAll,
+          batchButton,
         ]),
         episodeGrid,
         make("p", {
@@ -2023,6 +2363,14 @@
           subscription.title.toLowerCase().includes(state.query.toLowerCase()),
       )
       .forEach((subscription) => {
+        const watchedCount = n(subscription.watched_episodes);
+        const totalCount = n(subscription.total_episodes);
+        const step = (delta) => {
+          const max = totalCount || Number.MAX_SAFE_INTEGER;
+          watched.value = String(
+            Math.min(max, Math.max(0, n(watched.value) + delta)),
+          );
+        };
         const watched = make("input", {
           type: "number",
           name: "watched",
@@ -2080,12 +2428,15 @@
             },
           },
           [
-            make("label", {}, ["已看", watched]),
+            make("label", {}, [
+              "已看",
+              icon("−", `${subscription.title} 减少一集`, () => step(-1), "step-button"),
+              watched,
+              icon("+", `${subscription.title} 增加一集`, () => step(1), "step-button"),
+            ]),
             button("保存", "subtle small-button", null, { type: "submit" }),
           ],
         );
-        const watchedCount = n(subscription.watched_episodes);
-        const totalCount = n(subscription.total_episodes);
         const pct = totalCount
           ? Math.min(100, Math.round((watchedCount / totalCount) * 100))
           : 0;
@@ -2098,6 +2449,16 @@
           make("article", {
             class: `tracking-row${statusLabel === "已追平" ? " finished" : ""}`,
           }, [
+            make("span", { class: "series-cover" },
+              subscription.cover
+                ? make("img", {
+                    src: subscription.cover,
+                    alt: "",
+                    loading: "lazy",
+                    referrerpolicy: "no-referrer",
+                  })
+                : "▤",
+            ),
             make("div", { class: "series-info" }, [
               make("h3", { text: subscription.title }),
               make("span", {
@@ -2243,17 +2604,32 @@
       "",
     ];
   }
+  function statusGroup(job) {
+    const value = job.status || "";
+    if (/completed|done/i.test(value)) return "done";
+    if (/failed|error|cancel/i.test(value)) return "problem";
+    if (value === "running" || value === "downloading") return "running";
+    return "queued";
+  }
   function downloadList() {
+    const jobs =
+      state.downloadFilter === "all"
+        ? state.downloads
+        : state.downloads.filter(
+            (job) => statusGroup(job) === state.downloadFilter,
+          );
     const list = make("div", { class: "download-list" });
-    if (!state.downloads.length)
+    if (!jobs.length)
       list.append(
         empty(
           "↓",
-          "下载队列是空的",
-          "添加一个你有权保存的视频直链或 HLS 地址。",
+          state.downloads.length ? "没有符合条件的任务" : "下载队列是空的",
+          state.downloads.length
+            ? "换一个筛选条件试试。"
+            : "添加一个你有权保存的视频直链或 HLS 地址。",
         ),
       );
-    state.downloads.forEach((job) => {
+    jobs.forEach((job) => {
       const [label, cls] = status(job);
       const total = n(job.total_bytes),
         written = n(job.bytes_written);
@@ -2310,8 +2686,9 @@
   async function refreshDownloads() {
     const result = await api("/api/downloads");
     state.downloads = Array.isArray(result) ? result : result?.jobs || [];
+    if (state.page !== "downloads") return;
     const existing = main.querySelector(".download-list");
-    if (state.page === "downloads" && existing) {
+    if (existing) {
       existing.replaceWith(downloadList());
       updateNavBadges();
     }
@@ -2375,9 +2752,43 @@
         ],
       ),
     );
+    const counts = {
+      all: state.downloads.length,
+      running: 0,
+      queued: 0,
+      done: 0,
+      problem: 0,
+    };
+    state.downloads.forEach((job) => {
+      counts[statusGroup(job)] += 1;
+    });
     root.append(
       add,
       sectionTitle("全部任务", state.downloads.length),
+      make(
+        "div",
+        { class: "filters" },
+        [
+          ["all", "全部"],
+          ["running", "下载中"],
+          ["queued", "排队中"],
+          ["done", "已完成"],
+          ["problem", "异常"],
+        ].map(([key, label]) =>
+          make("button", {
+            type: "button",
+            class: `filter-chip${state.downloadFilter === key ? " active" : ""}`,
+            "aria-pressed": String(state.downloadFilter === key),
+            text: `${label} ${counts[key]}`,
+            on: {
+              click: () => {
+                state.downloadFilter = key;
+                render();
+              },
+            },
+          }),
+        ),
+      ),
       downloadList(),
     );
     return root;
@@ -2666,21 +3077,25 @@
           "aria-label": label,
           spellcheck: "false",
         });
-        panel.append(
-          make("div", { class: "feed-row" }, [
-            make("label", {}, [label, input]),
-            button("复制", "subtle small-button", async () => {
-              try {
-                await navigator.clipboard.writeText(url);
-                toast(`${label}已复制`);
-              } catch (_) {
-                input.focus();
-                input.select();
-                toast("地址已选中，请按 Ctrl+C（Mac 为 ⌘C）复制。");
-              }
-            }),
-          ]),
-        );
+        const row = make("div", { class: "feed-row" }, [
+          make("label", {}, [label, input]),
+        ]);
+        const copy = button("复制", "subtle small-button", async () => {
+          try {
+            await navigator.clipboard.writeText(url);
+            copy.textContent = "✓ 已复制";
+            setTimeout(() => {
+              copy.textContent = "复制";
+            }, 1500);
+            toast(`${label}已复制`);
+          } catch (_) {
+            input.focus();
+            input.select();
+            toast("地址已选中，请按 Ctrl+C（Mac 为 ⌘C）复制。");
+          }
+        });
+        row.append(copy);
+        panel.append(row);
       });
       panel.append(
         make("p", {
@@ -2708,13 +3123,7 @@
     }
     return panel;
   }
-  async function settings() {
-    const root = make(
-      "div",
-      {},
-      head("账户与设置", "管理你的账户，以及这个影音空间的成员。"),
-    );
-    const grid = make("div", { class: "settings-grid" });
+  function accountSettings() {
     const panel = make("section", { class: "panel" }, [
       make("h2", { text: "修改密码" }),
       make("p", { class: "panel-description", text: "密码至少 10 个字符。" }),
@@ -2769,115 +3178,161 @@
         ],
       ),
     );
-    grid.append(panel);
-    if (admin()) {
-      const users = make("section", { class: "panel" }, [
-        make("h2", { text: "家庭成员" }),
-        make("p", {
-          class: "panel-description",
-          text: "管理员可以邀请成员进入这个影音空间。",
-        }),
-      ]);
-      users.append(
-        make(
-          "form",
-          {
-            class: "form-row",
-            on: {
-              submit: async (event) => {
-                event.preventDefault();
-                const f = event.currentTarget;
-                try {
-                  await api("/api/users", {
-                    method: "POST",
-                    body: {
-                      username: f.elements.username.value.trim(),
-                      password: f.elements.password.value,
-                      role: f.elements.role.value,
-                    },
-                  });
-                  f.reset();
-                  toast("成员已添加");
-                  await render();
-                } catch (e) {
-                  toast(e.message, true);
-                }
-              },
+    return panel;
+  }
+  async function familySettings() {
+    const users = make("section", { class: "panel" }, [
+      make("h2", { text: "家庭成员" }),
+      make("p", {
+        class: "panel-description",
+        text: "管理员可以邀请成员进入这个影音空间。",
+      }),
+    ]);
+    users.append(
+      make(
+        "form",
+        {
+          class: "form-row",
+          on: {
+            submit: async (event) => {
+              event.preventDefault();
+              const f = event.currentTarget;
+              try {
+                await api("/api/users", {
+                  method: "POST",
+                  body: {
+                    username: f.elements.username.value.trim(),
+                    password: f.elements.password.value,
+                    role: f.elements.role.value,
+                  },
+                });
+                f.reset();
+                toast("成员已添加");
+                await render();
+              } catch (e) {
+                toast(e.message, true);
+              }
             },
           },
-          [
-            make("label", {}, [
-              "用户名",
-              make("input", {
-                name: "username",
-                required: true,
-                pattern: "[A-Za-z0-9_-]{3,32}",
+        },
+        [
+          make("label", {}, [
+            "用户名",
+            make("input", {
+              name: "username",
+              required: true,
+              pattern: "[A-Za-z0-9_-]{3,32}",
+            }),
+          ]),
+          make("label", {}, [
+            "初始密码",
+            make("input", {
+              name: "password",
+              type: "password",
+              minlength: 10,
+              required: true,
+            }),
+          ]),
+          make("label", {}, [
+            "角色",
+            make("select", { name: "role" }, [
+              make("option", { value: "user", text: "家庭成员" }),
+              make("option", { value: "admin", text: "管理员" }),
+            ]),
+          ]),
+          button("添加成员", "primary", null, { type: "submit" }),
+        ],
+      ),
+    );
+    try {
+      const result = await api("/api/users");
+      const members = Array.isArray(result) ? result : result?.users || [];
+      const list = make("div", { class: "user-list" });
+      members.forEach((member) =>
+        list.append(
+          make("div", { class: "user-row" }, [
+            make("span", {
+              class: "avatar",
+              text: member.username.slice(0, 1).toUpperCase(),
+            }),
+            make("div", {}, [
+              make("strong", { text: member.username }),
+              make("small", {
+                text: member.role === "admin" ? "管理员" : "家庭成员",
               }),
             ]),
-            make("label", {}, [
-              "初始密码",
-              make("input", {
-                name: "password",
-                type: "password",
-                minlength: 10,
-                required: true,
-              }),
-            ]),
-            make("label", {}, [
-              "角色",
-              make("select", { name: "role" }, [
-                make("option", { value: "user", text: "家庭成员" }),
-                make("option", { value: "admin", text: "管理员" }),
-              ]),
-            ]),
-            button("添加成员", "primary", null, { type: "submit" }),
-          ],
+            member.id === state.user.id
+              ? make("span", { class: "small muted", text: "当前账户" })
+              : button("移除", "danger small-button", async () => {
+                  if (!window.confirm(`确定移除 ${member.username}？`))
+                    return;
+                  try {
+                    await api(`/api/users/${encodeURIComponent(member.id)}`, {
+                      method: "DELETE",
+                    });
+                    toast("成员已移除");
+                    render();
+                  } catch (e) {
+                    toast(e.message, true);
+                  }
+                }),
+          ]),
         ),
       );
-      try {
-        const result = await api("/api/users");
-        const members = Array.isArray(result) ? result : result?.users || [];
-        const list = make("div", { class: "user-list" });
-        members.forEach((member) =>
-          list.append(
-            make("div", { class: "user-row" }, [
-              make("span", {
-                class: "avatar",
-                text: member.username.slice(0, 1).toUpperCase(),
-              }),
-              make("div", {}, [
-                make("strong", { text: member.username }),
-                make("small", {
-                  text: member.role === "admin" ? "管理员" : "家庭成员",
-                }),
-              ]),
-              member.id === state.user.id
-                ? make("span", { class: "small muted", text: "当前账户" })
-                : button("移除", "danger small-button", async () => {
-                    if (!window.confirm(`确定移除 ${member.username}？`))
-                      return;
-                    try {
-                      await api(`/api/users/${encodeURIComponent(member.id)}`, {
-                        method: "DELETE",
-                      });
-                      toast("成员已移除");
-                      render();
-                    } catch (e) {
-                      toast(e.message, true);
-                    }
-                  }),
-            ]),
-          ),
-        );
-        users.append(list);
-      } catch (e) {
-        users.append(make("p", { class: "form-error", text: e.message }));
-      }
-      grid.append(users);
+      users.append(list);
+    } catch (e) {
+      users.append(make("p", { class: "form-error", text: e.message }));
     }
-    root.append(grid, await tvboxSettings());
-    if (admin()) root.append(await epgSettings());
-    if (admin()) root.append(await sourceSettings());
+    return users;
+  }
+  async function settings() {
+    const root = make(
+      "div",
+      {},
+      head("账户与设置", "管理你的账户，以及这个影音空间的成员。"),
+    );
+    const tabs = [
+      ["account", "账户安全"],
+      ...(admin()
+        ? [
+            ["family", "家庭成员"],
+            ["sources", "在线影视源"],
+            ["epg", "电视节目单"],
+          ]
+        : []),
+      ["tvbox", "影视仓订阅"],
+    ];
+    const active = tabs.some(([key]) => key === state.settingsTab)
+      ? state.settingsTab
+      : "account";
+    state.settingsTab = active;
+    root.append(
+      make(
+        "div",
+        { class: "settings-tabs" },
+        tabs.map(([key, label]) =>
+          make("button", {
+            type: "button",
+            class: `filter-chip${key === active ? " active" : ""}`,
+            "aria-pressed": String(key === active),
+            text: label,
+            on: {
+              click: () => {
+                state.settingsTab = key;
+                render();
+              },
+            },
+          }),
+        ),
+      ),
+    );
+    const body = make("div", { class: "settings-panel" });
+    if (active === "account") body.append(accountSettings());
+    else if (active === "family") body.append(await familySettings());
+    else if (active === "sources") body.append(await sourceSettings());
+    else if (active === "epg") body.append(await epgSettings());
+    else if (active === "tvbox") body.append(await tvboxSettings());
+    root.append(body);
     return root;
   }
   async function render() {
@@ -2971,6 +3426,10 @@
       : "进入影音空间 ";
     $("auth-form").dataset.setup = setup ? "1" : "0";
     $("auth-error").hidden = true;
+    password.type = "password";
+    $("auth-reveal").setAttribute("aria-pressed", "false");
+    $("auth-reveal").setAttribute("aria-label", "显示密码");
+    $("auth-reveal").title = "显示密码";
   }
   function showApp(user) {
     state.user = user;
@@ -3164,6 +3623,35 @@
     closePlayer();
   });
   $("player-source").addEventListener("click", () => switchLiveSource(1));
+  paintSpeedButton();
+  $("player-speed").addEventListener("click", cycleSpeed);
+  $("player-guide-toggle").addEventListener("click", () => {
+    const player = state.player;
+    if (!player?.live) return;
+    player.guideCollapsed = !player.guideCollapsed;
+    $("player-guide").hidden = player.guideCollapsed || !player.guideAvailable;
+    updatePlayerControls();
+  });
+  $("video-player").addEventListener("volumechange", () => {
+    const video = $("video-player");
+    storeNumber("polyview-volume", video.volume);
+    storeNumber("polyview-muted", video.muted ? 1 : 0);
+  });
+  $("auth-reveal").addEventListener("click", () => {
+    const field = $("auth-password");
+    const reveal = field.type === "password";
+    field.type = reveal ? "text" : "password";
+    const button = $("auth-reveal");
+    button.setAttribute("aria-label", reveal ? "隐藏密码" : "显示密码");
+    button.setAttribute("aria-pressed", String(reveal));
+    button.title = button.getAttribute("aria-label");
+  });
+  syncConnection();
+  window.addEventListener("offline", () => syncConnection(false));
+  window.addEventListener("online", () => {
+    syncConnection(true);
+    toast("网络已恢复");
+  });
   let fullscreenExitedAt = 0;
   $("player-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
@@ -3228,7 +3716,20 @@
 
   $("video-player").addEventListener("timeupdate", () => saveProgress());
   $("video-player").addEventListener("pause", () => saveProgress(true));
-  $("video-player").addEventListener("ended", () => saveProgress(true));
+  $("video-player").addEventListener("ended", async () => {
+    const player = state.player;
+    await saveProgress(true);
+    if (
+      player &&
+      player === state.player &&
+      !player.live &&
+      player.playlist?.length &&
+      player.playlistIndex < player.playlist.length - 1
+    ) {
+      toast("即将播放下一集");
+      playPlaylist(1, true);
+    }
+  });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) saveProgress(true, true);
   });
@@ -3241,6 +3742,14 @@
       if (["online", "library", "live", "series"].includes(state.page))
         render();
     }, 250);
+  });
+  $("search-input").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    if (["online", "library", "live", "series"].includes(state.page)) return;
+    state.query = $("search-input").value.trim();
+    state.onlinePage = 1;
+    setNav("online");
   });
   $("search-clear").addEventListener("click", () => {
     const input = $("search-input");

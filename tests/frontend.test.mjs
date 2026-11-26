@@ -124,6 +124,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "auth-form",
     "auth-username",
     "auth-password",
+    "auth-reveal",
+    "connection-banner",
     "auth-title",
     "auth-description",
     "auth-submit",
@@ -143,6 +145,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "player-mute",
     "player-fullscreen",
     "player-source",
+    "player-speed",
+    "player-guide-toggle",
     "player-guide",
     "player-stage",
     "player-prev",
@@ -234,6 +238,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   const storage = {};
   const context = vm.createContext({
     document,
+    navigator: { onLine: true, clipboard: { writeText: async () => {} } },
+    location: { origin: "https://polyview.test" },
     localStorage: {
       getItem: (key) => storage[key] ?? null,
       setItem: (key, value) => {
@@ -269,7 +275,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, online, updateNavBadges, library};\n})();",
+      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
     ),
     context,
   );
@@ -282,11 +288,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     hlsInstances,
     documentElement: document.documentElement,
     ...context.hooks,
-    elements,
-    calls,
-    order,
-    hlsInstances,
-    documentElement: document.documentElement,
+    context,
+    localStorage: context.localStorage,
   };
 }
 
@@ -1510,4 +1513,341 @@ test("library shows continue watching and groups episodes by series", async () =
   assert.equal(nodes.filter((node) => node.className === "continue-section").length, 1);
   assert.equal(nodes.filter((node) => node.className === "library-series").length, 2);
   assert.equal(nodes.filter((node) => node.className === "media-card").length, 4);
+});
+
+function pageNodes(root) {
+  return [root, ...(root.children || []).flatMap(pageNodes)];
+}
+
+function pageClass(root, name) {
+  return pageNodes(root).filter((node) => node.className?.split(" ").includes(name));
+}
+
+function pageButton(root, label) {
+  const button = pageNodes(root).find((node) => node.tagName === "BUTTON" && node.textContent === label);
+  assert.ok(button, `Missing button ${label}`);
+  return button;
+}
+
+function playbackNode(root, matches, description) {
+  const node = pageNodes(root).find(matches);
+  assert.ok(node, `Missing ${description}`);
+  return node;
+}
+
+async function openTwoEpisodeDetail() {
+  const item = { id: "42", source_id: 3, title: "故事" };
+  const episodes = [1, 2].map((number) => ({
+    name: `第${number}集`, url: `https://source.example/${number}.m3u8`,
+  }));
+  const app = environment({
+    "/api/catalog/3/detail?id=42": { ...item, groups: [{ name: "HLS", direct: true, episodes }] },
+    "/api/tracking": [],
+  });
+  await app.openCatalogDetail(item);
+  return { app, dialog: app.elements.get("catalog-dialog") };
+}
+
+function queuedEpisodeBodies(app) {
+  return app.calls
+    .filter(({ url, options }) => url === "/api/downloads" && options.method === "POST")
+    .map(({ options }) => JSON.parse(options.body));
+}
+
+test("descending episode order downloads the matching source episode", async () => {
+  const { app, dialog } = await openTwoEpisodeDetail();
+  pageButton(dialog, "倒序").dispatchEvent("click");
+  await pageButton(dialog, "下载本集").listeners.click[0]();
+  assert.deepEqual(queuedEpisodeBodies(app), [
+    { url: "https://source.example/2.m3u8", title: "故事 S01E02" },
+  ]);
+});
+
+test("batch selection queues every chosen episode with its source index", async () => {
+  const { app, dialog } = await openTwoEpisodeDetail();
+  pageButton(dialog, "选择集数").dispatchEvent("click");
+  pageButton(dialog, "第2集").dispatchEvent("click");
+  pageButton(dialog, "第1集").dispatchEvent("click");
+  const submit = pageButton(dialog, "批量加入下载队列（2 集）");
+  assert.equal(submit.disabled, false);
+  assert.equal(submit.hidden, false);
+  await submit.listeners.click[0]();
+  assert.deepEqual(queuedEpisodeBodies(app), [
+    { url: "https://source.example/1.m3u8", title: "故事 S01E01" },
+    { url: "https://source.example/2.m3u8", title: "故事 S01E02" },
+  ]);
+  assert.match(app.elements.get("toast").textContent, /已加入 2 集下载队列/);
+});
+
+test("ended playback advances to the next playlist episode", async () => {
+  const app = environment();
+  const playlist = [1, 2].map((number) => ({
+    title: `第${number}集`, remote_url: `https://source.example/${number}.m3u8`,
+  }));
+  app.play(playlist[0], false, playlist, 0);
+  const video = app.elements.get("video-player");
+  video.currentTime = video.duration;
+  video.ended = true;
+  video.dispatchEvent("ended");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(app.state.player.playlistIndex, 1);
+  assert.equal(app.elements.get("player-title").textContent, "第2集");
+  const plays = video.playCalls;
+  app.hlsInstances.at(-1).emit("manifest_parsed");
+  assert.equal(video.playCalls, plays + 1);
+});
+
+test("playback speed cycles and persists", () => {
+  const app = environment();
+  app.play({ id: 1, title: "故事" });
+  const speed = app.elements.get("player-speed");
+  const video = app.elements.get("video-player");
+  assert.equal(video.volume, 1);
+  assert.equal(speed.hidden, false);
+  assert.equal(speed.textContent, "1.0×");
+  assert.equal(video.playbackRate, 1);
+  for (const rate of [1.25, 1.5]) {
+    speed.dispatchEvent("click");
+    assert.equal(speed.textContent, `${rate}×`);
+    assert.equal(video.playbackRate, rate);
+    assert.equal(app.localStorage.getItem("polyview-speed"), String(rate));
+  }
+});
+
+test("stored volume and mute are restored when a title opens", () => {
+  const app = environment();
+  app.localStorage.setItem("polyview-volume", "0.35");
+  app.localStorage.setItem("polyview-muted", "1");
+  app.play({ id: 1, title: "故事" });
+  const video = app.elements.get("video-player");
+  assert.equal(video.volume, 0.35);
+  assert.equal(video.muted, true);
+  video.volume = 0;
+  video.muted = false;
+  video.dispatchEvent("volumechange");
+  assert.equal(app.localStorage.getItem("polyview-volume"), "0");
+  assert.equal(app.localStorage.getItem("polyview-muted"), "0");
+});
+
+function livePlaybackFixture(channels, scheduled) {
+  const now = 1800000000;
+  const programs = scheduled.map((id) => ({
+    channel_id: id, start: now, stop: now + 3600, title: `节目 ${id}`,
+  }));
+  const app = environment({
+    "/api/channels": channels.map(([id, name, group_name]) => ({
+      id, name, group_name, sources: [{ url: `https://source.example/${id}.m3u8` }],
+    })),
+    [`/api/epg?start=${now - 21600}&end=${now + 86400}`]: { programs },
+  });
+  app.context.Date = class extends Date { static now() { return now * 1000; } };
+  app.state.page = "live";
+  return app;
+}
+
+test("live channels without an EPG stay hidden until the toggle is used", async () => {
+  const app = livePlaybackFixture([[1, "综合一台", "央视"], [2, "本地二台", "地方"]], [1]);
+  const view = await app.live();
+  assert.match(view.textContent, /综合一台/);
+  assert.doesNotMatch(view.textContent, /本地二台/);
+  pageButton(view, "显示全部频道（含 1 个无节目单）").dispatchEvent("click");
+  assert.equal(app.state.showAllChannels, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  const updated = app.elements.get("content");
+  assert.match(updated.textContent, /综合一台/);
+  assert.match(updated.textContent, /本地二台/);
+});
+
+test("live group chips show channel counts and pan the timeline", async () => {
+  const app = livePlaybackFixture([[1, "一台", "央视"], [2, "地方台", "地方"], [3, "三台", "央视"]], [1, 2, 3]);
+  const view = await app.live();
+  pageButton(view, "央视 2").dispatchEvent("click");
+  const guide = app.elements.get("live-guide");
+  const scroller = playbackNode(guide, (node) => node.className === "epg-scroll", "EPG scroller");
+  scroller.scrollLeft = 240;
+  pageButton(guide, "+2 小时 →").dispatchEvent("click");
+  assert.equal(scroller.scrollLeft, 480);
+  pageButton(guide, "← -2 小时").dispatchEvent("click");
+  assert.equal(scroller.scrollLeft, 240);
+  playbackNode(guide, (node) => node.attributes?.["aria-label"] === "播放 一台", "first channel").dispatchEvent("click");
+  const toggle = app.elements.get("player-guide-toggle");
+  const sidebar = app.elements.get("player-guide");
+  assert.equal(toggle.hidden, false);
+  assert.match(sidebar.textContent, /节目 1/);
+  toggle.dispatchEvent("click");
+  assert.equal(sidebar.hidden, true);
+  assert.equal(toggle.getAttribute("aria-pressed"), "false");
+  app.playerGuide(app.state.player.item);
+  assert.equal(sidebar.hidden, true);
+  toggle.dispatchEvent("click");
+  assert.equal(sidebar.hidden, false);
+  assert.equal(toggle.getAttribute("aria-pressed"), "true");
+  const next = app.elements.get("player-next");
+  const prev = app.elements.get("player-prev");
+  assert.equal(next.getAttribute("aria-label"), "下一台");
+  assert.equal(prev.getAttribute("aria-label"), "上一台");
+  assert.equal(next.hidden, false);
+  next.dispatchEvent("click");
+  assert.equal(app.state.player.live, true);
+  assert.equal(app.elements.get("player-title").textContent, "三台");
+  assert.match(sidebar.textContent, /节目 3/);
+  assert.equal(next.hidden, true);
+  assert.equal(prev.hidden, false);
+  prev.dispatchEvent("click");
+  assert.equal(app.elements.get("player-title").textContent, "一台");
+});
+
+const tvboxPaths = { config_path: "/feeds/config", catalog_path: "/feeds/catalog", live_path: "/feeds/live" };
+
+test("settings tabs render one panel at a time", async () => {
+  const app = environment({ "/api/users": [], "/api/tvbox": tvboxPaths });
+  app.state.page = "settings";
+  app.state.user = { id: 1, username: "root", role: "admin" };
+  const page = await app.settings();
+  assert.deepEqual(pageClass(page, "filter-chip").map((chip) => chip.textContent),
+    ["账户安全", "家庭成员", "在线影视源", "电视节目单", "影视仓订阅"]);
+  const panelTitles = (view) => pageNodes(pageClass(view, "settings-panel")[0])
+    .filter((node) => node.tagName === "H2").map((node) => node.textContent);
+  assert.deepEqual(panelTitles(page), ["修改密码"]);
+  assert.equal(app.calls.length, 0);
+  pageButton(page, "家庭成员").dispatchEvent("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(panelTitles(app.elements.get("content")), ["家庭成员"]);
+  assert.ok(app.calls.some((call) => call.url === "/api/users"));
+});
+
+test("tvbox copy buttons confirm success briefly", async () => {
+  const app = environment({ "/api/tvbox": tvboxPaths });
+  app.state.settingsTab = "tvbox";
+  let copied;
+  app.context.navigator.clipboard.writeText = async (value) => { copied = value; };
+  const page = await app.settings();
+  const copy = pageButton(page, "复制");
+  const timers = [];
+  app.context.setTimeout = (callback, delay) => timers.push({ callback, delay });
+  await copy.listeners.click[0]();
+  assert.equal(copied, "https://polyview.test/feeds/config");
+  assert.equal(copy.textContent, "✓ 已复制");
+  timers.find(({ delay }) => delay === 1500).callback();
+  assert.equal(copy.textContent, "复制");
+});
+
+test("tracking rows show covers and stepper buttons adjust the watched count", async () => {
+  const app = environment({ "/api/sources": [] });
+  const cover = "https://images.test/show.jpg";
+  const list = app.trackingRows([{ id: 7, title: "故事", cover, total_episodes: 4, watched_episodes: 1 }]);
+  const image = pageNodes(pageClass(list, "series-cover")[0]).find((node) => node.tagName === "IMG");
+  assert.equal(image.attributes.src, cover);
+  const form = pageClass(list, "tracking-progress")[0];
+  const input = pageNodes(form).find((node) => node.attributes?.name === "watched");
+  const step = pageNodes(form).find((node) => node.attributes?.["aria-label"] === "故事 增加一集");
+  step.dispatchEvent("click");
+  assert.equal(input.value, "2");
+  assert.equal(app.calls.length, 0);
+  await form.listeners.submit[0]({ preventDefault() {} });
+  const saves = app.calls.filter((call) => call.url === "/api/tracking/7" && call.options.method === "PUT");
+  assert.equal(saves.length, 1);
+  assert.deepEqual(JSON.parse(saves[0].options.body), { watched_episodes: 2 });
+});
+
+test("download filters narrow the queue and count each status", async () => {
+  const jobs = ["running", "failed", "completed"].map((status, id) => ({ id, status, title: `任务 ${id}` }));
+  const app = environment({ "/api/downloads": jobs });
+  app.state.downloads = jobs;
+  app.state.downloadFilter = "running";
+  const rows = pageClass(app.downloadList(), "download-row");
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].textContent, /任务 0/);
+  const page = await app.downloads();
+  const chips = pageClass(page, "filter-chip");
+  assert.deepEqual(chips.map((chip) => chip.textContent), ["全部 3", "下载中 1", "排队中 0", "已完成 1", "异常 1"]);
+  assert.equal(chips[1].attributes["aria-pressed"], "true");
+});
+
+test("all-view folds one series into a stack and expands on demand", async () => {
+  const app = environment({ "/api/library": [
+    { id: "e1", title: "第一集", kind: "episode", series: "故事", series_id: 7 },
+    { id: "e2", title: "第二集", kind: "episode", series: "故事", series_id: 7 },
+    { id: "m1", title: "电影", kind: "movie" },
+  ] });
+  app.state.page = "library";
+  app.state.filter = "all";
+  const page = await app.library();
+  const stacks = pageClass(page, "library-stack");
+  assert.equal(stacks.length, 1);
+  assert.equal(pageClass(page, "media-card").length, 2);
+  pageClass(stacks[0], "poster-button")[0].dispatchEvent("click");
+  assert.ok(app.state.expandedSeries.has("id:7"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(pageClass(app.elements.get("content"), "media-card").length, 4);
+});
+
+function pageDiscoveryRoutes(results) {
+  return {
+    "/api/sources": [{ id: 1, name: "甲源", enabled: true }, { id: 2, name: "乙源", enabled: true }],
+    "/api/catalog/categories": { categories: [] },
+    "/api/catalog/discover?page=1": { results, errors: [], page: 1, page_count: 1, total: results.length },
+  };
+}
+
+test("spotlight dots switch the featured title and its detail link", async () => {
+  const results = [1, 2, 3].map((id) => ({
+    id: String(id), title: `影片 ${id}`, source_id: 1, source_name: "甲源", year: String(2027 - id), cover: `https://images.test/${id}.jpg`,
+  }));
+  const detailUrl = "/api/catalog/1/detail?id=3";
+  const app = environment({ ...pageDiscoveryRoutes(results), "/api/tracking": [], [detailUrl]: { ...results[2], groups: [] } });
+  const spotlight = pageClass(await app.online(), "spotlight")[0];
+  const dots = pageClass(spotlight, "spotlight-dot");
+  assert.equal(dots.length, 3);
+  dots[2].dispatchEvent("click");
+  assert.equal(pageNodes(spotlight).find((node) => node.tagName === "H2").textContent, "影片 3");
+  assert.deepEqual(pageClass(spotlight, "spotlight-dot").map((dot) => dot.attributes["aria-pressed"]), ["false", "false", "true"]);
+  await pageButton(spotlight, "查看片源").listeners.click[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(app.calls.filter((call) => call.url.includes("/detail?")).map((call) => call.url), [detailUrl]);
+});
+
+test("Enter in the top search jumps to discovery from settings", () => {
+  const app = environment({ "/api/sources": [] });
+  app.state.page = "settings";
+  const search = app.elements.get("search-input");
+  search.value = "流浪地球";
+  search.dispatchEvent("keydown", { key: "Enter", preventDefault() {} });
+  assert.equal(app.state.page, "online");
+  assert.equal(app.state.query, "流浪地球");
+});
+
+test("the password reveal toggles the input type", () => {
+  const app = environment();
+  const input = app.elements.get("auth-password");
+  const reveal = app.elements.get("auth-reveal");
+  input.type = "password";
+  reveal.dispatchEvent("click");
+  assert.equal(input.type, "text");
+  assert.equal(reveal.attributes["aria-pressed"], "true");
+  reveal.dispatchEvent("click");
+  assert.equal(input.type, "password");
+  assert.equal(reveal.attributes["aria-pressed"], "false");
+});
+
+test("the offline banner reflects connectivity", () => {
+  const app = environment();
+  const banner = app.elements.get("connection-banner");
+  app.syncConnection(false);
+  assert.equal(banner.hidden, false);
+  app.syncConnection(true);
+  assert.equal(banner.hidden, true);
+});
+
+test("existing discover spotlight without covers keeps a single feature", async () => {
+  const app = environment(pageDiscoveryRoutes([
+    { id: "a", source_id: 1, source_name: "甲源", title: "单源片" },
+    { id: "b", source_id: 1, source_name: "甲源", title: "聚合片" },
+    { id: "c", source_id: 2, source_name: "乙源", title: "聚合片" },
+  ]));
+  const page = await app.online();
+  const spots = pageClass(page, "spotlight");
+  assert.equal(spots.length, 1);
+  assert.equal(pageNodes(spots[0]).find((node) => node.tagName === "H2").textContent, "聚合片");
+  assert.equal(pageClass(page, "spotlight-dot").length, 0);
 });
