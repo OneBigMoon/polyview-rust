@@ -836,6 +836,7 @@ mod tests {
             db: Mutex::new(conn),
             playback_grants: Default::default(),
             telegram_native: Default::default(),
+            cloud_fixture: None,
             download_runtime: Default::default(),
             media_dir: root.to_path_buf(),
             download_dir: root.join("downloads"),

@@ -406,7 +406,7 @@ async fn proxy(
     .await
 }
 
-async fn relay_response(
+pub(crate) async fn relay_response(
     upstream: reqwest::Response,
     requested_playlist: bool,
     playlist: impl FnOnce(&[u8], &Url) -> Result<String, AppError>,
@@ -549,6 +549,7 @@ mod tests {
                 db: Mutex::new(conn),
                 playback_grants: Default::default(),
                 telegram_native: Default::default(),
+                cloud_fixture: None,
                 download_runtime: Default::default(),
                 media_dir: media_dir.clone(),
                 download_dir: media_dir,

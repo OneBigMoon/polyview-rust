@@ -326,7 +326,7 @@
       document.createTextNode("影音空间 "),
       make("span", { text: "/" }),
       document.createTextNode(
-        ` ${{ online: "影视发现", calendar: "放送日历", library: "媒体库", live: "电视直播", favorites: "我的收藏", series: "追剧清单", downloads: "下载任务", settings: "账户与设置" }[page]}`,
+        ` ${{ online: "影视发现", cloud: "网盘搜片", calendar: "放送日历", library: "媒体库", live: "电视直播", favorites: "我的收藏", series: "追剧清单", downloads: "下载任务", settings: "账户与设置" }[page]}`,
       ),
     );
     render();
@@ -4772,6 +4772,12 @@
       ]),
     ]);
   }
+  function cloudViews() {
+    return globalThis.polyviewCloud({ make, button, head, api, admin });
+  }
+  async function cloud() {
+    return cloudViews().page();
+  }
   async function settings() {
     const root = make(
       "div",
@@ -4785,6 +4791,7 @@
             ["family", "家庭成员"],
             ["sources", "在线影视源"],
             ["parsers", "解析接口"],
+            ["cloud", "网盘与资源频道"],
             ["epg", "直播与节目单"],
             ["notify", "通知与日历"],
             ["backup", "备份与工具"],
@@ -4821,6 +4828,7 @@
     else if (active === "family") body.append(await familySettings());
     else if (active === "sources") body.append(await sourceSettings());
     else if (active === "parsers") body.append(await globalThis.polyviewParserPanel({ make, button, api, toast }));
+    else if (active === "cloud") body.append(await cloudViews().settings());
     else if (active === "epg") body.append(...await Promise.all([epgSettings(), liveSubscriptionSettings(), channelAliasSettings()]));
     else if (active === "notify") body.append(...await notificationCalendarSettings());
     else if (active === "backup") body.append(...backupSettings());
@@ -4863,6 +4871,7 @@
       const page =
         pageName === "favorites" ? await favorites() :
         pageName === "calendar" ? await calendar() :
+        pageName === "cloud" ? await cloud() :
         pageName === "online"
           ? await online()
           : pageName === "library"

@@ -2,6 +2,12 @@
 mod backup;
 #[path = "cases/calendar.rs"]
 mod calendar;
+#[path = "cases/cloud_accounts.rs"]
+mod cloud_accounts;
+#[path = "cases/cloud_bot.rs"]
+mod cloud_bot;
+#[path = "cases/cloud_search.rs"]
+mod cloud_search;
 #[path = "cases/download_metadata.rs"]
 mod download_metadata;
 #[path = "cases/download_settings.rs"]
@@ -100,6 +106,17 @@ impl TestApp {
     }
 
     fn new_with_native(telegram_native: polyview::telegram::native::NativeRuntime) -> Self {
+        Self::with_services(telegram_native, None)
+    }
+
+    fn with_cloud_fixture(url: reqwest::Url) -> Self {
+        Self::with_services(Default::default(), Some(url))
+    }
+
+    fn with_services(
+        telegram_native: polyview::telegram::native::NativeRuntime,
+        cloud_fixture: Option<reqwest::Url>,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let media_dir = temp.path().join("media");
         fs::create_dir_all(media_dir.join("downloads")).unwrap();
@@ -111,6 +128,7 @@ impl TestApp {
             db: Mutex::new(conn),
             playback_grants: Default::default(),
             telegram_native,
+            cloud_fixture,
             download_runtime: Default::default(),
             media_dir,
             download_dir,

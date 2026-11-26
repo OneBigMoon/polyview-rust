@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 import { registerParserPanelTests } from "./cases/parser-panel.mjs";
+import { registerCloudPageTests } from "./cases/cloud-page.mjs";
 
 const application = await readFile(
   new URL("../web/app.js", import.meta.url),
@@ -281,7 +282,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {calendar, state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, favorites, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
+      "globalThis.hooks = {cloud, calendar, state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, favorites, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
     ),
     context,
   );
@@ -1954,7 +1955,7 @@ test("settings tabs render one panel at a time", async () => {
   app.state.user = { id: 1, username: "root", role: "admin" };
   const page = await app.settings();
   assert.deepEqual(pageClass(page, "filter-chip").map((chip) => chip.textContent),
-    ["账户安全", "家庭成员", "在线影视源", "解析接口", "直播与节目单", "通知与日历", "备份与工具", "影视仓订阅"]);
+    ["账户安全", "家庭成员", "在线影视源", "解析接口", "网盘与资源频道", "直播与节目单", "通知与日历", "备份与工具", "影视仓订阅"]);
   const panelTitles = (view) => pageNodes(pageClass(view, "settings-panel")[0])
     .filter((node) => node.tagName === "H2").map((node) => node.textContent);
   assert.deepEqual(panelTitles(page), ["修改密码"]);
@@ -3596,3 +3597,4 @@ test("failed Telegram album imports preserve the selected video and allow anothe
 });
 
 registerParserPanelTests({ environment, pageNodes, pageButton });
+registerCloudPageTests({ environment, pageNodes, pageButton });

@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db: Mutex::new(conn),
         playback_grants: Default::default(),
         telegram_native: Default::default(),
+        cloud_fixture: None,
         download_runtime: Default::default(),
         media_dir,
         download_dir,
@@ -111,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_worker = polyview::source_subscriptions::start_worker(state.clone());
     let health_worker = polyview::catalog::start_health_worker(state.clone());
     let telegram_worker = polyview::telegram::subscriptions::start_worker(state.clone());
+    let cloud_bot = polyview::cloud::bot::start_worker(state.clone());
     let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await;
@@ -120,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     source_worker.abort();
     health_worker.abort();
     telegram_worker.abort();
+    cloud_bot.abort();
     result?;
     Ok(())
 }

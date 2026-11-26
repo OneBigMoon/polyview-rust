@@ -44,6 +44,12 @@ struct Backup {
         skip_serializing_if = "Option::is_none"
     )]
     source_subscriptions: Option<SubscriptionBackup>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cloud: Option<crate::cloud::Backup>,
     epg_config: EpgConfig,
     app_settings: SiteSettings,
 }
@@ -140,6 +146,7 @@ async fn export(State(state): State<Shared>, user: AuthUser) -> Result<Json<Back
         live_sources: export_live(&tx)?,
         live_channels: Some(export_channels(&tx)?),
         source_subscriptions: Some(source_subscriptions::export_config(&tx)?),
+        cloud: Some(crate::cloud::export_config(&tx)?),
         epg_config: EpgConfig {
             url: tx.query_row("SELECT value FROM settings WHERE key='epg_url'", [], |r| {
                 r.get(0)
@@ -323,6 +330,9 @@ async fn import(
     }
     if let Some(channels) = backup.live_channels {
         restore_channels(&tx, &channels)?;
+    }
+    if let Some(config) = backup.cloud {
+        crate::cloud::restore_config(&tx, config)?;
     }
     tx.commit()?;
     state.playback_grants.clear();

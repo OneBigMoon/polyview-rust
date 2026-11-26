@@ -78,6 +78,7 @@ fn app_state(directory: &Path) -> Shared {
         db: Mutex::new(conn),
         playback_grants: Default::default(),
         telegram_native: Default::default(),
+        cloud_fixture: None,
         download_runtime: Default::default(),
         download_dir: media_dir.join("downloads"),
         media_dir,

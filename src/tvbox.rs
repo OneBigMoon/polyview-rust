@@ -107,7 +107,7 @@ fn require_token(state: &Shared, token: &str) -> Result<i64, AppError> {
         .ok_or_else(|| AppError::not_found("Feed not found"))
 }
 
-fn validate_origin(raw: &str) -> Result<String, AppError> {
+pub(crate) fn validate_origin(raw: &str) -> Result<String, AppError> {
     let url = Url::parse(raw).map_err(|_| AppError::bad_request("Invalid public origin"))?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
@@ -731,6 +731,7 @@ mod tests {
             db: Mutex::new(conn),
             playback_grants: Default::default(),
             telegram_native: Default::default(),
+            cloud_fixture: None,
             download_runtime: Default::default(),
             download_dir: media_dir.join("downloads"),
             media_dir,

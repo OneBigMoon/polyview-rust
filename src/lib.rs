@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod calendar;
 pub mod catalog;
+pub mod cloud;
 pub mod download_settings;
 pub mod epg;
 pub mod legacy;
@@ -39,6 +40,7 @@ pub struct AppState {
     pub db: Mutex<Connection>,
     pub playback_grants: playback::PlaybackGrants,
     pub telegram_native: telegram::native::NativeRuntime,
+    pub cloud_fixture: Option<reqwest::Url>,
     pub download_runtime: network::DownloadRuntime,
     pub media_dir: PathBuf,
     pub download_dir: PathBuf,
@@ -148,6 +150,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     live_sources::init_schema(conn)?;
     source_subscriptions::init_schema(conn)?;
     parsers::init_schema(conn)?;
+    cloud::init_schema(conn)?;
     Ok(())
 }
 
@@ -156,6 +159,7 @@ pub fn router(state: Shared) -> Router {
         .route("/", get(index))
         .route("/app.js", get(script))
         .route("/parser-settings.js", get(parser_settings_script))
+        .route("/cloud.js", get(cloud_script))
         .route("/style.css", get(styles))
         .route("/three-bg.js", get(three_background))
         .route("/vendor/three.module.min.js", get(three_module))
@@ -168,6 +172,7 @@ pub fn router(state: Shared) -> Router {
         .merge(playback::router())
         .merge(parsers::router())
         .merge(catalog::router())
+        .merge(cloud::router())
         .merge(tracking::router())
         .merge(tvbox::router())
         .merge(user_data::router())
@@ -225,6 +230,12 @@ async fn parser_settings_script() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../web/parser-settings.js"),
+    )
+}
+async fn cloud_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/cloud.js"),
     )
 }
 async fn styles() -> impl IntoResponse {
