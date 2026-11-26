@@ -135,6 +135,7 @@ async fn host_requests_are_privileged_and_authorization_requires_an_authenticate
     assert_eq!(rows[0]["uses_proxy"], true);
     let cmd = rows[0]["command"].as_str().unwrap();
     assert!(cmd.contains("umask 077"));
+    assert!(cmd.contains(" telegram-host-login "));
     assert!(cmd.contains("operator'\\''s tdl' -n 'polyview_u2'"));
     assert!(cmd.contains(&format!("'type=bolt,path={}'", app.directory(2).display())));
     assert!(cmd.contains("${TDL_PROXY:?"));

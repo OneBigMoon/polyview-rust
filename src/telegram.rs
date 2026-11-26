@@ -302,6 +302,7 @@ async fn requests(
     } else {
         settings.tdl_path.clone()
     };
+    let viewer = std::env::current_exe()?;
     let rows = stmt.query_map(params![root, settings.telegram_namespace], |row| {
         let scope = Scope {
             account_key: row.get(2)?,
@@ -323,7 +324,8 @@ async fn requests(
             username: row.get(1)?,
             uses_proxy,
             command: format!(
-                "(umask 077 && exec {} -n {} --storage {}{} login -T qr)",
+                "(umask 077 && exec {} telegram-host-login {} -n {} --storage {}{} login -T qr)",
+                shell_word(&viewer.to_string_lossy()),
                 shell_word(&executable),
                 shell_word(&location.namespace),
                 shell_word(&location.storage(&scope)),

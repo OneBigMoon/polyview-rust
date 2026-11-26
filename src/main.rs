@@ -1,3 +1,5 @@
+mod host_qr;
+
 use polyview::{AppState, Shared, init_schema, network, router};
 use std::{
     env,
@@ -9,6 +11,10 @@ use std::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("telegram-host-login")) {
+        return host_qr::run(args).await;
+    }
     if env::args().any(|arg| arg == "--help" || arg == "-h") {
         println!(
             "PolyView — web viewing, series downloads, and TVBox / 影视仓 feeds\n\nConfiguration via environment:\n  POLYVIEW_BIND          Listen address (default 127.0.0.1:8080)\n  POLYVIEW_DATA_DIR      New database/report directory (default ./data)\n  POLYVIEW_MEDIA_DIR     Media library directory (default ./media)\n  POLYVIEW_PUBLIC_URL    HTTP(S) origin reachable by TV clients; no path\n  POLYVIEW_SECURE_COOKIE Set true behind HTTPS (default false)\n  POLYVIEW_LEGACY_DB     Explicit original database backup to import read-only\n  POLYVIEW_LEGACY_CONFIG Optional original JSON config used with LEGACY_DB\n  RUST_LOG              Log filter (default polyview=info)\n\nOpen the web interface to create the first administrator or use imported accounts.\nConfigure CMS sources for online viewing and tracking. FFmpeg is required for HLS\ndownloads; completed files are saved under the media directory.\n\nLegacy import uses a separate polyview.sqlite3 database and writes an import\nreport. Imported automatic downloads stay off. Old jobs, history, sessions, and\nTelegram execution are not migrated; retain the original service until verified."

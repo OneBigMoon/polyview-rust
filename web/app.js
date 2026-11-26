@@ -3101,7 +3101,7 @@
         const result = await api(path, { method });
         if (!current()) return;
         const labels = { unconfigured: "服务器尚未配置 tdl。", idle: "此账户尚未连接 Telegram。",
-          waiting: "等待服务器管理员在宿主机完成 tdl 登录。", authorized: "此账户已连接 Telegram。", error: "无法检查 Telegram 会话。" };
+          waiting: "等待服务器管理员启动 tdl。请在宿主机浏览器扫码，按需在宿主机终端输入两步验证密码。", authorized: "此账户已连接 Telegram。", error: "无法检查 Telegram 会话。" };
         statusLine.textContent = labels[result?.state] || labels.error;
         if (result?.state === "idle") controls.append(button("申请连接", "primary", () => load("POST")));
         if (result?.state === "error") controls.append(button("重新申请连接", "subtle", () => load("POST")));
@@ -3129,7 +3129,7 @@
             if (!current()) return;
             if (pending.length) {
               requests.append(make("h3", { text: "等待宿主机登录的账户" }), make("p", {
-                text: "核对申请人与 Telegram 账户后，请以运行 PolyView 的系统用户在可信主机终端执行对应命令，并在该终端按照 tdl 提示完成登录。完成后请申请人刷新授权状态。",
+                text: "核对申请人后，以运行 PolyView 的系统用户在宿主机终端执行对应命令。在宿主机浏览器扫描二维码，两步验证密码在原终端输入。完成后请申请人刷新授权状态。",
               }));
               for (const request of pending) requests.append(make("section", {}, [
                 make("strong", { text: `${request.username}（账户 ${request.user_id}）` }),
