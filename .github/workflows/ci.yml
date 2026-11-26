@@ -23,16 +23,42 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check Rust warnings
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Run tests
+      - name: Install check dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          cargo test --locked --all-targets
+          sudo apt-get install -y ffmpeg ripgrep
+      - name: Run tests
+        run: cargo test --locked --all-targets
       - name: Run frontend behavior tests
         run: node --test tests/frontend.test.mjs
       - name: Check frontend syntax
-        run: node --check web/app.js
+        run: |
+          for script in web/*.js; do
+            node --check "$script"
+          done
+      - name: Check CSP and forbidden feature references
+        shell: bash
+        run: |
+          assert_absent() {
+            local status
+            if rg --no-ignore --line-number --ignore-case --multiline --pcre2 "$@"; then
+              return 1
+            else
+              status=$?
+              [[ $status == 1 ]] || return "$status"
+            fi
+          }
+          assert_absent \
+            -e 'setAttribute\s*\(\s*["\x27\x60](?:style|on[a-z]+)["\x27\x60]' \
+            -e '\.(?:innerHTML|outerHTML|insertAdjacentHTML)\b' \
+            -e '<style\b|<script\b(?![^>]*\ssrc\s*=)' \
+            -e '<[a-z][\w:-]*\b[^<>]*?\s(?:style|on[a-z]+)\s*=' \
+            -e '\b(?:onclick|onchange|onsubmit)\s*=' \
+            web/*.js web/index.html
+          assert_absent 'danmaku|弹幕' src web/*.js web/index.html web/style.css
       - name: Build release
         run: cargo build --locked --release
       - name: Validate deployment configuration
         run: docker compose config --quiet
+      - name: Exercise release HTTP and browser flows
+        run: node scripts/e2e-smoke.mjs

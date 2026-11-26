@@ -11,8 +11,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 polyview \
     && useradd --uid 1000 --gid polyview --no-create-home --shell /usr/sbin/nologin polyview \
-    && mkdir -p /data /media \
-    && chown polyview:polyview /data /media
+    && install -d -o polyview -g polyview /data /media \
+    && install -d -o polyview -g polyview -m 0700 /data/telegram
 COPY --from=builder /build/target/release/polyview /usr/local/bin/polyview
 COPY LICENSE /usr/share/doc/polyview/LICENSE
 COPY web/vendor/hls.LICENSE /usr/share/doc/polyview/hls.LICENSE

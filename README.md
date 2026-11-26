@@ -119,6 +119,7 @@ For episodes, use names such as `三体.S01E02.mp4`, or put videos under `三体
 
 Import a UTF-8 M3U playlist or a grouped TXT list (`Group,#genre#`). Separate alternative stream URLs with `#`. Each line can carry VLC options, pipe-delimited HTTP headers and a catch-up template. Administrators can probe one group or all groups, see first-byte latency and remove lines after three consecutive failures. The guide retains seven days of history. Click a past program marked **回看** to play its original time window. Web and TVBox clients receive scoped relay URLs for protected streams and artwork.
 The all-channels toggle includes channels without XMLTV data. Group chips filter the guide, and the time controls move along the programme grid. Configure XMLTV feeds and channel-name aliases under **直播与节目单**.
+When channels exist, the server checks the XMLTV cache 30 seconds after startup and then every six hours. A failed refresh leaves the previous guide available.
 The live player uses compact controls without a playback timeline and shows the channel's current and upcoming programmes on the right; the fullscreen button fills the screen with both the stream and the programme list.
 
 PolyView serves original local media without transcoding. MP4 with H.264/AAC and supported WebM codecs work in common browsers; MKV, AVI, and other codecs depend on the browser or TV client.
@@ -165,7 +166,11 @@ The administrator can configure the download engine under **下载**. Concurrenc
 
 ### Native channel browsing
 
-Configure the Telegram application API ID and hash as an administrator. A member can start, monitor or cancel their login in the web panel. A trusted host desktop confirms the requesting member, displays the QR for scanning in Telegram and confirms the verified Telegram identity before binding the session. The built-in desktop flow supports macOS. Other deployments can supply a trusted executable using `POLYVIEW_TELEGRAM_HOST_HELPER`. A headless browser-only deployment cannot complete this confirmation. The QR request expires after two minutes. Accounts that require an additional Telegram password cannot complete this native flow. The separate tdl path below supports terminal two-step verification for downloads.
+Configure the Telegram application API ID and hash as an administrator. A signed-in member selects **连接 Telegram** in the web panel. The request expires after two minutes and the member can monitor or cancel it there.
+
+On headless Linux, the account owner completes phone, code and optional two-step verification at a trusted terminal. Run `polyview telegram-native-login --member-id ID` as the service user with the same `POLYVIEW_DATA_DIR` and `POLYVIEW_TDJSON_PATH`. With the supplied Compose service, use `docker compose exec polyview polyview telegram-native-login --member-id ID`. Use the member ID shown by the panel and check the PolyView member and Telegram account before confirming. The terminal hides credential input.
+
+The macOS desktop flow or a trusted `POLYVIEW_TELEGRAM_HOST_HELPER` can display a QR code for the official Telegram app. The desktop operator confirms the identity before binding the session. Desktop QR authorization stops when Telegram requires an additional password.
 
 Private native sessions live under `POLYVIEW_DATA_DIR/telegram/`. A connected member can browse chats, search messages, play videos with byte-range seeking, queue an album or subscribe to matching keywords. The member's TVBox token also permits streaming their Telegram videos.
 
@@ -229,17 +234,18 @@ Install FFmpeg/FFprobe to run the real HLS integration test; it prints an explic
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
-node --check web/app.js
-node --check web/three-bg.js
+for script in web/*.js; do node --check "$script"; done
 node --test tests/frontend.test.mjs
 cargo build --locked --release
+docker compose config --quiet
+node scripts/e2e-smoke.mjs
 ```
 
 Tests cover account/session lifecycle, permissions, per-user state, CMS search/details and partial source failure, tracking deduplication, read-only legacy import, HLS rewriting, Range/HEAD playback, scan recovery, download cancellation/retry, TV feed revocation, and restart recovery. `tests/hls_flow.rs` generates an H.264/AAC HLS fixture with FFmpeg, downloads and probes its MP4 output, and verifies automatic library entry, progress, Range playback, and TV token playback.
 
 Offline fixtures cover source subscription formats, resolver failover, live catch-up, TDLib messages and byte ranges, cloud transfer protocols, Bot progress, qBittorrent and Transmission, metadata sidecars, organization rollback, and token-scoped TVBox artwork.
 
-The CI workflow installs FFmpeg and runs formatting, strict Clippy, Rust tests, frontend behavior/syntax tests, a release build, and Compose validation. Passing local checks does not establish that the NAS deployment, real source availability, Telegram authorization, or TV device playback have been verified.
+The smoke test launches the release binary on loopback with temporary data, a mock CMS and local feed providers. It also opens a locally installed supported browser when available. Use `POLYVIEW_REQUIRE_BROWSER=1 node scripts/e2e-smoke.mjs` to require the browser checks. CI runs the same smoke test after the release build.
 
 ## License
 

@@ -10,12 +10,26 @@ services:
       POLYVIEW_MEDIA_DIR: "/media"
       POLYVIEW_SECURE_COOKIE: "${POLYVIEW_SECURE_COOKIE:-false}"
       POLYVIEW_PUBLIC_URL: "${POLYVIEW_PUBLIC_URL:-}"
+      # Use absolute paths inside the container for the library and trusted helper.
+      POLYVIEW_TDJSON_PATH:
+      POLYVIEW_TELEGRAM_HOST_HELPER:
       RUST_LOG: "${RUST_LOG:-polyview=info}"
     volumes:
+      # Bind mounts mask the image's /data. The selected UID/GID needs write
+      # access here. A pre-existing telegram/ must be owned by that UID with mode 0700.
       - type: bind
         source: "${POLYVIEW_DATA_DIR:-./data}"
         target: /data
       - type: bind
         source: "${POLYVIEW_MEDIA_DIR:-./media}"
         target: /media
+      # Optional Linux tools (tdl, N_m3u8DL-RE, libtdjson.so, host helper).
+      # Uncomment to mount an existing directory. Configure executables in
+      # download settings and the library/helper above using /opt/polyview-tools/ paths.
+      # - type: bind
+      #   source: "${POLYVIEW_TOOLS_DIR:-./tools}"
+      #   target: /opt/polyview-tools
+      #   read_only: true
+      #   bind:
+      #     create_host_path: false
     restart: unless-stopped
