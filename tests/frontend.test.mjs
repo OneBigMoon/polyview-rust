@@ -2775,3 +2775,202 @@ test("the resource tool extracts unique HTTP links, copies them, and imports the
     assert.equal(options.headers["X-PolyView-Request"], "1");
   }
 });
+
+function m6DownloadsFixture(routes, user = { id: 12, role: "member" }) {
+  const app = environment();
+  app.state.user = user;
+  app.state.page = "downloads";
+  app.context.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    app.calls.push({ url, options });
+    if (method !== "GET") assert.equal(options.headers["X-PolyView-Request"], "1");
+    const route = routes[url] ?? (url === "/api/downloads" ? [] : { state: "idle" });
+    const data = typeof route === "function" ? await route(method, options.body && JSON.parse(options.body)) : route;
+    return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+  };
+  return app;
+}
+
+const m6Click = (root, label) => pageButton(root, label).listeners.click[0]();
+const m6Field = (root, name) => pageNodes(root).find((node) => node.attributes?.name === name);
+function m6Form(root, button) {
+  return pageNodes(root).find((node) => node.tagName === "FORM" && pageNodes(node).some((child) => child.tagName === "BUTTON" && child.textContent === button));
+}
+const m6Submit = (root, button) => {
+  const form = m6Form(root, button);
+  return form.listeners.submit[0]({ preventDefault() {}, currentTarget: form });
+};
+
+test("local library cards and series stacks use real posters, proxied retry and text fallback", async () => {
+  const metadata = { cover: "https://fixture.example/cover", description: "影片简介", year: "2018" };
+  const app = environment({ "/api/library": [
+    { id: 1, kind: "movie", title: "电影甲", ...metadata },
+    { id: 2, kind: "episode", title: "第一集", series: "剧甲", series_id: 6 },
+    { id: 3, kind: "episode", title: "第二集", series: "剧甲", series_id: 6, ...metadata },
+    { id: 4, kind: "movie", title: "电影乙" },
+  ] });
+  const page = await app.library();
+  const posters = pageClass(page, "poster-button");
+  for (const name of ["电影甲", "剧甲"]) {
+    const poster = posters.find((p) => p.attributes.title.startsWith(name));
+    assert.match(poster.attributes.title, /2018 · 影片简介/);
+    const art = pageClass(poster, "poster-art")[0];
+    const img = pageNodes(art).find((node) => node.tagName === "IMG");
+    assert.equal(img.attributes.src, metadata.cover);
+    img.remove = () => { art.children = art.children.filter((node) => node !== img); };
+    img.dispatchEvent("error");
+    assert.equal(img.attributes.src, `/api/image?url=${encodeURIComponent(metadata.cover)}`);
+    img.dispatchEvent("error");
+    assert.ok(!art.children.includes(img));
+    assert.equal(pageClass(art, "poster-name")[0].textContent, name);
+  }
+  assert.ok(!pageNodes(posters.find((p) => p.attributes.title === "电影乙")).some((node) => node.tagName === "IMG"));
+});
+
+test("single and batch catalog downloads carry sanitized movie metadata", async () => {
+  const item = { id: "x", source_id: 5, title: "影片", cover: "https://fixture.example/poster" };
+  const app = environment({ "/api/catalog/5/detail?id=x": { ...item, year: "2025", description: "<b>简介</b>", groups: [
+    { name: "线路", direct: true, episodes: [{ name: "第1集", url: "https://fixture.example/video" }] },
+  ] }, "/api/tracking": [] });
+  await app.openCatalogDetail(item);
+  const dialog = app.elements.get("catalog-dialog");
+  await m6Click(dialog, "下载本集");
+  await m6Click(dialog, "选择集数");
+  await m6Click(dialog, "全选");
+  await m6Click(dialog, "批量加入下载队列（1 集）");
+  const body = { title: "影片 S01E01", url: "https://fixture.example/video", cover: item.cover, year: "2025", description: "简介" };
+  assert.deepEqual(queuedEpisodeBodies(app), [body, body]);
+});
+
+test("manual download form sends optional poster, year and description", async () => {
+  const app = m6DownloadsFixture({});
+  const root = await app.downloads();
+  const form = m6Form(root, "开始下载");
+  const expected = { title: "影片", url: "https://fixture.example/file.mp4", cover: "https://fixture.example/image", year: "2025", description: "简介" };
+  form.elements = Object.fromEntries(Object.entries(expected).map(([key, value]) => {
+    const field = m6Field(form, key);
+    field.value = value;
+    return [key, field];
+  }));
+  form.reset = () => {};
+  await m6Submit(root, "开始下载");
+  assert.deepEqual(queuedEpisodeBodies(app), [expected]);
+});
+
+test("queue pause, resume and completed cleanup repaint server state and counts", async () => {
+  let jobs = [{ id: 41, title: "当前片", status: "running" }, { id: 42, title: "历史片", status: "completed" }];
+  const app = m6DownloadsFixture({
+    "/api/downloads": () => jobs,
+    "/api/downloads/41/pause": () => { jobs[0].status = "paused"; },
+    "/api/downloads/41/resume": () => { jobs[0].status = "queued"; },
+    "/api/downloads/completed": () => { jobs = jobs.slice(0, 1); },
+  });
+  const root = await app.downloads();
+  await m6Click(root, "暂停");
+  assert.equal(pageClass(root, "download-status")[0].textContent, "已暂停");
+  pageButton(root, "已暂停 1");
+  await m6Click(root, "继续");
+  pageButton(root, "排队中 1");
+  await m6Click(root, "清理已完成");
+  pageButton(root, "全部 1");
+  assert.doesNotMatch(root.textContent, /历史片/);
+  assert.deepEqual(app.calls.filter(({options}) => options.method && options.method !== "GET").map(({url, options}) => [url, options.method]), [
+    ["/api/downloads/41/pause", "POST"], ["/api/downloads/41/resume", "POST"], ["/api/downloads/completed", "DELETE"],
+  ]);
+});
+
+test("Telegram request, cancellation, host authorization and video import are scoped to the member", async () => {
+  const states = new Map();
+  const jobs = [];
+  const app = m6DownloadsFixture({
+    "/api/telegram/login": (method) => {
+      const id = app.state.user.id;
+      if (method === "POST") states.set(id, "waiting");
+      if (method === "DELETE") states.delete(id);
+      return { state: states.get(id) || "idle", qr: ["private-qr"], message: "private-stdout" };
+    },
+    "/api/downloads/telegram": (_, body) => { jobs.push({ id: 1, title: "视频", status: "queued", kind: "telegram", url: body.url }); },
+    "/api/downloads": () => app.state.user.id === 12 ? jobs : [],
+  });
+  const page = await app.downloads();
+  await m6Click(page, "申请连接");
+  assert.match(page.textContent, /等待服务器管理员/);
+  await m6Click(page, "取消申请");
+  await m6Click(page, "申请连接");
+  states.set(12, "authorized");
+  await m6Click(page, "刷新授权状态");
+  m6Field(page, "telegram_url").value = "https://t.me/c/12345/7";
+  await m6Submit(page, "导入视频");
+  assert.equal(jobs[0].url, "https://t.me/c/12345/7");
+  assert.equal(m6Field(page, "telegram_url").value, "");
+  assert.doesNotMatch(page.textContent, /private-qr|private-stdout|12345/);
+  app.state.user = { id: 13, role: "member" };
+  const second = await app.downloads();
+  pageButton(second, "申请连接");
+  assert.equal(m6Field(second, "telegram_url"), undefined);
+  assert.equal(app.state.downloads.length, 0);
+  const count = app.calls.length;
+  await m6Submit(page, "导入视频");
+  await page.refreshQueue();
+  assert.equal(app.calls.length, count);
+  assert.ok(!app.calls.some(({url}) => url.includes("requests") || url.includes("password") || url.startsWith("/api/settings")));
+});
+
+test("late queue polls cannot overwrite fresh data or another account's downloads", async () => {
+  let reply = () => [];
+  const app = m6DownloadsFixture({ "/api/downloads": () => reply() });
+  const page = await app.downloads();
+  let resolve;
+  reply = () => new Promise((done) => { resolve = done; });
+  const older = page.refreshQueue();
+  const started = app.calls.length;
+  await page.refreshQueue(true);
+  assert.equal(app.calls.length, started);
+  reply = () => [{ id: 5, title: "最新", status: "paused" }];
+  await page.refreshQueue();
+  resolve([{ id: 5, title: "过期", status: "running" }]);
+  await older;
+  assert.match(page.textContent, /最新/);
+  assert.doesNotMatch(page.textContent, /过期/);
+  reply = () => new Promise((done) => { resolve = done; });
+  const previousAccount = page.refreshQueue();
+  app.state.user = { id: 22, role: "member" };
+  reply = () => [];
+  await app.downloads();
+  resolve([{ id: 7, title: "私密", status: "queued" }]);
+  await previousAccount;
+  assert.equal(app.state.downloads.length, 0);
+});
+
+test("administrator sees official host commands and updates download settings with write-only proxy", async () => {
+  const saved = { enabled: true, concurrency: 1, max_attempts: 3, n_m3u8dl_path: "N_m3u8DL-RE", ffmpeg_path: "ffmpeg", ffprobe_path: "ffprobe", tdl_path: "tdl", telegram_directory: "./telegram", telegram_namespace: "family", telegram_proxy_configured: true };
+  const changes = [];
+  const app = m6DownloadsFixture({
+    "/api/telegram/login/requests": [{ user_id: 4, username: "family", command: "tdl -n family_u4 login", uses_proxy: true }],
+    "/api/settings/downloads": (method, body) => {
+      if (method === "PUT") { changes.push(body); Object.assign(saved, { concurrency: body.concurrency }); }
+      return saved;
+    },
+  }, { id: 1, role: "admin" });
+  const page = await app.downloads();
+  assert.match(page.textContent, /tdl -n family_u4 login/);
+  assert.match(page.textContent, /TDL_PROXY/);
+  const proxy = m6Field(page, "telegram_proxy");
+  assert.equal(proxy.attributes.type, "password");
+  assert.equal(proxy.value, "");
+  assert.equal(m6Field(page, "concurrency").attributes.max, "4");
+  assert.equal(m6Field(page, "max_attempts").attributes.max, "10");
+  m6Field(page, "concurrency").value = "3";
+  await m6Submit(page, "保存下载设置");
+  assert.ok(!Object.hasOwn(changes[0], "telegram_proxy"));
+  assert.equal(changes[0].concurrency, 3);
+  assert.equal(changes[0].enabled, true);
+  proxy.value = "socks5://fixture:password@localhost";
+  await m6Submit(page, "保存下载设置");
+  assert.equal(changes[1].telegram_proxy, "socks5://fixture:password@localhost");
+  assert.equal(proxy.value, "");
+  m6Field(page, "clear_proxy").checked = true;
+  await m6Submit(page, "保存下载设置");
+  assert.equal(changes[2].telegram_proxy, "");
+  assert.doesNotMatch(page.textContent, /fixture:password/);
+});

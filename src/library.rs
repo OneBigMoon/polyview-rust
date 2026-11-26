@@ -42,6 +42,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
          );
          CREATE INDEX IF NOT EXISTS library_media_series ON library_media(series_id);",
     )?;
+    for column in ["cover", "year", "description"] {
+        crate::ensure_column(conn, "library_media", column, "TEXT NOT NULL DEFAULT ''")?;
+    }
     crate::ensure_column(conn, "library_user_media", "favorite_at", "INTEGER")?;
     conn.execute("UPDATE library_user_media SET favorite_at=updated_at WHERE favorite=1 AND favorite_at IS NULL", [])?;
     Ok(())
@@ -73,6 +76,9 @@ pub struct MediaItem {
     pub position: f64,
     pub duration: f64,
     pub watched: bool,
+    pub cover: String,
+    pub year: String,
+    pub description: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -89,7 +95,8 @@ async fn list(
     let query = search.q.unwrap_or_default();
     let mut stmt = conn.prepare(
         "SELECT m.id,m.title,m.relative_path,m.kind,s.title,m.series_id,m.season,m.episode,m.size,
-                COALESCE(u.favorite,0),COALESCE(u.position,0),COALESCE(u.duration,0),COALESCE(u.watched,0)
+                COALESCE(u.favorite,0),COALESCE(u.position,0),COALESCE(u.duration,0),COALESCE(u.watched,0),
+                m.cover,m.year,m.description
          FROM library_media m LEFT JOIN library_series s ON s.id=m.series_id
          LEFT JOIN library_user_media u ON u.media_id=m.id AND u.user_id=?1
          WHERE m.available=1 AND (?2='' OR instr(lower(m.title || ' ' || COALESCE(s.title,'')),lower(?2))>0)
@@ -116,6 +123,9 @@ pub(crate) fn media_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> 
         position: row.get(10)?,
         duration: row.get(11)?,
         watched: row.get(12)?,
+        cover: row.get(13)?,
+        year: row.get(14)?,
+        description: row.get(15)?,
     })
 }
 
@@ -130,11 +140,79 @@ pub struct ScanResult {
 struct ScannedFile {
     relative_path: String,
     root: &'static str,
-    title: String,
-    series: Option<String>,
-    season: Option<i64>,
-    episode: Option<i64>,
     size: i64,
+}
+
+impl ScannedFile {
+    fn index(&self, conn: &Connection) -> Result<(), AppError> {
+        let relative = FsPath::new(&self.relative_path);
+        let stem = relative
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let (series, season, episode) = episode_info(stem, relative);
+        let series_id = if let Some(title) = series {
+            conn.execute(
+                "INSERT INTO library_series(title) VALUES(?) ON CONFLICT(title) DO NOTHING",
+                [&title],
+            )?;
+            Some(conn.query_row(
+                "SELECT id FROM library_series WHERE title=?",
+                [&title],
+                |r| r.get::<_, i64>(0),
+            )?)
+        } else {
+            None
+        };
+        let kind = if series_id.is_some() {
+            "episode"
+        } else {
+            "movie"
+        };
+        conn.execute(
+            "INSERT INTO library_media(title,relative_path,root,kind,series_id,season,episode,size,available)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1)
+             ON CONFLICT(root,relative_path) DO UPDATE SET title=excluded.title,kind=excluded.kind,
+             series_id=excluded.series_id,season=excluded.season,episode=excluded.episode,size=excluded.size,available=1",
+            params![clean_title(stem), self.relative_path, self.root, kind, series_id, season, episode, self.size],
+        )?;
+        Ok(())
+    }
+}
+
+/// Queue cleanup may delete a completed job immediately. Commit its durable media row
+/// and catalog metadata in the same transaction as the terminal queue state.
+pub(crate) fn complete_download(
+    conn: &mut Connection,
+    id: i64,
+    size: i64,
+) -> Result<bool, AppError> {
+    let tx = conn.transaction()?;
+    let path = tx
+        .query_row(
+            "UPDATE downloads SET status='completed',bytes_written=?2,total_bytes=?2,error=NULL
+         WHERE id=?1 AND status='running' RETURNING relative_path",
+            params![id, size],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(relative_path) = path else {
+        return Ok(false);
+    };
+    // Queue paths are relative to media_dir, including the download subdirectory.
+    let file = ScannedFile {
+        relative_path,
+        root: "media",
+        size,
+    };
+    file.index(&tx)?;
+    tx.execute(
+        "UPDATE library_media SET (cover,year,description)=(SELECT cover,year,description FROM downloads WHERE id=?1)
+         WHERE root='media' AND relative_path=?2",
+        params![id, file.relative_path],
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 async fn scan(State(state): State<Shared>, user: AuthUser) -> Result<Json<ScanResult>, AppError> {
@@ -149,6 +227,14 @@ async fn scan(State(state): State<Shared>, user: AuthUser) -> Result<Json<ScanRe
 pub fn scan_library(state: &Shared) -> Result<ScanResult, AppError> {
     let media_root = fs::canonicalize(&state.media_dir)?;
     let download_root = fs::canonicalize(&state.download_dir)?;
+    let mut missing: HashSet<(String, String)> = {
+        let conn = state.conn()?;
+        let mut statement =
+            conn.prepare("SELECT root,relative_path FROM library_media WHERE available=1")?;
+        statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?
+    };
     let mut files = Vec::new();
     collect_files(&media_root, &media_root, "media", &mut files)?;
     if !download_root.starts_with(&media_root) {
@@ -158,50 +244,28 @@ pub fn scan_library(state: &Shared) -> Result<ScanResult, AppError> {
     // Only reconcile after the complete walk succeeds; an unreadable mount must not clear the catalog.
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
-    let previous: HashSet<(String, String)> = {
-        let mut statement =
-            tx.prepare("SELECT root,relative_path FROM library_media WHERE available=1")?;
-        statement
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_, _>>()?
-    };
     let mut added = 0;
-    let mut seen = HashSet::new();
-    tx.execute("UPDATE library_media SET available=0 WHERE available=1", [])?;
-    for file in &files {
-        let key = (file.root.to_string(), file.relative_path.clone());
-        if !previous.contains(&key) {
+    let total = files.len();
+    // Only mark files from the pre-walk snapshot as missing. A queue worker may
+    // have indexed a new file while this scan was walking a different directory.
+    for file in files {
+        file.index(&tx)?;
+        if !missing.remove(&(file.root.to_owned(), file.relative_path)) {
             added += 1;
         }
-        seen.insert(key);
-        let series_id = if let Some(title) = &file.series {
-            tx.execute(
-                "INSERT INTO library_series(title) VALUES(?1) ON CONFLICT(title) DO NOTHING",
-                [title],
-            )?;
-            Some(tx.query_row(
-                "SELECT id FROM library_series WHERE title=?1",
-                [title],
-                |r| r.get::<_, i64>(0),
-            )?)
-        } else {
-            None
-        };
-        tx.execute(
-            "INSERT INTO library_media(title,relative_path,root,kind,series_id,season,episode,size,available)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1)
-             ON CONFLICT(root,relative_path) DO UPDATE SET title=excluded.title,kind=excluded.kind,
-             series_id=excluded.series_id,season=excluded.season,episode=excluded.episode,size=excluded.size,available=1",
-            params![file.title,file.relative_path,file.root,if series_id.is_some() {"episode"} else {"movie"},
-                series_id,file.season,file.episode,file.size],
+    }
+    let mut removed = 0;
+    for (root, path) in missing {
+        removed += tx.execute(
+            "UPDATE library_media SET available=0 WHERE root=? AND relative_path=? AND available=1",
+            params![root, path],
         )?;
     }
-    let removed = previous.difference(&seen).count();
     tx.commit()?;
     Ok(ScanResult {
         added,
         removed,
-        total: files.len(),
+        total,
     })
 }
 
@@ -236,27 +300,19 @@ fn collect_files(
                 .to_str()
                 .ok_or_else(|| AppError::bad_request("Media filenames must be valid UTF-8"))?
                 .to_string();
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            let (series, season, episode) = episode_info(stem, relative);
+            let size = i64::try_from(entry.metadata()?.len())
+                .map_err(|_| AppError::bad_request("Media file is too large"))?;
             files.push(ScannedFile {
                 relative_path,
                 root: source,
-                title: clean_title(stem),
-                series,
-                season,
-                episode,
-                size: i64::try_from(entry.metadata()?.len())
-                    .map_err(|_| AppError::bad_request("Media file is too large"))?,
+                size,
             });
         }
     }
     Ok(())
 }
 
-fn is_video(path: &FsPath) -> bool {
+pub(crate) fn is_video(path: &FsPath) -> bool {
     path.extension()
         .and_then(|v| v.to_str())
         .is_some_and(|ext| {
@@ -550,6 +606,7 @@ mod tests {
         init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            download_runtime: Default::default(),
             media_dir: media.clone(),
             download_dir: media.join("downloads"),
             client: reqwest::Client::new(),

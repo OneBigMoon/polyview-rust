@@ -75,6 +75,8 @@ struct Progress {
     local_id: Option<i64>,
     title: String,
     cover: String,
+    year: String,
+    description: String,
     episode_index: i64,
     episode_name: String,
     remote_url: String,
@@ -84,7 +86,7 @@ struct Progress {
 }
 
 const ONLINE: &str = "SELECT 'online',p.source_id,p.media_id,NULL,p.title,p.cover,p.episode_index,p.episode_name,
-    p.remote_url,p.position,p.duration,p.updated_at AS updated_at FROM online_progress p JOIN catalog_sources s ON s.id=p.source_id
+    p.remote_url,p.position,p.duration,p.updated_at AS updated_at,'' AS year,'' AS description FROM online_progress p JOIN catalog_sources s ON s.id=p.source_id
     WHERE p.user_id=?1 AND s.enabled=1 AND (s.adult=0 OR ?2)";
 
 async fn progress(
@@ -100,7 +102,7 @@ async fn progress(
         }
         (None, None) => format!("{ONLINE} AND p.position>0 AND (p.position<p.duration*0.95 OR EXISTS(
             SELECT 1 FROM tracking_subscriptions t WHERE t.user_id=p.user_id AND t.source_id=p.source_id AND t.media_id=p.media_id))
-            UNION ALL SELECT 'local',NULL,NULL,m.id,m.title,'',0,'','',u.position,u.duration,u.updated_at
+            UNION ALL SELECT 'local',NULL,NULL,m.id,m.title,m.cover,0,'','',u.position,u.duration,u.updated_at,m.year,m.description
             FROM library_user_media u JOIN library_media m ON m.id=u.media_id WHERE u.user_id=?1 AND m.available=1 AND u.position>0 AND u.watched=0
             ORDER BY updated_at DESC,2,3,4 LIMIT 24"),
         _ => return Err(AppError::bad_request("Provide both source_id and media_id")),
@@ -121,6 +123,8 @@ async fn progress(
             local_id: r.get(3)?,
             title: r.get(4)?,
             cover: r.get(5)?,
+            year: r.get(12)?,
+            description: r.get(13)?,
             episode_index: r.get(6)?,
             episode_name: r.get(7)?,
             remote_url: r.get(8)?,
@@ -280,7 +284,7 @@ async fn favorites(State(state): State<Shared>, user: AuthUser) -> Result<Json<V
     let mut stmt=conn.prepare("SELECT f.source_id,f.media_id,f.title,f.cover,f.year,f.kind,f.remark,f.created_at,s.name FROM catalog_favorites f JOIN catalog_sources s ON s.id=f.source_id
         WHERE f.user_id=?1 AND s.enabled=1 AND (s.adult=0 OR ?2) ORDER BY f.created_at DESC,f.rowid DESC")?;
     let catalog=stmt.query_map(params![user.id,adult_sources_enabled(&conn)?],|r| Ok(json!({"source_id":r.get::<_,i64>(0)?,"media_id":r.get::<_,String>(1)?,"title":r.get::<_,String>(2)?,"cover":r.get::<_,String>(3)?,"year":r.get::<_,String>(4)?,"kind":r.get::<_,String>(5)?,"remark":r.get::<_,String>(6)?,"created_at":r.get::<_,i64>(7)?,"source_name":r.get::<_,String>(8)?})))?.collect::<Result<Vec<_>,_>>()?;
-    let mut stmt=conn.prepare("SELECT m.id,m.title,m.relative_path,m.kind,s.title,m.series_id,m.season,m.episode,m.size,u.favorite,u.position,u.duration,u.watched
+    let mut stmt=conn.prepare("SELECT m.id,m.title,m.relative_path,m.kind,s.title,m.series_id,m.season,m.episode,m.size,u.favorite,u.position,u.duration,u.watched,m.cover,m.year,m.description
         FROM library_user_media u JOIN library_media m ON m.id=u.media_id LEFT JOIN library_series s ON s.id=m.series_id
         WHERE u.user_id=? AND u.favorite=1 AND m.available=1 ORDER BY COALESCE(u.favorite_at,u.updated_at) DESC,u.rowid DESC")?;
     let local = stmt

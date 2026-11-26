@@ -374,7 +374,7 @@ async fn completed_download_sends_a_notification_after_library_scan() {
         .conn()
         .unwrap()
         .execute_batch(
-            "CREATE TRIGGER fail_first_scan BEFORE INSERT ON library_media
+            "CREATE TRIGGER fail_first_scan BEFORE UPDATE OF available ON library_media
         WHEN (SELECT COUNT(*) FROM downloads WHERE status='completed')=1
         BEGIN SELECT RAISE(ABORT, 'offline fixture scan failure'); END;",
         )

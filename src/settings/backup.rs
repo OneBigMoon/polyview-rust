@@ -56,6 +56,8 @@ struct SiteSettings {
     calendar: CalendarSettings,
     notify: NotifySettings,
     play: PlaySettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    downloads: Option<crate::download_settings::DownloadSettings>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -103,6 +105,7 @@ async fn export(State(state): State<Shared>, user: AuthUser) -> Result<Json<Back
             calendar: get_setting_json(&tx, "calendar")?,
             notify: get_setting_json(&tx, "notify")?,
             play: get_setting_json(&tx, "play")?,
+            downloads: Some(crate::download_settings::download_settings(&tx)?),
             douban_movie_url: get_setting_json(&tx, "douban_movie_url")?,
             douban_series_url: get_setting_json(&tx, "douban_series_url")?,
         },
@@ -182,6 +185,10 @@ impl SiteSettings {
     fn restore(self, conn: &Connection) -> Result<(), AppError> {
         self.calendar.validate()?;
         self.play.validate()?;
+        if let Some(settings) = &self.downloads {
+            settings.validate()?;
+            set_setting_json(conn, "downloads", settings)?;
+        }
         self.notify.validate()?;
         if self.calendar != get_setting_json::<CalendarSettings>(conn, "calendar")? {
             conn.execute("DELETE FROM remote_cache WHERE cache_key='calendar'", [])?;

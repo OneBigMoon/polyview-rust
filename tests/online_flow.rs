@@ -76,6 +76,7 @@ fn app_state(directory: &Path) -> Shared {
     init_schema(&conn).unwrap();
     Arc::new(AppState {
         db: Mutex::new(conn),
+        download_runtime: Default::default(),
         download_dir: media_dir.join("downloads"),
         media_dir,
         client: reqwest::Client::new(),

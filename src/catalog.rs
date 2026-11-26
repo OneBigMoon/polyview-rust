@@ -1424,6 +1424,7 @@ mod tests {
         init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            download_runtime: Default::default(),
             media_dir: temp.path().to_path_buf(),
             download_dir: temp.path().to_path_buf(),
             client: reqwest::Client::new(),

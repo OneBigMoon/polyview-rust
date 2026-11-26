@@ -97,7 +97,10 @@ fn cookie_token(headers: &HeaderMap) -> Option<&str> {
         .find_map(|(name, value)| (name == "polyview_session").then_some(value))
 }
 
-fn current_user(conn: &Connection, headers: &HeaderMap) -> Result<Option<AuthUser>, AppError> {
+pub(crate) fn current_user(
+    conn: &Connection,
+    headers: &HeaderMap,
+) -> Result<Option<AuthUser>, AppError> {
     let Some(token) = cookie_token(headers) else {
         return Ok(None);
     };

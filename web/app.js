@@ -343,6 +343,7 @@
         type: "button",
         class: "poster-button",
         "aria-label": `播放 ${item.title}`,
+        title: [item.title, item.year, item.description].filter(Boolean).join(" · "),
         on: { click: () => {
           const key = item.kind === "episode" && seriesKey(item);
           if (!key) return play(item);
@@ -351,6 +352,7 @@
         } },
       },
       make("div", { class: `poster-art tone-${index % 6}` }, [
+        item.cover ? posterImage(item.cover) : null,
         make("span", { class: "poster-label", text: label }),
         make("span", { class: "poster-name", text: item.title }),
         make("span", {
@@ -385,7 +387,7 @@
       poster,
       fav,
       make("div", { class: "media-meta" }, [
-        make("span", { text: meta }),
+        make("span", { text: [meta, item.year].filter(Boolean).join(" · ") }),
         item.watched
           ? make("span", { class: "watched", text: "✓ 已看" })
           : null,
@@ -542,6 +544,8 @@
       let index = 0;
       seriesGroups.forEach((items, key) => {
         const name = items[0].series || "剧集";
+        const cover = items.find((entry) => entry.cover)?.cover;
+        const info = items.find((entry) => entry.description) || items[0];
         const watched = items.filter((item) => item.watched).length;
         const expanded =
           state.expandAllSeries || state.expandedSeries.has(key);
@@ -551,6 +555,7 @@
             {
               type: "button",
               class: "poster-button",
+              title: [name, info.year, info.description].filter(Boolean).join(" · "),
               "aria-label": `${expanded ? "收起" : "展开"}剧集 ${name}`,
               "aria-expanded": String(expanded),
               on: {
@@ -567,6 +572,7 @@
               },
             },
             make("div", { class: `poster-art stack-art tone-${index++ % 6}` }, [
+              cover ? posterImage(cover) : null,
               make("span", { class: "poster-name", text: name }),
               make("span", {
                 class: "stack-badge",
@@ -2290,6 +2296,7 @@
     return root;
   }
   async function openCatalogDetail(item, playImmediately = false) {
+    const owner = state.user;
     let dialog = $("catalog-dialog");
     if (!dialog) {
       dialog = make("dialog", {
@@ -2581,6 +2588,13 @@
         orderedEpisodes().forEach((episode) => picked.add(episode.sourceIndex));
         paintBatch();
       });
+      function enqueueEpisode(episode) {
+        const body = { url: episode.url, title: `${detail.title} ${episodeCode(episode.sourceIndex + 1)}` };
+        if (favoriteData.cover) body.cover = favoriteData.cover;
+        if (favoriteData.year) body.year = String(favoriteData.year);
+        if (description) body.description = description;
+        return api("/api/downloads", { method: "POST", body });
+      }
       async function submitBatch() {
         if (submitting || !picked.size) return;
         if (detail.groups[n(groups.value)].direct === false) {
@@ -2592,20 +2606,16 @@
         let ok = 0;
         let failed = 0;
         for (const episode of orderedEpisodes()) {
+          if (owner !== state.user) return;
           if (!picked.has(episode.sourceIndex)) continue;
           try {
-            await api("/api/downloads", {
-              method: "POST",
-              body: {
-                url: episode.url,
-                title: `${detail.title} ${episodeCode(episode.sourceIndex + 1)}`,
-              },
-            });
+            await enqueueEpisode(episode);
             ok += 1;
           } catch (_) {
             failed += 1;
           }
         }
+        if (owner !== state.user) return;
         if (failed) toast(`已加入 ${ok} 集，${failed} 集失败`, true);
         else toast(`已加入 ${ok} 集下载队列`);
         submitting = false;
@@ -2675,6 +2685,7 @@
       });
       fillEpisodes();
       const download = button("下载本集", "subtle", async () => {
+        if (owner !== state.user) return;
         if (detail.groups[n(groups.value)].direct === false) {
           toast("该线路是非直链解析页，无法直接下载，请选择直链线路。", true);
           return;
@@ -2682,16 +2693,10 @@
         download.disabled = true;
         const episode = selected();
         try {
-          await api("/api/downloads", {
-            method: "POST",
-            body: {
-              url: episode.url,
-              title: `${detail.title} ${episodeCode(episode.sourceIndex + 1)}`,
-            },
-          });
-          toast("已加入下载队列");
+          await enqueueEpisode(episode);
+          if (owner === state.user) toast("已加入下载队列");
         } catch (error) {
-          toast(error.message, true);
+          if (owner === state.user) toast(error.message, true);
         } finally {
           download.disabled = false;
         }
@@ -3008,6 +3013,7 @@
     if (job.status === "failed" || job.status === "error")
       return ["失败", "error"];
     if (/cancel/i.test(job.status)) return ["已取消", ""];
+    if (job.status === "paused") return ["已暂停", ""];
     return [
       job.status === "running" || job.status === "downloading"
         ? "下载中"
@@ -3020,9 +3026,10 @@
     if (/completed|done/i.test(value)) return "done";
     if (/failed|error|cancel/i.test(value)) return "problem";
     if (value === "running" || value === "downloading") return "running";
+    if (value === "paused") return "paused";
     return "queued";
   }
-  function downloadList() {
+  function downloadList(change) {
     const jobs =
       state.downloadFilter === "all"
         ? state.downloads
@@ -3047,7 +3054,7 @@
       const row = make("article", { class: "download-row" }, [
         make("div", { class: "download-title" }, [
           make("strong", { text: job.title }),
-          make("small", { text: job.error || job.relative_path || job.url }),
+          make("small", { text: job.kind === "telegram" ? "Telegram 视频" : job.error || job.relative_path || "视频下载" }),
         ]),
         total
           ? make("progress", {
@@ -3063,59 +3070,164 @@
             }),
         make("span", { class: `download-status ${cls}`, text: label }),
       ]);
+      const endpoint = `/api/downloads/${encodeURIComponent(job.id)}`;
+      if (["queued", "running", "downloading"].includes(job.status))
+        row.append(button("暂停", "subtle small-button", () => change(`${endpoint}/pause`)));
+      if (job.status === "paused")
+        row.append(button("继续", "subtle small-button", () => change(`${endpoint}/resume`)));
       if (/failed|cancel/i.test(job.status))
-        row.append(
-          button("重试", "subtle small-button", async () => {
-            try {
-              await api(`/api/downloads/${encodeURIComponent(job.id)}/retry`, {
-                method: "POST",
-                body: {},
-              });
-              await refreshDownloads();
-            } catch (e) {
-              toast(e.message, true);
-            }
-          }),
-        );
+        row.append(button("重试", "subtle small-button", () => change(`${endpoint}/retry`)));
       else if (!/completed|done/i.test(job.status))
-        row.append(
-          icon("×", `取消 ${job.title}`, async () => {
-            try {
-              await api(`/api/downloads/${encodeURIComponent(job.id)}`, {
-                method: "DELETE",
-              });
-              await refreshDownloads();
-            } catch (e) {
-              toast(e.message, true);
-            }
-          }),
-        );
+        row.append(icon("×", `取消 ${job.title}`, () => change(endpoint, "DELETE")));
       list.append(row);
     });
     return list;
   }
-  async function refreshDownloads() {
-    const result = await api("/api/downloads");
-    state.downloads = Array.isArray(result) ? result : result?.jobs || [];
-    if (state.page !== "downloads") return;
-    const existing = main.querySelector(".download-list");
-    if (existing) {
-      existing.replaceWith(downloadList());
-      updateNavBadges();
+  async function telegramPanel(current, refreshQueue) {
+    const path = "/api/telegram/login";
+    const panel = make("section", { class: "panel telegram-panel" });
+    const statusLine = make("p", { role: "status" });
+    const controls = make("div", { class: "form-row" });
+    const requests = make("div");
+    panel.append(make("h2", { text: "Telegram 视频" }), statusLine, controls, requests);
+    let busy = false;
+    async function load(method = "GET") {
+      if (busy || !current()) return;
+      busy = true;
+      controls.replaceChildren();
+      requests.replaceChildren();
+      statusLine.textContent = "正在检查 Telegram 授权…";
+      try {
+        const result = await api(path, { method });
+        if (!current()) return;
+        const labels = { unconfigured: "服务器尚未配置 tdl。", idle: "此账户尚未连接 Telegram。",
+          waiting: "等待服务器管理员在宿主机完成 tdl 登录。", authorized: "此账户已连接 Telegram。", error: "无法检查 Telegram 会话。" };
+        statusLine.textContent = labels[result?.state] || labels.error;
+        if (result?.state === "idle") controls.append(button("申请连接", "primary", () => load("POST")));
+        if (result?.state === "error") controls.append(button("重新申请连接", "subtle", () => load("POST")));
+        if (result?.state === "waiting") controls.append(button("取消申请", "subtle", () => load("DELETE")));
+        if (result?.state === "authorized") {
+          const url = make("input", { type: "url", required: true, name: "telegram_url", placeholder: "https://t.me/channel/123" });
+          const submit = button("导入视频", "primary", null, { type: "submit" });
+          controls.append(make("form", { class: "form-row", on: { submit: async (event) => {
+            event.preventDefault();
+            if (!current() || submit.disabled) return;
+            submit.disabled = true;
+            try {
+              await api("/api/downloads/telegram", { method: "POST", body: { url: url.value.trim() } });
+              if (!current()) return;
+              url.value = "";
+              toast("Telegram 视频已加入下载队列");
+              await refreshQueue();
+            } catch (_) { if (current()) toast("导入失败，请检查消息链接和授权状态。", true); }
+            finally { submit.disabled = false; }
+          } } }, [make("label", {}, ["Telegram 视频消息链接", url]), submit]));
+        }
+        if (admin()) {
+          try {
+            const pending = await api(`${path}/requests`);
+            if (!current()) return;
+            if (pending.length) {
+              requests.append(make("h3", { text: "等待宿主机登录的账户" }), make("p", {
+                text: "核对申请人与 Telegram 账户后，请以运行 PolyView 的系统用户在可信主机终端执行对应命令，并在该终端按照 tdl 提示完成登录。完成后请申请人刷新授权状态。",
+              }));
+              for (const request of pending) requests.append(make("section", {}, [
+                make("strong", { text: `${request.username}（账户 ${request.user_id}）` }),
+                request.uses_proxy ? make("p", { text: "请先在宿主机终端从服务器配置导出 TDL_PROXY。" }) : null,
+                make("pre", {}, make("code", { text: request.command })),
+              ]));
+            }
+          } catch (_) { if (current()) requests.textContent = "暂时无法读取待处理授权申请。"; }
+        }
+      } catch (_) { if (current()) statusLine.textContent = "无法读取 Telegram 授权状态。"; }
+      finally {
+        busy = false;
+        if (current()) controls.append(button("刷新授权状态", "subtle", () => load()));
+      }
     }
+    await load();
+    return panel;
+  }
+  async function downloadParameters(current) {
+    const path = "/api/settings/downloads";
+    const panel = make("details", { class: "panel" }, make("summary", { text: "下载与 Telegram 参数" }));
+    try {
+      let saved = await api(path);
+      if (!current()) return panel;
+      const fields = settingsFields([
+        ["enabled", "启用下载", "checkbox"], ["concurrency", "并发任务数", "number", 1, 4],
+        ["max_attempts", "每项任务最多尝试次数", "number", 1, 10], ["n_m3u8dl_path", "N_m3u8DL-RE 路径"],
+        ["ffmpeg_path", "FFmpeg 路径"], ["ffprobe_path", "FFprobe 路径"], ["tdl_path", "tdl 路径"],
+        ["telegram_directory", "Telegram 会话目录"], ["telegram_namespace", "Telegram 命名空间"],
+      ], saved);
+      const proxy = make("input", { name: "telegram_proxy", type: "password", autocomplete: "new-password" });
+      const clear = make("input", { type: "checkbox", name: "clear_proxy" });
+      const proxyLabel = make("label");
+      const clearLabel = make("label", { class: "checkbox-label" }, [clear, "清除已保存的代理"]);
+      function paintProxy() {
+        proxy.value = "";
+        clear.checked = false;
+        clearLabel.hidden = !saved.telegram_proxy_configured;
+        proxyLabel.replaceChildren(saved.telegram_proxy_configured ? "替换代理地址（留空保留）" : "代理地址（可选）", proxy);
+      }
+      paintProxy();
+      const submit = button("保存下载设置", "primary", null, { type: "submit" });
+      panel.append(make("form", { class: "form-row", on: { submit: async (event) => {
+        event.preventDefault();
+        if (!current() || submit.disabled) return;
+        const body = fields.values();
+        if (clear.checked) body.telegram_proxy = "";
+        else if (proxy.value.trim()) body.telegram_proxy = proxy.value.trim();
+        submit.disabled = true;
+        try {
+          saved = await api(path, { method: "PUT", body });
+          if (current()) { paintProxy(); toast("下载设置已保存"); }
+        } catch (_) { if (current()) toast("保存失败，请检查参数后重试。", true); }
+        finally { submit.disabled = false; }
+      } } }, [...fields.labels, proxyLabel, clearLabel, submit]));
+    } catch (_) { panel.append(make("p", { class: "form-error", text: "无法读取下载设置。" })); }
+    return panel;
   }
   async function downloads() {
-    await refreshDownloads();
-    const root = make(
-      "div",
-      {},
-      head("下载任务", "把想看的内容带回你的媒体库。"),
-    );
+    const owner = state.user, sequence = renderSequence;
+    const current = () => state.user === owner && renderSequence === sequence;
+    const queue = make("section", { class: "download-queue" });
+    let revision = 0;
+    let fetching = false;
+    async function refresh(background = false) {
+      if (!current() || (background && fetching)) return;
+      fetching = true;
+      const request = ++revision;
+      try {
+        const result = await api("/api/downloads");
+        if (!current() || request !== revision) return;
+        state.downloads = Array.isArray(result) ? result : result?.jobs || [];
+        paintQueue();
+        updateNavBadges();
+      } catch (error) {
+        if (current() && request === revision) throw error;
+      } finally {
+        if (request === revision) fetching = false;
+      }
+    }
+    async function change(path, method = "POST") {
+      if (!current()) return;
+      try {
+        await api(path, { method });
+        await refresh();
+      } catch (error) { if (current()) toast(error.message, true); }
+    }
+    const cleanup = button("清理已完成", "subtle", () => {
+      if (current() && window.confirm("清理已完成和已取消的任务记录？已下载的文件会保留。"))
+        return change("/api/downloads/completed", "DELETE");
+    });
+    const root = make("div", {}, head("下载任务", "把想看的内容带回你的媒体库。", cleanup));
+    root.refreshQueue = refresh;
     const add = make("section", { class: "panel" }, [
       make("h2", { text: "添加下载" }),
       make("p", {
         class: "panel-description",
-        text: "支持 HTTP / HTTPS 视频文件直链和 HLS（.m3u8）。HLS 由服务器上的 FFmpeg 下载合并；请只保存你拥有或获授权的内容。",
+        text: "支持 HTTP / HTTPS 视频文件直链和 HLS（.m3u8）。请只保存你拥有或获授权的内容。",
       }),
     ]);
     add.append(
@@ -3126,6 +3238,7 @@
           on: {
             submit: async (event) => {
               event.preventDefault();
+              if (!current()) return;
               const f = event.currentTarget;
               try {
                 await api("/api/downloads", {
@@ -3133,13 +3246,18 @@
                   body: {
                     title: f.elements.title.value.trim(),
                     url: f.elements.url.value.trim(),
+                    ...Object.fromEntries(["cover", "year", "description"].flatMap((name) => {
+                      const value = f.elements[name].value.trim();
+                      return value ? [[name, value]] : [];
+                    })),
                   },
                 });
+                if (!current()) return;
                 f.reset();
                 toast("已加入下载队列");
-                await refreshDownloads();
+                await refresh();
               } catch (e) {
-                toast(e.message, true);
+                if (current()) toast(e.message, true);
               }
             },
           },
@@ -3159,49 +3277,33 @@
               placeholder: "https://example.com/video.mp4",
             }),
           ]),
+          make("details", {}, [make("summary", { text: "影片信息（可选）" }),
+            make("label", {}, ["海报地址", make("input", { name: "cover", type: "url" })]),
+            make("label", {}, ["年份", make("input", { name: "year" })]),
+            make("label", {}, ["简介", make("textarea", { name: "description" })]),
+          ]),
           button("开始下载", "primary", null, { type: "submit" }),
         ],
       ),
     );
-    const counts = {
-      all: state.downloads.length,
-      running: 0,
-      queued: 0,
-      done: 0,
-      problem: 0,
-    };
-    state.downloads.forEach((job) => {
-      counts[statusGroup(job)] += 1;
-    });
-    root.append(
-      add,
-      sectionTitle("全部任务", state.downloads.length),
-      make(
-        "div",
-        { class: "filters" },
-        [
-          ["all", "全部"],
-          ["running", "下载中"],
-          ["queued", "排队中"],
-          ["done", "已完成"],
-          ["problem", "异常"],
-        ].map(([key, label]) =>
-          make("button", {
-            type: "button",
-            class: `filter-chip${state.downloadFilter === key ? " active" : ""}`,
-            "aria-pressed": String(state.downloadFilter === key),
-            text: `${label} ${counts[key]}`,
-            on: {
-              click: () => {
-                state.downloadFilter = key;
-                render();
-              },
-            },
-          }),
-        ),
-      ),
-      downloadList(),
-    );
+    function paintQueue() {
+      const counts = { all: state.downloads.length, running: 0, queued: 0, paused: 0, done: 0, problem: 0 };
+      state.downloads.forEach((job) => { counts[statusGroup(job)]++; });
+      cleanup.disabled = !state.downloads.some((job) => /completed|done|cancel/i.test(job.status));
+      const filters = [["all", "全部"], ["running", "下载中"], ["queued", "排队中"], ["done", "已完成"], ["problem", "异常"]];
+      if (counts.paused || state.downloadFilter === "paused") filters.splice(3, 0, ["paused", "已暂停"]);
+      queue.replaceChildren(sectionTitle("全部任务", counts.all), make("div", { class: "filters" },
+        filters.map(([key, label]) => make("button", {
+          type: "button", class: `filter-chip${state.downloadFilter === key ? " active" : ""}`,
+          "aria-pressed": String(state.downloadFilter === key), text: `${label} ${counts[key]}`,
+          on: { click: () => { state.downloadFilter = key; paintQueue(); } },
+        }))), downloadList(change));
+    }
+    const [, telegram, parameters] = await Promise.all([refresh(), telegramPanel(current, refresh),
+      admin() ? downloadParameters(current) : null]);
+    root.append(add, telegram);
+    if (parameters) root.append(parameters);
+    root.append(queue);
     return root;
   }
   async function liveSubscriptionSettings() {
@@ -3364,11 +3466,11 @@
     ["timeout_secs", "超时（秒）", "number"], ["searchable", "允许搜索", "checkbox"],
   ];
   function settingsFields(definitions, values) {
-    const inputs = definitions.map(([name, label, type = "text"]) => {
+    const inputs = definitions.map(([name, label, type = "text", min = 3, max = 60]) => {
       const attrs = { name, type };
       if (type === "checkbox") attrs.checked = Boolean(values[name]);
       else attrs.value = values[name] ?? "";
-      if (type === "number") Object.assign(attrs, { min: 3, max: 60, required: true });
+      if (type === "number") Object.assign(attrs, { min, max, required: true });
       const input = make("input", attrs);
       return { name, type, input, label: make("label", { class: type === "checkbox" ? "checkbox-label" : "" },
         type === "checkbox" ? [input, label] : [label, input]) };
@@ -4174,7 +4276,7 @@
       updateNavBadges();
       if (pageName === "downloads")
         state.poll = setInterval(
-          () => refreshDownloads().catch((e) => toast(e.message, true)),
+          () => page.refreshQueue(true).catch((e) => { if (sequence === renderSequence) toast(e.message, true); }),
           3500,
         );
     } catch (e) {
@@ -4244,6 +4346,10 @@
     state.user = null;
     ++renderSequence;
     clearInterval(state.poll);
+    state.downloads = [];
+    state.downloadFilter = "all";
+    main.replaceChildren();
+    if ($("catalog-dialog")?.open) $("catalog-dialog").close();
     $("app-shell").hidden = true;
     $("auth-screen").hidden = false;
     authMode(false);

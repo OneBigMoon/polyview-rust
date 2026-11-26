@@ -834,6 +834,7 @@ mod tests {
         crate::init_schema(&conn).unwrap();
         Arc::new(AppState {
             db: Mutex::new(conn),
+            download_runtime: Default::default(),
             media_dir: root.to_path_buf(),
             download_dir: root.join("downloads"),
             client: reqwest::Client::new(),

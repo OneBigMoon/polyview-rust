@@ -2,6 +2,10 @@
 mod backup;
 #[path = "cases/calendar.rs"]
 mod calendar;
+#[path = "cases/download_metadata.rs"]
+mod download_metadata;
+#[path = "cases/download_settings.rs"]
+mod download_settings;
 #[path = "cases/live_sources.rs"]
 mod live_sources;
 #[path = "cases/member_feeds.rs"]
@@ -16,6 +20,8 @@ mod recommend;
 mod source_ops;
 #[path = "cases/suggest.rs"]
 mod suggest;
+#[path = "cases/telegram_media.rs"]
+mod telegram_media;
 #[path = "cases/user_data.rs"]
 mod user_data;
 
@@ -75,6 +81,7 @@ impl TestApp {
         init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            download_runtime: Default::default(),
             media_dir,
             download_dir,
             client: reqwest::Client::new(),

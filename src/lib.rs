@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod calendar;
 pub mod catalog;
+pub mod download_settings;
 pub mod epg;
 pub mod legacy;
 pub mod library;
@@ -9,6 +10,7 @@ pub mod network;
 pub mod notify;
 pub mod playback;
 pub mod settings;
+pub mod telegram;
 pub mod tracking;
 pub mod tvbox;
 pub mod user_data;
@@ -33,6 +35,7 @@ pub type Shared = Arc<AppState>;
 
 pub struct AppState {
     pub db: Mutex<Connection>,
+    pub download_runtime: network::DownloadRuntime,
     pub media_dir: PathBuf,
     pub download_dir: PathBuf,
     pub client: reqwest::Client,
@@ -129,6 +132,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "PRAGMA foreign_keys=ON; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
     )?;
     auth::init_schema(conn)?;
+    telegram::init_schema(conn)?;
     library::init_schema(conn)?;
     network::init_schema(conn)?;
     catalog::init_schema(conn)?;
@@ -160,6 +164,8 @@ pub fn router(state: Shared) -> Router {
         .merge(tvbox::router())
         .merge(user_data::router())
         .merge(settings::router())
+        .merge(download_settings::router())
+        .merge(telegram::router())
         .merge(calendar::router())
         .merge(notify::router())
         .merge(live_sources::router())

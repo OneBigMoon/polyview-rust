@@ -15,6 +15,14 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, time::Duration};
 use tokio::task::JoinHandle;
 
+const TRACKING_DOWNLOADS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tracking_downloads (
+    subscription_id INTEGER NOT NULL REFERENCES tracking_subscriptions(id) ON DELETE CASCADE,
+    episode_key TEXT NOT NULL,
+    download_id INTEGER REFERENCES downloads(id) ON DELETE SET NULL,
+    archived_completed INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(subscription_id,episode_key)
+);";
+
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tracking_subscriptions (
@@ -31,14 +39,28 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
             error TEXT,
             UNIQUE(user_id,source_id,media_id)
         );
-        CREATE TABLE IF NOT EXISTS tracking_downloads (
-            subscription_id INTEGER NOT NULL REFERENCES tracking_subscriptions(id) ON DELETE CASCADE,
-            episode_key TEXT NOT NULL,
-            download_id INTEGER NOT NULL REFERENCES downloads(id) ON DELETE CASCADE,
-            PRIMARY KEY(subscription_id,episode_key)
-        );
         CREATE INDEX IF NOT EXISTS tracking_user ON tracking_subscriptions(user_id,id);",
     )?;
+    let tx = conn.unchecked_transaction()?;
+    let old_foreign_key: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('tracking_downloads')
+         WHERE \"from\"='download_id' AND on_delete='CASCADE')",
+        [],
+        |row| row.get(0),
+    )?;
+    if old_foreign_key {
+        tx.execute_batch("ALTER TABLE tracking_downloads RENAME TO tracking_downloads_old")?;
+    }
+    tx.execute_batch(TRACKING_DOWNLOADS_SCHEMA)?;
+    if old_foreign_key {
+        tx.execute_batch(
+            "INSERT INTO tracking_downloads(subscription_id,episode_key,download_id)
+            SELECT subscription_id,episode_key,download_id FROM tracking_downloads_old;
+            DROP TABLE tracking_downloads_old;",
+        )?;
+    }
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS tracking_download_job ON tracking_downloads(download_id) WHERE download_id IS NOT NULL")?;
+    tx.commit()?;
     for column in ["paused", "notified_episodes"] {
         ensure_column(
             conn,
@@ -78,8 +100,8 @@ const SUBSCRIPTION_SELECT: &str =
     "SELECT s.id,s.source_id,s.media_id,s.title,s.cover,s.total_episodes,
             s.watched_episodes,s.auto_download,s.last_checked,s.error,
             (SELECT COUNT(*) FROM tracking_downloads td WHERE td.subscription_id=s.id),
-            (SELECT COUNT(*) FROM tracking_downloads td JOIN downloads d ON d.id=td.download_id
-             WHERE td.subscription_id=s.id AND d.status='completed'), s.paused
+            (SELECT COUNT(*) FROM tracking_downloads td LEFT JOIN downloads d ON d.id=td.download_id
+             WHERE td.subscription_id=s.id AND (d.status='completed' OR td.archived_completed=1)), s.paused
      FROM tracking_subscriptions s";
 
 fn subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
@@ -297,7 +319,7 @@ async fn check_one(state: &Shared, id: i64, user_id: i64) -> Result<usize, AppEr
         return Ok(0);
     }
     let detail = catalog::detail(state, subscription.source_id, &subscription.media_id).await;
-    let result = detail.and_then(|detail| apply_detail(state, id, user_id, &detail));
+    let result = detail.and_then(|detail| apply_detail(state, id, user_id, detail));
     if let Err(ref error) = result {
         let updated = state.conn()?.execute(
             "UPDATE tracking_subscriptions SET last_checked=?,error=? WHERE id=? AND user_id=? AND paused=0",
@@ -314,7 +336,7 @@ fn apply_detail(
     state: &Shared,
     id: i64,
     user_id: i64,
-    detail: &CatalogDetail,
+    detail: CatalogDetail,
 ) -> Result<usize, AppError> {
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
@@ -350,6 +372,11 @@ fn apply_detail(
     )?;
     let mut queued = 0;
     if automatic {
+        let metadata = network::DownloadMetadata {
+            cover: detail.cover,
+            year: detail.year,
+            description: detail.description,
+        };
         let mut seen = HashSet::new();
         for (index, episode) in episodes.iter().enumerate() {
             let ordinal = index as i64 + 1;
@@ -375,7 +402,14 @@ fn apply_detail(
                 "{} S01E{ordinal:02}",
                 detail.title.chars().take(180).collect::<String>()
             );
-            let download_id = network::enqueue_in(&tx, state, user_id, &title, &episode.url)?;
+            let download_id = network::enqueue_with_metadata(
+                &tx,
+                state,
+                user_id,
+                &title,
+                &episode.url,
+                &metadata,
+            )?;
             tx.execute(
                 "INSERT INTO tracking_downloads(subscription_id,episode_key,download_id) VALUES(?,?,?)",
                 params![id, key, download_id],
@@ -392,6 +426,26 @@ fn apply_detail(
         );
     }
     Ok(queued)
+}
+
+pub(crate) fn clear_download_history(
+    conn: &mut Connection,
+    user_id: i64,
+) -> Result<usize, AppError> {
+    let tx = conn.transaction()?;
+    // Keep the subscription's episode key after the job is gone. Its next check
+    // must not recreate a finished or intentionally cancelled download.
+    tx.execute(
+        "UPDATE tracking_downloads SET archived_completed=1 WHERE download_id IN
+        (SELECT id FROM downloads WHERE user_id=? AND status='completed')",
+        [user_id],
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM downloads WHERE user_id=? AND status IN ('completed','cancelled')",
+        [user_id],
+    )?;
+    tx.commit()?;
+    Ok(deleted)
 }
 
 pub fn start_worker(state: Shared) -> JoinHandle<()> {
@@ -433,6 +487,7 @@ mod tests {
         crate::settings::init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            download_runtime: Default::default(),
             media_dir,
             download_dir,
             client: reqwest::Client::new(),

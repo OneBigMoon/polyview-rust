@@ -1,6 +1,7 @@
 use crate::{
     AppError, Shared,
     auth::{AuthUser, require_admin},
+    download_settings::{DownloadSettings, download_settings},
     now,
 };
 use axum::{
@@ -13,8 +14,19 @@ use futures_util::StreamExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, future::Future, path::PathBuf, time::Duration};
-use tokio::{io::AsyncWriteExt, task::JoinHandle};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::{Path as FsPath, PathBuf},
+    process::Stdio,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::AsyncWriteExt,
+    process::Command,
+    sync::{Notify, Semaphore, watch},
+    task::{JoinHandle, JoinSet},
+};
 use url::Url;
 
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
@@ -42,6 +54,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
         );
         CREATE INDEX IF NOT EXISTS downloads_user ON downloads(user_id, id);",
     )?;
+    for (name, definition) in [
+        ("kind", "TEXT NOT NULL DEFAULT 'direct'"),
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("cover", "TEXT NOT NULL DEFAULT ''"),
+        ("year", "TEXT NOT NULL DEFAULT ''"),
+        ("description", "TEXT NOT NULL DEFAULT ''"),
+        ("attempt_token", "TEXT NOT NULL DEFAULT ''"),
+        ("retry_at", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        crate::ensure_column(conn, "downloads", name, definition)?;
+    }
     Ok(())
 }
 
@@ -53,6 +76,9 @@ pub fn router() -> Router<Shared> {
         .route("/api/downloads", get(list_downloads).post(create_download))
         .route("/api/downloads/{id}", delete(cancel_download))
         .route("/api/downloads/{id}/retry", post(retry_download))
+        .route("/api/downloads/{id}/pause", post(pause_download))
+        .route("/api/downloads/{id}/resume", post(resume_download))
+        .route("/api/downloads/completed", delete(clear_downloads))
 }
 
 #[derive(Debug, Serialize)]
@@ -369,7 +395,7 @@ pub(crate) fn parse_playlist(text: &str) -> Result<Vec<PlaylistChannel>, AppErro
 }
 
 #[derive(Debug, Serialize)]
-struct Download {
+pub(crate) struct Download {
     id: i64,
     title: String,
     url: String,
@@ -378,6 +404,14 @@ struct Download {
     total_bytes: Option<i64>,
     error: Option<String>,
     relative_path: String,
+    kind: String,
+    attempts: i64,
+    #[serde(flatten)]
+    metadata: DownloadMetadata,
+    #[serde(skip)]
+    user_id: i64,
+    #[serde(skip)]
+    attempt_token: String,
 }
 
 fn download_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Download> {
@@ -390,10 +424,41 @@ fn download_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Download> {
         total_bytes: row.get(5)?,
         error: row.get(6)?,
         relative_path: row.get(7)?,
+        kind: row.get(8)?,
+        attempts: row.get(9)?,
+        metadata: DownloadMetadata {
+            cover: row.get(10)?,
+            year: row.get(11)?,
+            description: row.get(12)?,
+        },
+        user_id: row.get(13)?,
+        attempt_token: row.get(14)?,
     })
 }
 
-const DOWNLOAD_COLUMNS: &str = "id,title,url,status,bytes_written,total_bytes,error,relative_path";
+const DOWNLOAD_COLUMNS: &str = "id,title,url,status,bytes_written,total_bytes,error,relative_path,kind,attempts,cover,year,description,user_id,attempt_token";
+
+pub(crate) fn download_by_id(
+    conn: &Connection,
+    id: i64,
+    user_id: i64,
+) -> Result<Download, AppError> {
+    conn.query_row(
+        &format!("SELECT {DOWNLOAD_COLUMNS} FROM downloads WHERE id=?1 AND user_id=?2"),
+        params![id, user_id],
+        download_row,
+    )
+    .optional()?
+    .ok_or_else(|| AppError::not_found("Download not found"))
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct DownloadMetadata {
+    pub cover: String,
+    pub year: String,
+    pub description: String,
+}
 
 async fn list_downloads(
     State(state): State<Shared>,
@@ -413,6 +478,8 @@ async fn list_downloads(
 struct DownloadInput {
     url: String,
     title: String,
+    #[serde(flatten)]
+    metadata: DownloadMetadata,
 }
 
 fn download_extension(url: &Url) -> Result<String, AppError> {
@@ -442,12 +509,15 @@ async fn create_download(
     Json(input): Json<DownloadInput>,
 ) -> Result<(StatusCode, Json<Download>), AppError> {
     let conn = state.conn()?;
-    let id = enqueue_in(&conn, &state, user.id, &input.title, &input.url)?;
-    let result = conn.query_row(
-        &format!("SELECT {DOWNLOAD_COLUMNS} FROM downloads WHERE id=?1"),
-        [id],
-        download_row,
+    let id = enqueue_with_metadata(
+        &conn,
+        &state,
+        user.id,
+        &input.title,
+        &input.url,
+        &input.metadata,
     )?;
+    let result = download_by_id(&conn, id, user.id)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -458,19 +528,80 @@ pub fn enqueue_in(
     title: &str,
     raw_url: &str,
 ) -> Result<i64, AppError> {
+    enqueue_with_metadata(
+        conn,
+        state,
+        user_id,
+        title,
+        raw_url,
+        &DownloadMetadata::default(),
+    )
+}
+
+pub(crate) fn enqueue_with_metadata(
+    conn: &Connection,
+    state: &Shared,
+    user_id: i64,
+    title: &str,
+    raw_url: &str,
+    metadata: &DownloadMetadata,
+) -> Result<i64, AppError> {
+    if raw_url.chars().any(char::is_control) {
+        return Err(AppError::bad_request(
+            "Invalid control character in download URL",
+        ));
+    }
     let url = http_url(raw_url.trim())?;
     let extension = download_extension(&url)?;
+    insert_download(
+        conn,
+        state,
+        user_id,
+        title,
+        url.as_str(),
+        &extension,
+        Some(metadata),
+    )
+}
+
+pub(crate) fn enqueue_telegram(
+    conn: &Connection,
+    state: &Shared,
+    user_id: i64,
+    title: &str,
+    url: &str,
+) -> Result<i64, AppError> {
+    insert_download(conn, state, user_id, title, url, "mp4", None)
+}
+
+fn insert_download(
+    conn: &Connection,
+    state: &Shared,
+    user_id: i64,
+    title: &str,
+    url: &str,
+    extension: &str,
+    direct_metadata: Option<&DownloadMetadata>,
+) -> Result<i64, AppError> {
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 200 {
         return Err(AppError::bad_request(
             "Give the download a title of 1 to 200 characters",
         ));
     }
-    let relative_path = unique_relative_path(conn, state, title, &extension)?;
+    let relative_path = unique_relative_path(conn, state, title, extension)?;
+    let kind = if direct_metadata.is_some() {
+        "direct"
+    } else {
+        "telegram"
+    };
+    let empty = DownloadMetadata::default();
+    let metadata = direct_metadata.unwrap_or(&empty);
     conn.execute(
-        "INSERT INTO downloads(user_id,title,url,relative_path,created_at) VALUES (?1,?2,?3,?4,?5)",
-        params![user_id, title, url.to_string(), relative_path, now()],
+        "INSERT INTO downloads(user_id,title,url,relative_path,created_at,kind,cover,year,description) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![user_id, title, url, relative_path, now(), kind, metadata.cover, metadata.year, metadata.description],
     )?;
+    state.download_runtime.wake();
     Ok(conn.last_insert_rowid())
 }
 
@@ -538,27 +669,14 @@ async fn cancel_download(
     user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
-    let conn = state.conn()?;
-    let status: String = conn
-        .query_row(
-            "SELECT status FROM downloads WHERE id=?1 AND user_id=?2",
-            params![id, user.id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or_else(|| AppError::not_found("Download not found"))?;
-    if status == "completed" {
-        return Err(AppError::bad_request(
-            "A completed download cannot be cancelled",
-        ));
-    }
-    // Keep the status check in the write so a completion racing this request wins.
-    let changed = conn.execute("UPDATE downloads SET status='cancelled',error=NULL WHERE id=?1 AND user_id=?2 AND status IN ('queued','running','failed')", params![id, user.id])?;
-    if changed == 0 {
-        return Err(AppError::bad_request(
-            "A completed download cannot be cancelled",
-        ));
-    }
+    transition(
+        &state,
+        user.id,
+        id,
+        &["running", "queued", "paused", "failed"],
+        "cancelled",
+        false,
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -567,22 +685,92 @@ async fn retry_download(
     user: AuthUser,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    transition(
+        &state,
+        user.id,
+        id,
+        &["failed", "cancelled"],
+        "queued",
+        true,
+    )?;
+    Ok(Json(json!({"status":"queued"})))
+}
+
+async fn pause_download(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    transition(&state, user.id, id, &["running", "queued"], "paused", false)?;
+    Ok(Json(json!({"status":"paused"})))
+}
+
+async fn resume_download(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    transition(&state, user.id, id, &["paused"], "queued", false)?;
+    Ok(Json(json!({"status":"queued"})))
+}
+
+fn transition(
+    state: &Shared,
+    user_id: i64,
+    id: i64,
+    from: &[&str],
+    to: &str,
+    reset_attempts: bool,
+) -> Result<(), AppError> {
     let conn = state.conn()?;
-    let status: String = conn
+    let (status, token) = conn
         .query_row(
-            "SELECT status FROM downloads WHERE id=?1 AND user_id=?2",
-            params![id, user.id],
-            |row| row.get(0),
+            "SELECT status,attempt_token FROM downloads WHERE id=?1 AND user_id=?2",
+            params![id, user_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
         .ok_or_else(|| AppError::not_found("Download not found"))?;
-    if !matches!(status.as_str(), "failed" | "cancelled") {
-        return Err(AppError::bad_request(
-            "Only failed or cancelled downloads can be retried",
-        ));
+    if !from.contains(&status.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "Cannot change a {status} download to {to}"
+        )));
     }
-    conn.execute("UPDATE downloads SET status='queued',bytes_written=0,total_bytes=NULL,error=NULL WHERE id=?1 AND user_id=?2", params![id, user.id])?;
-    Ok(Json(json!({"status":"queued"})))
+    conn.execute(
+        "UPDATE downloads SET status=?1,error=NULL,retry_at=0,
+        bytes_written=CASE WHEN ?1='queued' THEN 0 ELSE bytes_written END,
+        total_bytes=CASE WHEN ?1='queued' THEN NULL ELSE total_bytes END,
+        attempts=CASE WHEN ?2 THEN 0 ELSE attempts END WHERE id=?3 AND user_id=?4",
+        params![to, reset_attempts, id, user_id],
+    )?;
+    if let Some(cancel) = state.download_runtime.active.lock().unwrap().get(&token) {
+        cancel.send_replace(true);
+    }
+    state.download_runtime.wake();
+    Ok(())
+}
+
+async fn clear_downloads(
+    State(state): State<Shared>,
+    user: AuthUser,
+) -> Result<Json<Value>, AppError> {
+    let mut conn = state.conn()?;
+    let removed = crate::tracking::clear_download_history(&mut conn, user.id)?;
+    Ok(Json(json!({"removed":removed})))
+}
+
+#[derive(Default)]
+pub struct DownloadRuntime {
+    active: Mutex<HashMap<String, watch::Sender<bool>>>,
+    notify: Notify,
+    probe: tokio::sync::Mutex<Option<(String, Instant, bool)>>,
+    scan: tokio::sync::Mutex<()>,
+}
+
+impl DownloadRuntime {
+    pub fn wake(&self) {
+        self.notify.notify_one();
+    }
 }
 
 pub fn start_worker(state: Shared) -> JoinHandle<()> {
@@ -591,75 +779,132 @@ pub fn start_worker(state: Shared) -> JoinHandle<()> {
             tracing::error!(error = %error.1, "Could not recover download queue");
             return;
         }
+        let slots = Arc::new(Semaphore::new(4));
+        let mut tasks = JoinSet::new();
         loop {
-            match claim_job(&state) {
-                Ok(Some(job)) => {
-                    let result = transfer(&state, &job).await;
-                    let part = state
-                        .media_dir
-                        .join(&job.relative_path)
-                        .with_extension("part");
-                    if let Err(error) = tokio::fs::remove_file(part).await
-                        && error.kind() != std::io::ErrorKind::NotFound
-                    {
-                        tracing::warn!(%error, download_id = job.id, "Could not remove partial download");
-                    }
-                    if let Err(error) = result {
-                        tracing::warn!(download_id = job.id, %error, "Download failed");
-                        if let Ok(conn) = state.conn() {
-                            let _ = conn.execute("UPDATE downloads SET status='failed',error=?1 WHERE id=?2 AND status='running'", params![error, job.id]);
-                        }
-                    } else if result == Ok(true) {
-                        let scan_state = state.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            crate::library::scan_library(&scan_state)
-                        })
-                        .await
-                        {
-                            Ok(Ok(_)) => {
-                                crate::notify::send_in_background(&state, "下载已入库", job.title)
-                            }
-                            Ok(Err(error)) => {
-                                tracing::warn!(error = %error.1, "Downloaded video was saved, but library scan failed")
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "Downloaded video was saved, but library scan failed")
-                            }
-                        }
-                    }
+            if let Err(error) = schedule(&state, &slots, &mut tasks) {
+                tracing::error!(error = %error.1, "Could not schedule downloads");
+            }
+            tokio::select! {
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = result { tracing::error!(%error, "Download worker stopped"); }
                 }
-                Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
-                Err(error) => {
-                    tracing::error!(error = %error.1, "Download queue failed");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
+                _ = state.download_runtime.notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
         }
     })
 }
 
-fn recover_jobs(state: &Shared) -> Result<(), AppError> {
-    let interrupted = {
+fn schedule(
+    state: &Shared,
+    slots: &Arc<Semaphore>,
+    tasks: &mut JoinSet<()>,
+) -> Result<(), AppError> {
+    let settings = {
         let conn = state.conn()?;
-        let mut query =
-            conn.prepare("SELECT id,relative_path FROM downloads WHERE status='running'")?;
+        download_settings(&conn)?
+    };
+    // Lowering concurrency drains outstanding permits without interrupting those transfers.
+    while settings.enabled && 4 - slots.available_permits() < usize::from(settings.concurrency) {
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            break;
+        };
+        let Some(job) = claim_job(state)? else { break };
+        let state = state.clone();
+        let settings = settings.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            match transfer(&state, &job, &settings).await {
+                Err(error) => {
+                    if let Err(error) = record_failure(&state, &job, &error, settings.max_attempts) {
+                        tracing::error!(error = %error.1, download_id=job.id, "Could not record download failure");
+                    }
+                }
+                Ok(true) => {
+                    let _scan = state.download_runtime.scan.lock().await;
+                    let scan_state = state.clone();
+                    match tokio::task::spawn_blocking(move || crate::library::scan_library(&scan_state)).await {
+                        Ok(Ok(_)) => crate::notify::send_in_background(&state, "下载已入库", job.title),
+                        Ok(Err(error)) => tracing::warn!(error = %error.1, "Could not scan completed download"),
+                        Err(error) => tracing::warn!(%error, "Could not scan completed download"),
+                    }
+                }
+                Ok(false) => {}
+            }
+        });
+    }
+    Ok(())
+}
+
+fn record_failure(
+    state: &Shared,
+    job: &Download,
+    error: &str,
+    max_attempts: u8,
+) -> Result<(), AppError> {
+    let retry = job.attempts < i64::from(max_attempts);
+    state.conn()?.execute("UPDATE downloads SET status=?1,error=?2,retry_at=CAST(unixepoch('subsec')*1000 AS INTEGER)+?3
+        WHERE id=?4 AND attempt_token=?5 AND status='running'",
+        params![if retry { "queued" } else { "failed" }, error, job.attempts.min(8)*250, job.id, job.attempt_token])?;
+    Ok(())
+}
+
+fn recover_jobs(state: &Shared) -> Result<(), AppError> {
+    let mut conn = state.conn()?;
+    let interrupted = {
+        let mut query = conn.prepare(&format!(
+            "SELECT {DOWNLOAD_COLUMNS} FROM downloads WHERE status='running'"
+        ))?;
         query
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
+            .query_map([], download_row)?
             .collect::<Result<Vec<_>, _>>()?
     };
-    for (id, relative) in interrupted {
-        if let Ok((part, final_path)) = download_paths(state, &relative)
-            && let Some(size) = published_download_size(&part, &final_path)
-        {
-            state.conn()?.execute("UPDATE downloads SET status='completed',bytes_written=?1,total_bytes=?1,error=NULL WHERE id=?2 AND status='running'", params![size,id])?;
-            if let Err(error) = std::fs::remove_file(part) {
-                tracing::warn!(%error, download_id=id, "Could not remove recovered partial download");
+    for job in interrupted {
+        if let Ok(final_path) = download_path(state, &job.relative_path) {
+            // Pre-M6 jobs staged a sibling .part file. New jobs stage inside their attempt directory.
+            let stage = attempt_directory(state, &job);
+            let part = if job.attempt_token.is_empty() {
+                Some(final_path.with_extension("part"))
+            } else {
+                stage.as_ref().map(|path| path.join("video.part"))
+            };
+            if let Some(part) = part
+                && let Some(size) = published_download_size(&part, &final_path)
+            {
+                crate::library::complete_download(&mut conn, job.id, size)?;
+                if stage.is_none() {
+                    let _ = std::fs::remove_file(part);
+                }
             }
         }
     }
-    state.conn()?.execute("UPDATE downloads SET status='queued',bytes_written=0,total_bytes=NULL,error=NULL WHERE status='running'", [])?;
+    // A crash between a committed pause/completion and TempDir::drop may leave a
+    // private stage behind, even if the owner already cleared that job's history.
+    if std::fs::canonicalize(&state.download_dir)? != state.download_dir {
+        return Err(AppError::internal(
+            "Download directory was moved or replaced",
+        ));
+    }
+    for entry in std::fs::read_dir(&state.download_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some((id, token)) = name
+            .to_str()
+            .and_then(|s| s.strip_prefix(".polyview-job-"))
+            .and_then(|s| s.split_once('-'))
+        else {
+            continue;
+        };
+        if id.parse::<i64>().is_ok()
+            && uuid::Uuid::parse_str(token).is_ok()
+            && entry.file_type()?.is_dir()
+            && let Err(error) = std::fs::remove_dir_all(entry.path())
+        {
+            tracing::warn!(%error, "Could not remove interrupted download directory");
+        }
+    }
+    conn.execute("UPDATE downloads SET status='queued',bytes_written=0,total_bytes=NULL,error=NULL,retry_at=0 WHERE status='running'", [])?;
     Ok(())
 }
 
@@ -685,50 +930,38 @@ fn published_download_size(part: &std::path::Path, final_path: &std::path::Path)
 
 fn claim_job(state: &Shared) -> Result<Option<Download>, AppError> {
     let conn = state.conn()?;
-    let job = conn
-        .query_row(
-            &format!(
-                "SELECT {DOWNLOAD_COLUMNS} FROM downloads WHERE status='queued' ORDER BY id LIMIT 1"
-            ),
-            [],
-            download_row,
-        )
-        .optional()?;
-    if let Some(ref job) = job {
-        conn.execute("UPDATE downloads SET status='running',bytes_written=0,total_bytes=NULL,error=NULL WHERE id=?1 AND status='queued'", [job.id])?;
-    }
-    Ok(job)
+    Ok(conn.query_row(&format!("UPDATE downloads SET status='running', attempts=attempts+1, attempt_token=?1,
+        bytes_written=0,total_bytes=NULL,error=NULL WHERE id=(SELECT id FROM downloads WHERE status='queued'
+        AND retry_at <= CAST(unixepoch('subsec')*1000 AS INTEGER) ORDER BY id LIMIT 1) RETURNING {DOWNLOAD_COLUMNS}"),
+        [uuid::Uuid::new_v4().to_string()], download_row).optional()?)
 }
 
-fn is_running(state: &Shared, id: i64) -> Result<bool, String> {
-    let conn = state.conn().map_err(|e| e.1)?;
-    let status: Option<String> = conn
-        .query_row("SELECT status FROM downloads WHERE id=?1", [id], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(|e| e.to_string())?;
-    Ok(status.as_deref() == Some("running"))
+fn is_running(conn: &Connection, job: &Download) -> Result<bool, String> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM downloads WHERE id=?1 AND attempt_token=?2 AND user_id=?3 AND status='running')",
+        params![job.id, job.attempt_token, job.user_id], |row| row.get(0)).map_err(|e| e.to_string())
 }
 
-async fn while_running<T>(
-    state: &Shared,
-    id: i64,
-    future: impl Future<Output = T>,
-) -> Result<Option<T>, String> {
-    let timeout = tokio::time::timeout(Duration::from_secs(30), future);
-    tokio::pin!(timeout);
-    loop {
-        tokio::select! {
-            result = &mut timeout => return result.map(Some).map_err(|_| "Source stopped responding for 30 seconds".to_owned()),
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                if !is_running(state, id)? { return Ok(None); }
-            }
-        }
+fn attempt_directory(state: &Shared, job: &Download) -> Option<PathBuf> {
+    let token = uuid::Uuid::parse_str(&job.attempt_token).ok()?;
+    Some(
+        state
+            .download_dir
+            .join(format!(".polyview-job-{}-{token}", job.id)),
+    )
+}
+
+struct ActiveAttempt<'a> {
+    runtime: &'a DownloadRuntime,
+    token: &'a str,
+}
+
+impl Drop for ActiveAttempt<'_> {
+    fn drop(&mut self) {
+        self.runtime.active.lock().unwrap().remove(self.token);
     }
 }
 
-fn download_paths(state: &Shared, relative: &str) -> Result<(PathBuf, PathBuf), String> {
+fn download_path(state: &Shared, relative: &str) -> Result<PathBuf, String> {
     let final_path = state.media_dir.join(relative);
     if !final_path.starts_with(&state.download_dir)
         || final_path.parent() != Some(state.download_dir.as_path())
@@ -739,23 +972,114 @@ fn download_paths(state: &Shared, relative: &str) -> Result<(PathBuf, PathBuf), 
     if canonical != state.download_dir {
         return Err("Download directory was moved or replaced".to_owned());
     }
-    Ok((final_path.with_extension("part"), final_path))
+    Ok(final_path)
 }
 
-async fn transfer(state: &Shared, job: &Download) -> Result<bool, String> {
-    let (part_path, final_path) = download_paths(state, &job.relative_path)?;
-    if !is_running(state, job.id)? {
+async fn transfer(
+    state: &Shared,
+    job: &Download,
+    settings: &DownloadSettings,
+) -> Result<bool, String> {
+    let runtime = &state.download_runtime;
+    let (cancel, mut cancelled) = watch::channel(false);
+    runtime
+        .active
+        .lock()
+        .unwrap()
+        .insert(job.attempt_token.clone(), cancel);
+    let _active = ActiveAttempt {
+        runtime,
+        token: &job.attempt_token,
+    };
+    let running = || {
+        let conn = state.conn().map_err(|e| e.1)?;
+        is_running(&conn, job)
+    };
+    if !running()? {
         return Ok(false);
     }
-    if Url::parse(&job.url).is_ok_and(|url| url.path().to_ascii_lowercase().ends_with(".m3u8")) {
-        return transfer_hls(state, job, &part_path, &final_path).await;
-    }
-    let response = match while_running(state, job.id, state.client.get(&job.url).send()).await? {
-        Some(response) => {
-            response.map_err(|_| "Could not connect to the download source".to_owned())?
+    let future = transfer_attempt(state, job, settings);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancelled.changed() => return Ok(false),
+            result = &mut future => return result,
+            // Account removal cascades through SQLite without calling the job endpoints.
+            _ = tokio::time::sleep(Duration::from_secs(1)) => if !running()? { return Ok(false) },
         }
-        None => return Ok(false),
-    };
+    }
+}
+
+async fn transfer_attempt(
+    state: &Shared,
+    job: &Download,
+    settings: &DownloadSettings,
+) -> Result<bool, String> {
+    download_path(state, &job.relative_path)?;
+    let stage = attempt_directory(state, job).ok_or("Invalid download attempt token")?;
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix(stage.file_name().ok_or("Invalid download attempt path")?)
+        .rand_bytes(0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let work = builder
+        .tempdir_in(&state.download_dir)
+        .map_err(|e| format!("Cannot create download directory: {e}"))?;
+    let part = work.path().join("video.part");
+    let mut extension = None;
+    if job.kind == "telegram" {
+        let command = {
+            let conn = state.conn().map_err(|e| e.1)?;
+            if !is_running(&conn, job)? {
+                return Ok(false);
+            }
+            crate::telegram::tdl_command(&conn, settings, job.user_id)
+                .map_err(|_| "Telegram authorization is required")?
+        };
+        let video = crate::telegram::media::download(command, &job.url, work.path()).await?;
+        extension = Some(
+            video
+                .extension()
+                .and_then(|s| s.to_str())
+                .ok_or("Telegram video has no extension")?
+                .to_ascii_lowercase(),
+        );
+        tokio::fs::rename(video, &part)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        let url = http_url(&job.url).map_err(|e| e.1)?;
+        if url.path().to_ascii_lowercase().ends_with(".m3u8") {
+            transfer_hls(state, job, settings, work.path(), &part).await?;
+        } else {
+            transfer_direct(state, job, &part).await?;
+        }
+    }
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .await
+        .map_err(|e| e.to_string())?;
+    file.sync_all().await.map_err(|e| e.to_string())?;
+    let size = i64::try_from(file.metadata().await.map_err(|e| e.to_string())?.len())
+        .map_err(|_| "Video is too large")?;
+    if size == 0 {
+        return Err("Source returned an empty video".into());
+    }
+    drop(file);
+    publish_download(state, job, size, &part, extension.as_deref())
+}
+
+async fn transfer_direct(state: &Shared, job: &Download, part: &FsPath) -> Result<(), String> {
+    let response = tokio::time::timeout(Duration::from_secs(30), state.client.get(&job.url).send())
+        .await
+        .map_err(|_| "Source stopped responding for 30 seconds")?
+        .map_err(|_| "Could not connect to the download source")?;
     let response = response.error_for_status().map_err(|e| {
         format!(
             "Source returned HTTP {}",
@@ -784,34 +1108,27 @@ async fn transfer(state: &Shared, job: &Download) -> Result<bool, String> {
         .conn()
         .map_err(|e| e.1)?
         .execute(
-            "UPDATE downloads SET total_bytes=?1 WHERE id=?2 AND status='running'",
-            params![total_bytes, job.id],
+            "UPDATE downloads SET total_bytes=?1 WHERE id=?2 AND attempt_token=?3 AND status='running'",
+            params![total_bytes, job.id, job.attempt_token],
         )
         .map_err(|e| e.to_string())?;
-    match tokio::fs::remove_file(&part_path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("Cannot clean interrupted download: {error}")),
-    }
     let mut file = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&part_path)
+        .open(part)
         .await
         .map_err(|e| format!("Cannot create download file: {e}"))?;
     let mut stream = response.bytes_stream();
     let mut written: i64 = 0;
     let mut last_saved = std::time::Instant::now();
     loop {
-        let chunk = match while_running(state, job.id, stream.next()).await? {
-            None => return Ok(false),
-            Some(None) => break,
-            Some(Some(result)) => result
-                .map_err(|_| "Connection ended before the video finished downloading".to_owned())?,
+        let Some(chunk) = tokio::time::timeout(Duration::from_secs(30), stream.next())
+            .await
+            .map_err(|_| "Source stopped responding for 30 seconds")?
+        else {
+            break;
         };
-        if !is_running(state, job.id)? {
-            return Ok(false);
-        }
+        let chunk = chunk.map_err(|_| "Connection ended before the video finished downloading")?;
         file.write_all(&chunk)
             .await
             .map_err(|e| format!("Cannot write download file: {e}"))?;
@@ -819,14 +1136,7 @@ async fn transfer(state: &Shared, job: &Download) -> Result<bool, String> {
             .checked_add(chunk.len() as i64)
             .ok_or("Download is too large")?;
         if last_saved.elapsed() >= Duration::from_millis(500) {
-            state
-                .conn()
-                .map_err(|e| e.1)?
-                .execute(
-                    "UPDATE downloads SET bytes_written=?1 WHERE id=?2 AND status='running'",
-                    params![written, job.id],
-                )
-                .map_err(|e| e.to_string())?;
+            update_progress(state, job, written)?;
             last_saved = std::time::Instant::now();
         }
     }
@@ -836,24 +1146,81 @@ async fn transfer(state: &Shared, job: &Download) -> Result<bool, String> {
     if total_bytes.is_some_and(|total| written != total) {
         return Err("Source sent an incomplete video".to_owned());
     }
-    file.flush().await.map_err(|e| e.to_string())?;
-    file.sync_all().await.map_err(|e| e.to_string())?;
-    drop(file);
-    publish_download(state, job.id, written, &part_path, &final_path)
+    file.flush().await.map_err(|e| e.to_string())
+}
+
+fn update_progress(state: &Shared, job: &Download, written: i64) -> Result<(), String> {
+    state.conn().map_err(|e| e.1)?.execute("UPDATE downloads SET bytes_written=?1 WHERE id=?2 AND attempt_token=?3 AND status='running'",
+        params![written, job.id, job.attempt_token]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn command(binary: &str) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+async fn preferred_available(runtime: &DownloadRuntime, binary: &str) -> bool {
+    let mut cached = runtime.probe.lock().await;
+    if let Some((path, checked, available)) = &*cached
+        && path == binary
+        && checked.elapsed() < Duration::from_secs(60)
+    {
+        return *available;
+    }
+    let available = matches!(tokio::time::timeout(Duration::from_secs(3), command(binary).arg("--version").status()).await, Ok(Ok(status)) if status.success());
+    *cached = Some((binary.to_owned(), Instant::now(), available));
+    available
 }
 
 async fn transfer_hls(
     state: &Shared,
     job: &Download,
-    part_path: &std::path::Path,
-    final_path: &std::path::Path,
-) -> Result<bool, String> {
-    match tokio::fs::remove_file(part_path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("Cannot clean interrupted download: {error}")),
+    settings: &DownloadSettings,
+    work: &FsPath,
+    part_path: &FsPath,
+) -> Result<(), String> {
+    if preferred_available(&state.download_runtime, &settings.n_m3u8dl_path).await {
+        let mut preferred = command(&settings.n_m3u8dl_path);
+        preferred
+            .arg(&job.url)
+            .arg("--save-dir")
+            .arg(work)
+            .arg("--tmp-dir")
+            .arg(work.join("segments"))
+            .args([
+                "--save-name",
+                "video",
+                "--auto-select",
+                "--mux-after-done",
+                "format=mp4:muxer=ffmpeg",
+            ]);
+        if settings.ffmpeg_path != "ffmpeg" {
+            preferred
+                .arg("--ffmpeg-binary-path")
+                .arg(&settings.ffmpeg_path);
+        }
+        if preferred.status().await.is_ok_and(|s| s.success()) {
+            for name in ["video.MUX.mp4", "video.mp4"] {
+                let candidate = work.join(name);
+                if tokio::fs::symlink_metadata(&candidate)
+                    .await
+                    .is_ok_and(|m| m.is_file() && m.len() > 0)
+                {
+                    tokio::fs::rename(candidate, part_path)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+            }
+        }
     }
-    let mut child = tokio::process::Command::new("ffmpeg")
+    let mut child = command(&settings.ffmpeg_path)
         .args([
             "-nostdin",
             "-hide_banner",
@@ -882,82 +1249,59 @@ async fn transfer_hls(
             "mp4",
         ])
         .arg(part_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
         .spawn()
         .map_err(|_| "HLS downloads require FFmpeg installed on the server".to_string())?;
     loop {
-        if !is_running(state, job.id)? {
-            let _ = child.kill().await;
-            return Ok(false);
-        }
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            if !status.success() {
-                return Err("FFmpeg could not download this HLS stream; check the source, permissions, and available disk space".into());
+        tokio::select! {
+            result = child.wait() => {
+                if !result.map_err(|e| e.to_string())?.success() {
+                    return Err("FFmpeg could not download this HLS stream; check the source, permissions, and available disk space".into());
+                }
+                return Ok(());
             }
-            break;
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                if let Ok(metadata) = tokio::fs::metadata(part_path).await {
+                    update_progress(state, job, i64::try_from(metadata.len()).map_err(|_| "Video is too large")?)?;
+                }
+            }
         }
-        if let Ok(metadata) = tokio::fs::metadata(part_path).await {
-            state
-                .conn()
-                .map_err(|e| e.1)?
-                .execute(
-                    "UPDATE downloads SET bytes_written=? WHERE id=? AND status='running'",
-                    params![metadata.len().min(i64::MAX as u64) as i64, job.id],
-                )
-                .map_err(|e| e.to_string())?;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let file = tokio::fs::File::open(part_path)
-        .await
-        .map_err(|error| error.to_string())?;
-    file.sync_all().await.map_err(|error| error.to_string())?;
-    let size = i64::try_from(
-        file.metadata()
-            .await
-            .map_err(|error| error.to_string())?
-            .len(),
-    )
-    .map_err(|_| "Video is too large".to_string())?;
-    drop(file);
-    if size == 0 {
-        return Err("Source returned an empty video".into());
-    }
-    publish_download(state, job.id, size, part_path, final_path)
 }
 
 fn publish_download(
     state: &Shared,
-    id: i64,
+    job: &Download,
     written: i64,
-    part_path: &std::path::Path,
-    final_path: &std::path::Path,
+    part_path: &FsPath,
+    extension: Option<&str>,
 ) -> Result<bool, String> {
-    let conn = state.conn().map_err(|e| e.1)?;
-    let status: Option<String> = conn
-        .query_row("SELECT status FROM downloads WHERE id=?1", [id], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(|e| e.to_string())?;
-    if status.as_deref() != Some("running") {
+    let mut conn = state.conn().map_err(|e| e.1)?;
+    if !is_running(&conn, job)? {
         return Ok(false);
     }
+    let mut final_path = download_path(state, &job.relative_path)?;
+    if let Some(extension) = extension
+        && final_path.extension().and_then(|s| s.to_str()) != Some(extension)
+    {
+        let relative =
+            unique_relative_path(&conn, state, &job.title, extension).map_err(|e| e.1)?;
+        final_path = download_path(state, &relative)?;
+        conn.execute(
+            "UPDATE downloads SET relative_path=?1 WHERE id=?2 AND attempt_token=?3",
+            params![relative, job.id, job.attempt_token],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     // Publishing with a hard link is atomic and fails if an existing media file occupies the name.
-    std::fs::hard_link(part_path, final_path)
+    std::fs::hard_link(part_path, &final_path)
         .map_err(|e| format!("Cannot publish completed video: {e}"))?;
-    match conn.execute("UPDATE downloads SET status='completed',bytes_written=?1,total_bytes=?1,error=NULL WHERE id=?2 AND status='running'", params![written, id]) {
-        Ok(0) => { let _ = std::fs::remove_file(final_path); return Ok(false); }
-        Ok(_) => {}
-        Err(error) => {
+    match crate::library::complete_download(&mut conn, job.id, written) {
+        Ok(true) => Ok(true),
+        result => {
             let _ = std::fs::remove_file(final_path);
-            return Err(error.to_string());
+            result.map_err(|e| e.1)
         }
     }
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -981,8 +1325,11 @@ mod tests {
         crate::library::init_schema(&conn).unwrap();
         crate::catalog::init_schema(&conn).unwrap();
         crate::user_data::init_schema(&conn).unwrap();
+        crate::settings::init_schema(&conn).unwrap();
+        crate::tracking::init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            download_runtime: Default::default(),
             media_dir,
             download_dir,
             client: reqwest::Client::new(),
@@ -1086,8 +1433,8 @@ mod tests {
         assert!(!safe_title("../../evil\\file.mp4").contains('/'));
         assert!(safe_title(&"影".repeat(80)).len() <= 160);
         let (_temp, state) = state();
-        assert!(download_paths(&state, "downloads/../../outside.mp4").is_err());
-        assert!(download_paths(&state, "downloads/a.mp4").is_ok());
+        assert!(download_path(&state, "downloads/../../outside.mp4").is_err());
+        assert!(download_path(&state, "downloads/a.mp4").is_ok());
     }
 
     #[test]
@@ -1120,6 +1467,7 @@ mod tests {
             Json(DownloadInput {
                 url: "https://example.com/a.mp4".into(),
                 title: "Episode 1".into(),
+                metadata: Default::default(),
             }),
         )
         .await
@@ -1139,12 +1487,13 @@ mod tests {
                 .0,
             StatusCode::NOT_FOUND
         );
-        assert_eq!(claim_job(&state).unwrap().unwrap().id, job.id);
-        assert!(is_running(&state, job.id).unwrap());
+        let attempt = claim_job(&state).unwrap().unwrap();
+        assert_eq!(attempt.id, job.id);
+        assert!(is_running(&state.conn().unwrap(), &attempt).unwrap());
         cancel_download(State(state.clone()), user(1), Path(job.id))
             .await
             .unwrap();
-        assert!(!is_running(&state, job.id).unwrap());
+        assert!(!is_running(&state.conn().unwrap(), &attempt).unwrap());
         let _ = retry_download(State(state.clone()), user(1), Path(job.id))
             .await
             .unwrap();
@@ -1173,12 +1522,15 @@ mod tests {
             Json(DownloadInput {
                 url: format!("http://{address}/video.mp4"),
                 title: "Video".into(),
+                metadata: Default::default(),
             }),
         )
         .await
         .unwrap();
         let job = claim_job(&state).unwrap().unwrap();
-        transfer(&state, &job).await.unwrap();
+        transfer(&state, &job, &DownloadSettings::default())
+            .await
+            .unwrap();
         let final_path = state.media_dir.join(&created.relative_path);
         assert_eq!(std::fs::read(&final_path).unwrap(), b"test video bytes");
         assert_eq!(
@@ -1198,7 +1550,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            transfer(&state, &job)
+            transfer(&state, &job, &DownloadSettings::default())
                 .await
                 .unwrap_err()
                 .contains("Cannot publish")
@@ -1255,14 +1607,23 @@ mod tests {
             Json(DownloadInput {
                 url: format!("http://{address}/video.mp4"),
                 title: "Downloaded video".into(),
+                metadata: Default::default(),
             }),
         )
         .await
         .unwrap();
         let final_path = state.media_dir.join(&job.relative_path);
-        let part = final_path.with_extension("part");
         let worker = start_worker(state.clone());
-        wait_for(|| std::fs::metadata(&part).is_ok_and(|meta| meta.len() > 0)).await;
+        let partial_path = || {
+            let conn = state.conn().unwrap();
+            attempt_directory(&state, &download_by_id(&conn, job.id, 1).unwrap())
+                .map(|dir| dir.join("video.part"))
+        };
+        wait_for(|| {
+            partial_path().is_some_and(|part| std::fs::metadata(part).is_ok_and(|m| m.len() > 0))
+        })
+        .await;
+        let part = partial_path().unwrap();
         assert!(!final_path.exists());
         cancel_download(State(state.clone()), user(1), Path(job.id))
             .await
@@ -1299,24 +1660,30 @@ mod tests {
     #[tokio::test]
     async fn deleting_an_account_removes_its_jobs_and_stops_active_transfer() {
         let (_temp, state) = state();
-        let (_, Json(job)) = create_download(
+        let (_, Json(created)) = create_download(
             State(state.clone()),
             user(2),
             Json(DownloadInput {
                 url: "https://example.com/video.mp4".into(),
                 title: "Video".into(),
+                metadata: Default::default(),
             }),
         )
         .await
         .unwrap();
-        claim_job(&state).unwrap();
+        let job = claim_job(&state).unwrap().unwrap();
+        assert_eq!(job.id, created.id);
         state
             .conn()
             .unwrap()
             .execute("DELETE FROM users WHERE id=2", [])
             .unwrap();
-        assert!(!is_running(&state, job.id).unwrap());
-        assert!(!transfer(&state, &job).await.unwrap());
+        assert!(!is_running(&state.conn().unwrap(), &job).unwrap());
+        assert!(
+            !transfer(&state, &job, &DownloadSettings::default())
+                .await
+                .unwrap()
+        );
         assert!(
             list_downloads(State(state), user(2))
                 .await
@@ -1324,6 +1691,278 @@ mod tests {
                 .0
                 .is_empty()
         );
+    }
+
+    fn queue(state: &Shared, owner: i64, title: &str, url: &str) -> i64 {
+        let conn = state.conn().unwrap();
+        enqueue_in(&conn, state, owner, title, url).unwrap()
+    }
+
+    fn job_for(state: &Shared, id: i64, owner: i64) -> Download {
+        download_by_id(&state.conn().unwrap(), id, owner).unwrap()
+    }
+
+    fn configure(state: &Shared, settings: &DownloadSettings) {
+        crate::settings::set_setting_json(&state.conn().unwrap(), "downloads", settings).unwrap();
+        state.download_runtime.wake();
+    }
+
+    #[tokio::test]
+    async fn concurrent_pause_resume_and_cleanup_are_scoped_to_the_owner() {
+        use axum::routing::get;
+        use tokio::sync::{mpsc, oneshot};
+        let (_temp, state) = state();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        let router = Router::new().route(
+            "/{video}",
+            get(move |Path(video): Path<String>| {
+                let requests = requests.clone();
+                async move {
+                    let (reply, wait) = oneshot::channel::<String>();
+                    requests.send((video, reply)).unwrap();
+                    wait.await.unwrap_or_default()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut settings = DownloadSettings {
+            enabled: false,
+            concurrency: 2,
+            ..Default::default()
+        };
+        configure(&state, &settings);
+        let first = queue(&state, 1, "First", &format!("{base}/first.mp4"));
+        let second = queue(&state, 2, "Second", &format!("{base}/second.mp4"));
+        let third = queue(&state, 1, "Third", &format!("{base}/third.mp4"));
+        let worker = start_worker(state.clone());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pending.recv())
+                .await
+                .is_err()
+        );
+        settings.enabled = true;
+        configure(&state, &settings);
+        let mut replies = HashMap::new();
+        for _ in 0..2 {
+            let (video, sender) = tokio::time::timeout(Duration::from_secs(5), pending.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            replies.insert(video, sender);
+        }
+        assert_eq!(job_for(&state, first, 1).status, "running");
+        assert_eq!(job_for(&state, second, 2).status, "running");
+        assert_eq!(job_for(&state, third, 1).status, "queued");
+        assert_eq!(
+            pause_download(State(state.clone()), user(2), Path(first))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let old = job_for(&state, first, 1);
+        let _ = pause_download(State(state.clone()), user(1), Path(first))
+            .await
+            .unwrap();
+        let (video, third_reply) = tokio::time::timeout(Duration::from_secs(3), pending.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(video, "third.mp4");
+        assert_eq!(job_for(&state, first, 1).status, "paused");
+        assert!(!attempt_directory(&state, &old).unwrap().exists());
+        assert_eq!(
+            resume_download(State(state.clone()), user(2), Path(first))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let _ = resume_download(State(state.clone()), user(1), Path(first))
+            .await
+            .unwrap();
+        assert_eq!(job_for(&state, first, 1).status, "queued");
+        replies
+            .remove("second.mp4")
+            .unwrap()
+            .send("second video".into())
+            .unwrap();
+        let (video, resumed) = tokio::time::timeout(Duration::from_secs(3), pending.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(video, "first.mp4");
+        let fresh = job_for(&state, first, 1);
+        assert_ne!(fresh.attempt_token, old.attempt_token);
+        assert!(!is_running(&state.conn().unwrap(), &old).unwrap());
+        record_failure(&state, &old, "late fault", 1).unwrap();
+        update_progress(&state, &old, 9999).unwrap();
+        assert!(!publish_download(&state, &old, 1, FsPath::new("stale.part"), None).unwrap());
+        assert_eq!(job_for(&state, first, 1).status, "running");
+        assert_eq!(job_for(&state, first, 1).bytes_written, 0);
+        let _ = replies
+            .remove("first.mp4")
+            .unwrap()
+            .send("discarded video".into());
+        cancel_download(State(state.clone()), user(1), Path(third))
+            .await
+            .unwrap();
+        drop(third_reply);
+        resumed.send("resumed video".into()).unwrap();
+        wait_for(|| job_for(&state, first, 1).status == "completed").await;
+        assert_eq!(
+            clear_downloads(State(state.clone()), user(1))
+                .await
+                .unwrap()
+                .0["removed"],
+            2
+        );
+        assert_eq!(job_for(&state, second, 2).status, "completed");
+        assert!(
+            list_downloads(State(state.clone()), user(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read(state.media_dir.join(fresh.relative_path)).unwrap(),
+            b"resumed video"
+        );
+        worker.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transient_failures_retry_and_terminal_failures_stop_at_the_configured_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_temp, state) = state();
+        configure(
+            &state,
+            &DownloadSettings {
+                max_attempts: 2,
+                concurrency: 2,
+                ..Default::default()
+            },
+        );
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let router = Router::new()
+            .route(
+                "/temporary.mp4",
+                get(move || {
+                    let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        if first {
+                            (StatusCode::BAD_GATEWAY, "")
+                        } else {
+                            (StatusCode::OK, "video")
+                        }
+                    }
+                }),
+            )
+            .route("/bad.mp4", get(|| async { StatusCode::BAD_GATEWAY }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let good = queue(&state, 1, "Good", &format!("{base}/temporary.mp4"));
+        let bad = queue(&state, 1, "Bad", &format!("{base}/bad.mp4"));
+        let worker = start_worker(state.clone());
+        wait_for(|| {
+            job_for(&state, good, 1).status == "completed"
+                && job_for(&state, bad, 1).status == "failed"
+        })
+        .await;
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(job_for(&state, good, 1).attempts, 2);
+        assert_eq!(job_for(&state, bad, 1).attempts, 2);
+        assert!(job_for(&state, bad, 1).error.unwrap().contains("502"));
+        assert!(!state.download_dir.join("Bad.mp4").exists());
+        worker.abort();
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preferred_hls_probe_is_cached_and_failure_or_unavailability_uses_configured_ffmpeg() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, state) = state();
+        let stub = |name: &str, script: &str| {
+            let path = temp.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let primary = stub(
+            "preferred tool",
+            r#"#!/bin/sh
+set -eu
+if [ "$1" = '--version' ]; then printf 'probe\n' >> "$0.log"; exit 0; fi
+url=$1
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --save-dir) dir=$2; shift;;
+    --save-name) name=$2; shift;;
+  esac
+  shift
+done
+printf '%s\n' "$url" >> "$0.log"
+case "$url" in
+  */failed.m3u8) printf partial > "$dir/$name.MUX.mp4"; exit 1;;
+  *) printf preferred > "$dir/$name.MUX.mp4";;
+esac
+"#,
+        );
+        let fallback = stub(
+            "fallback tool",
+            r#"#!/bin/sh
+set -eu
+for last in "$@"; do :; done
+printf 'fallback\n' >> "$0.log"
+printf fallback > "$last"
+"#,
+        );
+        let mut settings = DownloadSettings {
+            n_m3u8dl_path: primary.clone(),
+            ffmpeg_path: fallback.clone(),
+            ..Default::default()
+        };
+        configure(&state, &settings);
+        let worker = start_worker(state.clone());
+        for (title, expected) in [
+            ("priority", "preferred"),
+            ("failed", "fallback"),
+            ("unavailable", "fallback"),
+        ] {
+            if title == "unavailable" {
+                settings.n_m3u8dl_path = temp.path().join("missing").to_str().unwrap().to_owned();
+                configure(&state, &settings);
+            }
+            let id = queue(&state, 1, title, &format!("http://127.0.0.1/{title}.m3u8"));
+            wait_for(|| job_for(&state, id, 1).status == "completed").await;
+            let job = job_for(&state, id, 1);
+            assert_eq!(job.attempts, 1);
+            assert_eq!(
+                std::fs::read_to_string(state.media_dir.join(job.relative_path)).unwrap(),
+                expected
+            );
+        }
+        let calls = std::fs::read_to_string(format!("{primary}.log")).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "probe",
+                "http://127.0.0.1/priority.m3u8",
+                "http://127.0.0.1/failed.m3u8"
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{fallback}.log")).unwrap(),
+            "fallback\nfallback\n"
+        );
+        worker.abort();
     }
 
     #[cfg(unix)]
@@ -1336,11 +1975,20 @@ mod tests {
             Json(DownloadInput {
                 url: "https://example.com/video.mp4".into(),
                 title: "Video".into(),
+                metadata: Default::default(),
             }),
         )
         .await
         .unwrap();
-        claim_job(&state).unwrap();
+        // A database migrated from the previous worker has no attempt token.
+        state
+            .conn()
+            .unwrap()
+            .execute(
+                "UPDATE downloads SET status='running' WHERE id=?1",
+                [job.id],
+            )
+            .unwrap();
         let final_path = state.media_dir.join(&job.relative_path);
         let part = final_path.with_extension("part");
         std::fs::write(&part, b"complete video").unwrap();
@@ -1362,6 +2010,7 @@ mod tests {
             .unwrap();
         recover_jobs(&state).unwrap();
         assert_eq!(std::fs::read(&final_path).unwrap(), b"complete video");
+        assert_eq!(std::fs::read(&part).unwrap(), b"unrelated partial");
         let Json(jobs) = list_downloads(State(state), user(1)).await.unwrap();
         assert_eq!(jobs[0].status, "queued");
     }

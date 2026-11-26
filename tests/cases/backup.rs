@@ -39,8 +39,11 @@ fn sample(backup: &mut Value) {
     }]);
     backup["epg_config"] =
         json!({"url":"https://epg.invalid/one.xml\nhttps://epg.invalid/two.xml"});
+    let mut downloads = backup["app_settings"]["downloads"].clone();
+    downloads["concurrency"] = json!(3);
     backup["app_settings"] = json!({
         "adult_sources_enabled":true,"epg_aliases":[{"from":"News HD","to":"News"}],
+        "downloads":downloads,
         "calendar":{"enabled":false,"api_url":"https://calendar.invalid/feed"},
         "notify":{"bark_url":"https://alerts.invalid/private/token","webhook_post_url":"","webhook_get_url":""},
         "play":{"ad_block":true,"play_ua":"Fixture","play_referer":"","image_referer":""},
@@ -101,6 +104,13 @@ async fn backup_roundtrips_configuration_and_preserves_members_sessions_and_sour
         StatusCode::OK
     );
     assert_eq!(cache_keys(&app), ["unrelated"]);
+    let downloads = app
+        .request("GET", "/api/settings/downloads", Some(&admin), None)
+        .await
+        .json();
+    assert_eq!(downloads["concurrency"], 3);
+    assert_eq!(downloads["telegram_proxy_configured"], false);
+    assert!(downloads.get("telegram_proxy").is_none());
     for key in ["calendar", "notify", "play"] {
         let path = format!("/api/settings/{key}");
         let live = app.request("GET", &path, Some(&admin), None).await;

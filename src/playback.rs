@@ -433,6 +433,7 @@ mod tests {
             temp,
             Arc::new(AppState {
                 db: Mutex::new(conn),
+                download_runtime: Default::default(),
                 media_dir: media_dir.clone(),
                 download_dir: media_dir,
                 client: reqwest::Client::new(),
