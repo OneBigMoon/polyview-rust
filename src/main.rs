@@ -9,20 +9,48 @@ use std::{
     time::Duration,
 };
 
+const HELP: &str = "PolyView — media library, online viewing, live TV and TVBox feeds
+
+Usage:
+  polyview                       Start the HTTP server
+  polyview telegram-native-login --member-id ID
+                                 Complete a pending native login from the NAS terminal
+  polyview telegram-host-login TDL [ARGS...]
+                                 Display the official tdl process's QR on its host
+
+Environment:
+  POLYVIEW_BIND                  Listen address (default 127.0.0.1:8080)
+  POLYVIEW_DATA_DIR              Database, reports and private sessions (default ./data)
+  POLYVIEW_MEDIA_DIR             Media library and downloads (default ./media)
+  POLYVIEW_PUBLIC_URL            HTTP(S) origin reachable by TV clients, without a path
+  POLYVIEW_SECURE_COOKIE         Set true behind HTTPS (default false)
+  POLYVIEW_LEGACY_DB             Original application database backup to import read-only
+  POLYVIEW_LEGACY_CONFIG         Optional original JSON config for that backup
+  POLYVIEW_TDJSON_PATH           Absolute path to the official TDLib JSON library
+  POLYVIEW_TELEGRAM_HOST_HELPER  Optional trusted executable for desktop login approval
+  RUST_LOG                       Log filter (default polyview=info)
+
+The server upgrades its polyview.sqlite3 in place. Importing a separate legacy backup
+preserves the original and writes legacy-import-report.json. Mapped online progress,
+favorites, search history and skip settings are included. Review unmapped records and
+enable imported automatic downloads after verifying the sources. Open the web panel
+to create the first administrator on an empty installation.";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);
-    if args.next().as_deref() == Some(std::ffi::OsStr::new("telegram-host-login")) {
-        return host_qr::run(args).await;
-    }
-    if env::args().any(|arg| arg == "--help" || arg == "-h") {
-        println!(
-            "PolyView — web viewing, series downloads, and TVBox / 影视仓 feeds\n\nConfiguration via environment:\n  POLYVIEW_BIND          Listen address (default 127.0.0.1:8080)\n  POLYVIEW_DATA_DIR      New database/report directory (default ./data)\n  POLYVIEW_MEDIA_DIR     Media library directory (default ./media)\n  POLYVIEW_PUBLIC_URL    HTTP(S) origin reachable by TV clients; no path\n  POLYVIEW_SECURE_COOKIE Set true behind HTTPS (default false)\n  POLYVIEW_LEGACY_DB     Explicit original database backup to import read-only\n  POLYVIEW_LEGACY_CONFIG Optional original JSON config used with LEGACY_DB\n  RUST_LOG              Log filter (default polyview=info)\n\nOpen the web interface to create the first administrator or use imported accounts.\nConfigure CMS sources for online viewing and tracking. FFmpeg is required for HLS\ndownloads; completed files are saved under the media directory.\n\nLegacy import uses a separate polyview.sqlite3 database and writes an import\nreport. Imported automatic downloads stay off. Old jobs, history, sessions, and\nTelegram execution are not migrated; retain the original service until verified."
-        );
-        return Ok(());
-    }
-    if env::args().len() > 1 {
-        return Err("Unknown argument; use --help".into());
+    let command = args.next();
+    match command.as_deref().and_then(|s| s.to_str()) {
+        Some("telegram-host-login") => return host_qr::run(args).await,
+        Some("telegram-native-login") => {
+            return polyview::telegram::login::terminal_login(args).await;
+        }
+        Some("--help" | "-h") => {
+            println!("{HELP}");
+            return Ok(());
+        }
+        None if command.is_none() => (),
+        _ => return Err("Unknown argument; use --help".into()),
     }
     tracing_subscriber::fmt()
         .with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "polyview=info".into()))
@@ -51,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state: Shared = Arc::new(AppState {
         db: Mutex::new(conn),
+        epg_refresh: Default::default(),
         playback_grants: Default::default(),
         telegram_native: Default::default(),
         cloud_fixture: None,
@@ -109,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = network::start_worker(state.clone());
     let tracking_worker = polyview::tracking::start_worker(state.clone());
     let live_worker = polyview::live_sources::start_worker(state.clone());
+    let epg_worker = polyview::epg::start_worker(state.clone());
     let source_worker = polyview::source_subscriptions::start_worker(state.clone());
     let health_worker = polyview::catalog::start_health_worker(state.clone());
     let telegram_worker = polyview::telegram::subscriptions::start_worker(state.clone());
@@ -121,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     worker.abort();
     tracking_worker.abort();
     live_worker.abort();
+    epg_worker.abort();
     source_worker.abort();
     health_worker.abort();
     telegram_worker.abort();

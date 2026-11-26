@@ -41,6 +41,7 @@ pub type Shared = Arc<AppState>;
 
 pub struct AppState {
     pub db: Mutex<Connection>,
+    pub epg_refresh: epg::RefreshRuntime,
     pub playback_grants: playback::PlaybackGrants,
     pub telegram_native: telegram::native::NativeRuntime,
     pub cloud_fixture: Option<reqwest::Url>,
@@ -59,7 +60,7 @@ impl AppState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AppError(pub StatusCode, pub String);
 
 impl AppError {

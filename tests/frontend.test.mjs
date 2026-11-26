@@ -3446,6 +3446,11 @@ test("native Telegram login polls host confirmation, cancels and handles officia
   const page = await app.downloads();
   await m6Click(page, "连接 Telegram");
   assert.match(page.textContent, /电脑桌面核对账户 family（9）/);
+  state = "terminal";
+  await scheduled();
+  assert.match(page.textContent, /NAS 本地终端为账户 family（9）/);
+  assert.match(page.textContent, /telegram-native-login --member-id 9/);
+  assert.doesNotMatch(page.textContent, /tg:\/\/|provider-private-output/);
   state = "scan";
   await scheduled();
   assert.match(page.textContent, /扫描 PolyView 宿主机桌面/);

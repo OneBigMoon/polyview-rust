@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use flate2::read::GzDecoder;
+use futures_util::{FutureExt, future};
 use roxmltree::{Document, ParsingOptions};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,10 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
+    sync::Mutex,
+    time::Duration,
 };
+use tokio::task::JoinHandle;
 
 const DEFAULT_EPG_URLS: &[&str] = &[
     "http://epg.51zmt.top:8000/e.xml",
@@ -48,6 +52,75 @@ const CHANNEL_ALIASES: &[(&str, &str)] = &[
 const EPG_STALE_SECONDS: i64 = 6 * 60 * 60;
 const CATCHUP_SECONDS: i64 = 7 * 24 * 3600;
 pub(crate) const ALIASES_KEY: &str = "epg_aliases";
+
+type FeedRefresh = future::BoxFuture<'static, Result<Value, AppError>>;
+
+#[derive(Default)]
+pub struct RefreshRuntime {
+    active: Mutex<Option<future::WeakShared<FeedRefresh>>>,
+}
+
+impl RefreshRuntime {
+    fn start_or_join(&self, state: &Shared) -> Result<future::Shared<FeedRefresh>, AppError> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| AppError::internal("EPG refresh lock failed"))?;
+        if let Some(task) = active.as_ref().and_then(future::WeakShared::upgrade)
+            && task.peek().is_none()
+        {
+            return Ok(task);
+        }
+        let state = state.clone();
+        let task = async move { refresh_epg(&state).await }.boxed().shared();
+        // The callers own the refresh. Cancelling the last one releases the slot.
+        *active = task.downgrade();
+        Ok(task)
+    }
+}
+
+fn last_update(conn: &Connection) -> Result<i64, AppError> {
+    Ok(setting_optional(conn, "epg_updated_at")?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0))
+}
+
+fn stale(updated_at: i64, timestamp: i64) -> bool {
+    updated_at <= 0 || timestamp.saturating_sub(updated_at) >= EPG_STALE_SECONDS
+}
+
+fn refresh_due(conn: &Connection, timestamp: i64) -> Result<bool, AppError> {
+    let has_channels: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM channels)", [], |row| {
+            row.get(0)
+        })?;
+    Ok(has_channels && stale(last_update(conn)?, timestamp))
+}
+
+async fn scheduled_refresh(state: &Shared) -> Result<(), AppError> {
+    let task = {
+        let conn = state.conn()?;
+        if !refresh_due(&conn, now())? {
+            return Ok(());
+        }
+        // Reserve the refresh before a concurrent request can commit a newer timestamp.
+        state.epg_refresh.start_or_join(state)?
+    };
+    task.await?;
+    Ok(())
+}
+
+pub fn start_worker(state: Shared) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        loop {
+            if let Err(error) = scheduled_refresh(&state).await {
+                tracing::warn!(status = error.0.as_u16(), "Scheduled EPG refresh failed");
+            }
+            tokio::time::sleep(Duration::from_secs(EPG_STALE_SECONDS as u64)).await;
+        }
+    })
+}
 
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
@@ -128,12 +201,10 @@ async fn guide(
         params![start, end],
         |row| row.get(0),
     )?;
-    let updated_at = setting_optional(&conn, "epg_updated_at")?
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
+    let updated_at = last_update(&conn)?;
     let mut result = json!({
         "updated_at": updated_at,
-        "stale": now() - updated_at > EPG_STALE_SECONDS,
+        "stale": stale(updated_at, now()),
         "matched_channels": matched,
         "programs": programs,
     });
@@ -150,9 +221,7 @@ async fn config(State(state): State<Shared>, user: AuthUser) -> Result<Json<Valu
         conn.query_row("SELECT COUNT(*) FROM epg_programs", [], |row| row.get(0))?;
     Ok(Json(json!({
         "url": setting(&conn, "epg_url")?,
-        "updated_at": setting_optional(&conn, "epg_updated_at")?
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0),
+        "updated_at": last_update(&conn)?,
         "programs": programs,
     })))
 }
@@ -251,7 +320,7 @@ pub(crate) fn store_aliases(
 
 async fn refresh(State(state): State<Shared>, user: AuthUser) -> Result<Json<Value>, AppError> {
     require_admin(&user)?;
-    Ok(Json(refresh_epg(&state).await?))
+    Ok(Json(state.epg_refresh.start_or_join(&state)?.await?))
 }
 
 async fn refresh_epg(state: &Shared) -> Result<Value, AppError> {
@@ -266,10 +335,10 @@ async fn refresh_epg(state: &Shared) -> Result<Value, AppError> {
     };
     let mut feeds = Vec::new();
     let mut errors = Vec::new();
-    for url in &urls {
+    for (index, url) in urls.iter().enumerate() {
         match fetch_epg(&state.client, url).await {
             Ok(parsed) => feeds.push(parsed),
-            Err(error) => errors.push(format!("{url}: {}", error.1)),
+            Err(error) => errors.push(format!("EPG source {}: {error}", index + 1)),
         }
     }
     if feeds.is_empty() {
@@ -284,7 +353,10 @@ async fn refresh_epg(state: &Shared) -> Result<Value, AppError> {
     }
     let conn = state.conn()?;
     let updated_at = now();
-    let (matched, programs) = store_feeds(&conn, &feeds, updated_at)?;
+    let (matched, programs) = store_feeds(&conn, &feeds, updated_at, errors.is_empty())?;
+    if !errors.is_empty() {
+        tracing::warn!(failed = errors.len(), "Some EPG sources failed to refresh");
+    }
     Ok(json!({
         "updated_at": updated_at,
         "feeds": feeds.len(),
@@ -298,6 +370,7 @@ fn store_feeds(
     conn: &Connection,
     feeds: &[ParsedEpg],
     updated_at: i64,
+    all_sources_succeeded: bool,
 ) -> Result<(usize, usize), AppError> {
     let custom = crate::settings::get_setting_json::<Vec<ChannelAlias>>(conn, ALIASES_KEY)?
         .into_iter()
@@ -325,8 +398,8 @@ fn store_feeds(
     let tx = conn.unchecked_transaction()?;
     let cutoff = updated_at - CATCHUP_SECONDS;
     tx.execute(
-        "DELETE FROM epg_programs WHERE start < ?1 OR stop > ?2",
-        params![cutoff, updated_at],
+        "DELETE FROM epg_programs WHERE start < ?1 OR (?3 AND stop > ?2)",
+        params![cutoff, updated_at, all_sources_succeeded],
     )?;
     for parsed in feeds {
         for (channel_id, key, tvg_id, prefer_id) in &channels {
@@ -353,8 +426,8 @@ fn store_feeds(
                 {
                     continue;
                 }
-                // A fresh listing supersedes overlapping archived schedules, including retitles.
-                if item.start < updated_at && item.stop > cutoff {
+                // On partial refreshes, preserve other feeds' cached slots until replaced.
+                if !all_sources_succeeded || item.start < updated_at {
                     tx.execute(
                         "DELETE FROM epg_programs WHERE channel_id=?1 AND start<?2 AND stop>?3",
                         params![channel_id, item.stop, item.start],
@@ -375,6 +448,12 @@ fn store_feeds(
             }
         }
     }
+    if programs == 0 {
+        return Err(AppError(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "EPG sources contained no usable listings for the configured channels".into(),
+        ));
+    }
     tx.execute(
         "INSERT INTO settings(key,value) VALUES ('epg_updated_at',?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -384,24 +463,23 @@ fn store_feeds(
     Ok((matched.len(), programs))
 }
 
-async fn fetch_epg(client: &reqwest::Client, url: &str) -> Result<ParsedEpg, AppError> {
+async fn fetch_epg(client: &reqwest::Client, url: &str) -> Result<ParsedEpg, String> {
     let response = client
         .get(url)
+        .timeout(Duration::from_secs(60))
         .send()
         .await
-        .map_err(|error| AppError(axum::http::StatusCode::BAD_GATEWAY, error.to_string()))?;
+        .map_err(|_| "request failed")?;
     if !response.status().is_success() {
-        return Err(AppError(
-            axum::http::StatusCode::BAD_GATEWAY,
-            format!("EPG source returned HTTP {}", response.status()),
-        ));
+        return Err(format!("HTTP {}", response.status().as_u16()));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| AppError(axum::http::StatusCode::BAD_GATEWAY, error.to_string()))?;
-    let body = decode_epg_body(&bytes)?;
-    parse_xmltv(&body)
+    let bytes = response.bytes().await.map_err(|_| "body read failed")?;
+    let body = decode_epg_body(&bytes).map_err(|_| "invalid encoding")?;
+    let parsed = parse_xmltv(&body).map_err(|_| "invalid XMLTV")?;
+    if parsed.programs.is_empty() {
+        return Err("no programme listings".into());
+    }
+    Ok(parsed)
 }
 
 fn decode_epg_body(bytes: &[u8]) -> Result<String, AppError> {
@@ -641,10 +719,187 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 mod tests {
     use super::*;
     use flate2::write::GzEncoder;
-    use std::io::Write;
+    use std::{
+        io::Write,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     fn default_key(name: &str) -> String {
         channel_key(name, &HashMap::new())
+    }
+
+    fn scheduler_state() -> Shared {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE channels (id INTEGER PRIMARY KEY, name TEXT, tvg_id TEXT)",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        crate::settings::init_schema(&conn).unwrap();
+        Arc::new(crate::AppState {
+            db: Mutex::new(conn),
+            epg_refresh: Default::default(),
+            playback_grants: Default::default(),
+            telegram_native: Default::default(),
+            cloud_fixture: None,
+            download_runtime: Default::default(),
+            media_dir: Default::default(),
+            download_dir: Default::default(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            secure_cookie: false,
+        })
+    }
+
+    fn admin() -> AuthUser {
+        AuthUser {
+            id: 1,
+            username: "test".into(),
+            role: "admin".into(),
+        }
+    }
+
+    fn seed_stale_guide(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO channels VALUES (1,'News','news');
+             INSERT INTO settings VALUES ('epg_updated_at','1');
+             INSERT INTO epg_programs VALUES (1,unixepoch(),unixepoch()+3600,'Cached','');",
+        )
+        .unwrap();
+    }
+
+    async fn serve_feed(router: Router) -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (base, server)
+    }
+
+    #[test]
+    fn scheduler_requires_channels_and_includes_the_six_hour_boundary() {
+        let state = scheduler_state();
+        let conn = state.conn().unwrap();
+        let timestamp = EPG_STALE_SECONDS * 3;
+        assert!(!refresh_due(&conn, timestamp).unwrap());
+        conn.execute("INSERT INTO channels VALUES (1,'News','news')", [])
+            .unwrap();
+        assert!(refresh_due(&conn, timestamp).unwrap());
+        conn.execute(
+            "INSERT INTO settings VALUES ('epg_updated_at',?1)",
+            [timestamp.to_string()],
+        )
+        .unwrap();
+        assert!(!refresh_due(&conn, timestamp + EPG_STALE_SECONDS - 1).unwrap());
+        assert!(refresh_due(&conn, timestamp + EPG_STALE_SECONDS).unwrap());
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_fetch_once_while_guide_reads_cached_rows() {
+        let state = scheduler_state();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let requests = hits.clone();
+        let router = Router::new().route(
+            "/feed",
+            get(move || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                async { r#"<tv><programme channel="news" start="20990101000000 +0000" stop="20990101010000 +0000"><title>New</title></programme></tv>"# }
+            }),
+        );
+        let (base, server) = serve_feed(router).await;
+        {
+            let conn = state.conn().unwrap();
+            seed_stale_guide(&conn);
+            store_config(&conn, &format!("{base}/feed")).unwrap();
+        }
+        let query = Query(GuideQuery {
+            start: None,
+            end: None,
+        });
+        let (worker, manual, guide_button, cached) = tokio::join!(
+            biased;
+            scheduled_refresh(&state),
+            refresh(State(state.clone()), admin()),
+            refresh(State(state.clone()), admin()),
+            guide(State(state.clone()), admin(), query),
+        );
+        worker.unwrap();
+        let report = manual.unwrap().0;
+        assert_eq!(report, guide_button.unwrap().0);
+        assert_eq!(report["programs"], 1);
+        assert_eq!(cached.unwrap().0["programs"][0]["title"], "Cached");
+        scheduled_refresh(&state).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let forced = refresh(State(state.clone()), admin()).await.unwrap();
+        assert_eq!(forced.0["matched_channels"], 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_preserves_timestamp_and_data_without_exposing_source_secrets() {
+        let state = scheduler_state();
+        let (base, server) = serve_feed(Router::new().route(
+            "/unmatched",
+            get(|| async { r#"<tv><programme channel="missing" start="20990101000000 +0000" stop="20990101010000 +0000"/></tv>"# }),
+        ))
+        .await;
+        seed_stale_guide(&state.conn().unwrap());
+        for (path, expected) in [
+            ("unavailable", "EPG source 1: HTTP 404"),
+            (
+                "unmatched",
+                "EPG sources contained no usable listings for the configured channels",
+            ),
+        ] {
+            store_config(
+                &state.conn().unwrap(),
+                &format!("{base}/{path}?token=secret"),
+            )
+            .unwrap();
+            let error = scheduled_refresh(&state).await.unwrap_err();
+            assert_eq!(error.1, expected);
+            let conn = state.conn().unwrap();
+            assert_eq!(last_update(&conn).unwrap(), 1);
+            let title: String = conn
+                .query_row("SELECT title FROM epg_programs", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(title, "Cached");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn partial_refresh_keeps_future_listings_from_unavailable_sources() {
+        let state = scheduler_state();
+        let (base, server) = serve_feed(Router::new().route(
+            "/good",
+            get(|| async { r#"<tv><programme channel="news" start="20990101000000 +0000" stop="20990101010000 +0000"><title>New</title></programme></tv>"# }),
+        ))
+        .await;
+        {
+            let conn = state.conn().unwrap();
+            seed_stale_guide(&conn);
+            conn.execute_batch(
+                "INSERT INTO channels VALUES (2,'Sports','sports');
+                 INSERT INTO epg_programs VALUES (2,unixepoch()+7200,unixepoch()+10800,'Sports','');",
+            )
+            .unwrap();
+            store_config(&conn, &format!("{base}/good\n{base}/missing?token=secret")).unwrap();
+        }
+        let report = refresh(State(state.clone()), admin()).await.unwrap().0;
+        assert_eq!(report["errors"], json!(["EPG source 2: HTTP 404"]));
+        let conn = state.conn().unwrap();
+        let titles = conn
+            .prepare("SELECT title FROM epg_programs ORDER BY title")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(titles, ["Cached", "New", "Sports"]);
+        server.abort();
     }
 
     #[test]
@@ -665,13 +920,16 @@ mod tests {
                <programme channel="feed.17" start="19700109080000 +0000" stop="19700109090000 +0000"><title>Wrong title</title></programme>
                <programme channel="feed.17" start="19700111100000 +0000" stop="19700111110000 +0000"><title>Withdrawn future slot</title></programme>"#,
         );
-        assert_eq!(store_feeds(&conn, &[original], now - 3600).unwrap(), (1, 3));
+        assert_eq!(
+            store_feeds(&conn, &[original], now - 3600, true).unwrap(),
+            (1, 3)
+        );
         let revised = feed(
             r#"<programme channel="feed.17" start="19700109081500 +0000" stop="19700109090000 +0000"><title>Corrected</title></programme>"#,
         );
         for _ in 0..2 {
             assert_eq!(
-                store_feeds(&conn, std::slice::from_ref(&revised), now).unwrap(),
+                store_feeds(&conn, std::slice::from_ref(&revised), now, true).unwrap(),
                 (1, 1)
             );
             let titles = conn

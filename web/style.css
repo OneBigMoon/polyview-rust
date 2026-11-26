@@ -2644,7 +2644,7 @@ textarea {
   body.nav-open .sidebar {
     transform: translateX(0);
   }
-  body.nav-open::before {
+  body.nav-open .app-shell::before {
     content: "";
     position: fixed;
     inset: 0;

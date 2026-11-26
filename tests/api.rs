@@ -62,6 +62,8 @@ mod telegram_web_login;
 mod tracking_automation;
 #[path = "cases/tracking_resolve.rs"]
 mod tracking_resolve;
+#[path = "cases/upgrade_compat.rs"]
+mod upgrade_compat;
 #[path = "cases/user_data.rs"]
 mod user_data;
 
@@ -136,6 +138,7 @@ impl TestApp {
         init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
+            epg_refresh: Default::default(),
             playback_grants: Default::default(),
             telegram_native,
             cloud_fixture,

@@ -834,6 +834,7 @@ mod tests {
         crate::init_schema(&conn).unwrap();
         Arc::new(AppState {
             db: Mutex::new(conn),
+            epg_refresh: Default::default(),
             playback_grants: Default::default(),
             telegram_native: Default::default(),
             cloud_fixture: None,

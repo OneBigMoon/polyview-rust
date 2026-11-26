@@ -333,28 +333,29 @@
 
     <dialog id="help-dialog" class="info-dialog" aria-labelledby="help-title">
       <div class="dialog-top">
-        <h2 id="help-title">把好故事，留给大屏幕。</h2>
+        <h2 id="help-title">PolyView 使用帮助</h2>
         <button id="help-close" class="icon-button" aria-label="关闭帮助">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
         </button>
       </div>
       <div class="help-body">
         <p>
-          媒体库播放 NAS
-          媒体目录中的视频。管理员扫描后，所有成员都能观看；收藏、观看进度与追剧清单由每个账户独立保存。
+          <strong>媒体库</strong>　管理员扫描 NAS 媒体目录后，家庭成员即可播放。每个账户分别保存收藏、观看进度和追剧清单。
         </p>
         <p>
-          剧集文件使用
-          <code>剧名 S01E01.mp4</code>
-          格式，可自动整理季度和集数。下载完成后会自动扫描入库。
+          <strong>本地整理</strong>　剧集可按 <code>剧名 S01E01.mp4</code> 命名。在「媒体自动化」启用元数据刮削，可补全海报和简介。启用文件整理后，可按设定的目录模板硬链接或移动影片。
         </p>
         <p>
-          直播支持导入 M3U 频道列表。直播地址需要浏览器能够访问；支持原生 HLS
-          或内置 HLS 播放器。跨域直播源需要允许跨域请求，视频编码仍需设备支持。
+          <strong>在线播放</strong>　在线片源和直播由 PolyView 服务器代理转发，无需源站开放浏览器跨域访问（CORS）。播放编码需设备支持。可为影片设置跳过片头、片尾的时长，剧集播完会自动连播下一集。
         </p>
         <p>
-          下载支持有权保存的 HTTP / HTTPS 视频文件直链和 HLS（.m3u8）地址。 HLS
-          使用服务器上的 FFmpeg 下载合并。磁力链接和 DRM 内容暂不支持。
+          <strong>直播与回看</strong>　管理员可导入 M3U 或分组 TXT 频道列表。节目单保留最近 7 天的记录，支持回看的频道可点选标有「回看」的往期节目。
+        </p>
+        <p>
+          <strong>网盘搜片</strong>　按片名搜索并筛选网盘。对支持的夸克、115 或天翼分享，选择「校验与转存」，再指定保存目录。
+        </p>
+        <p>
+          <strong>下载任务</strong>　可加入有权保存的 HTTP(S) 视频直链或 HLS（.m3u8）地址，完成后自动扫描入库。管理员配置 qBittorrent 或 Transmission 后，获授权的成员也可通过外部下载器添加磁力任务。
         </p>
         <div class="keyboard-help">
           <span><kbd>Tab</kbd> 移动焦点</span><span><kbd>Enter</kbd> 确认</span

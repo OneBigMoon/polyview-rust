@@ -83,6 +83,7 @@ pub(crate) struct NativeAccount {
 pub(super) enum AuthState {
     Starting,
     Phone,
+    Code,
     Qr(String),
     Password,
     Ready,
@@ -397,6 +398,30 @@ impl NativeClient {
         Ok(())
     }
 
+    #[cfg(unix)]
+    pub(super) async fn submit_factor(
+        &self,
+        stage: &AuthState,
+        input: String,
+    ) -> Result<(), AppError> {
+        if self.verifier.is_some() || *self.auth.borrow() != *stage {
+            return Err(denied());
+        }
+        let (method, field) = match stage {
+            AuthState::Phone => ("setAuthenticationPhoneNumber", "phone_number"),
+            AuthState::Code => ("checkAuthenticationCode", "code"),
+            AuthState::Password => ("checkAuthenticationPassword", "password"),
+            _ => return Err(denied()),
+        };
+        let mut request = json!({"@type":method});
+        request[field] = Value::String(input);
+        let reply = self.call(request, RPC_TIMEOUT).await?;
+        if reply["@type"] != "ok" {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
     async fn call(&self, value: Value, timeout: Duration) -> Result<Value, AppError> {
         if self.stop.load(Ordering::Acquire) != ACTIVE {
             return Err(unavailable());
@@ -566,6 +591,42 @@ impl NativeRuntime {
         self.stop(user_id, attempt, ABANDON).await;
     }
 
+    // The terminal owns its runtime. Wait for TDLib to release this exact
+    // database before publishing the binding to the independent HTTP process.
+    #[cfg(unix)]
+    pub(super) async fn release_session(&self, account: &NativeAccount) -> Result<(), AppError> {
+        self.close(account.user_id, account.attempt).await;
+        let entry = self.take_finished(account)?.ok_or_else(unavailable)?;
+        let clean = *entry.client.auth.borrow() == AuthState::Closed;
+        entry.worker.join().map_err(|_| unavailable())?;
+        if clean { Ok(()) } else { Err(unavailable()) }
+    }
+
+    #[cfg(unix)]
+    fn take_finished(&self, account: &NativeAccount) -> Result<Option<Entry>, AppError> {
+        let mut entries = self.entries.lock().map_err(|_| unavailable())?;
+        let key = (account.user_id, account.attempt);
+        if entries.get(&key).is_some_and(|entry| !*entry.done.borrow()) {
+            return Err(unavailable());
+        }
+        Ok(entries.remove(&key))
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn discard_session(&self, account: &NativeAccount) {
+        self.abandon(account.user_id, account.attempt).await;
+        if let Ok(Some(entry)) = self.take_finished(account) {
+            let _ = entry.worker.join();
+            // Transport failures may exit before run_client can perform its
+            // normal logout cleanup. Remove only this stopped enrollment's DB.
+            if *entry.client.auth.borrow() == AuthState::Failed
+                && let Ok(dir) = session_dir(&self.data_dir, account)
+            {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+
     async fn stop(&self, user_id: i64, attempt: Uuid, mode: u8) {
         let done = self.entries.lock().ok().and_then(|entries| {
             let entry = entries.get(&(user_id, attempt))?;
@@ -631,6 +692,7 @@ fn auth_state(state: &Value) -> AuthState {
     match state["@type"].as_str() {
         Some("authorizationStateWaitTdlibParameters") => AuthState::Starting,
         Some("authorizationStateWaitPhoneNumber") => AuthState::Phone,
+        Some("authorizationStateWaitCode") => AuthState::Code,
         Some("authorizationStateWaitOtherDeviceConfirmation") => {
             let link = state["link"].as_str().unwrap_or_default();
             if link.strip_prefix("tg://login?token=").is_some_and(|token| {
@@ -693,7 +755,10 @@ fn run_client(
             close_deadline = Instant::now() + CLOSE_TIMEOUT;
         }
         if closing != ACTIVE && Instant::now() >= close_deadline {
-            if closing != ABANDON || destroyed {
+            if closing == CLOSE {
+                return Err(expired());
+            }
+            if destroyed {
                 break;
             }
             transport.send(json!({"@type":"destroy","@extra":"shutdown"}))?;

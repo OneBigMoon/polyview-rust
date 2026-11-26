@@ -1,3 +1,16 @@
+#[cfg(unix)]
+#[path = "terminal.rs"]
+mod terminal;
+#[cfg(unix)]
+pub use terminal::terminal_login;
+
+#[cfg(not(unix))]
+pub async fn terminal_login(
+    _: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("Native terminal enrollment requires a Unix controlling terminal".into())
+}
+
 use super::native::{AuthState, NativeAccount};
 use crate::{
     AppError, Shared,
@@ -67,7 +80,7 @@ pub(crate) fn restore_config(conn: &Connection, config: NativeBackup) -> Result<
     validate_config(conn, &config)?;
     if export_config(conn)? != config {
         conn.execute(
-            "UPDATE native_telegram_accounts SET phase='expired' WHERE phase IN ('confirm','scan')",
+            "UPDATE native_telegram_accounts SET phase='expired' WHERE phase IN ('confirm','scan','terminal','claimed')",
             [],
         )?;
         set_setting_json(conn, SETTINGS, &config)?;
@@ -145,11 +158,17 @@ async fn save_config(
 }
 
 fn status(phase: &str) -> Json<Value> {
+    let phase = if phase == "claimed" {
+        "terminal"
+    } else {
+        phase
+    };
     let message = match phase {
         "unconfigured" => "请管理员先配置 Telegram API ID 和 Hash。",
-        "idle" => "可以申请在主机桌面授权。",
+        "idle" => "可以申请在主机授权。",
         "confirm" => "请在主机桌面核对并确认 PolyView 成员名称和编号。",
         "scan" => "请使用 Telegram 官方手机应用的设备扫码功能扫描主机屏幕，并在主机确认账户绑定。",
+        "terminal" => "请在运行 PolyView 的主机终端核对成员身份并完成授权。",
         "authorized" => "Telegram 账户已绑定。",
         "official" => "Telegram 要求额外验证。本次授权已停止，请使用官方客户端在本机完成验证。",
         "expired" => "本次授权已过期，请重新申请。",
@@ -186,7 +205,11 @@ async fn bound_status(
             };
             Some(id)
         }
-        AuthState::Phone | AuthState::Password | AuthState::Unsupported | AuthState::Qr(_) => None,
+        AuthState::Phone
+        | AuthState::Code
+        | AuthState::Password
+        | AuthState::Unsupported
+        | AuthState::Qr(_) => None,
         _ => return Ok(status("error")),
     };
     {
@@ -232,16 +255,16 @@ async fn login(
         }
     }
     let mut conn = state.conn()?;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let user = super::signed_in(&tx, &headers)?;
     let config = export_config(&tx)?;
     if !config.configured() {
         return Ok(status("unconfigured"));
     }
     let now = crate::now();
-    tx.execute("UPDATE native_telegram_accounts SET phase='expired' WHERE phase IN ('confirm','scan') AND expires_at<=?", [now])?;
+    tx.execute("UPDATE native_telegram_accounts SET phase='expired' WHERE phase IN ('confirm','scan','terminal','claimed') AND expires_at<=?", [now])?;
     if parts.method == Method::DELETE {
-        tx.execute("UPDATE native_telegram_accounts SET phase='idle' WHERE user_id=? AND phase IN ('confirm','scan')", [user.id])?;
+        tx.execute("UPDATE native_telegram_accounts SET phase='idle' WHERE user_id=? AND phase IN ('confirm','scan','terminal','claimed')", [user.id])?;
     }
     let phase: String = tx
         .query_row(
@@ -251,11 +274,16 @@ async fn login(
         )
         .optional()?
         .unwrap_or_else(|| "idle".into());
-    if parts.method != Method::POST || matches!(phase.as_str(), "confirm" | "scan" | "authorized") {
+    if parts.method != Method::POST
+        || matches!(
+            phase.as_str(),
+            "confirm" | "scan" | "terminal" | "claimed" | "authorized"
+        )
+    {
         tx.commit()?;
         return Ok(status(&phase));
     }
-    let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM native_telegram_accounts WHERE phase IN ('confirm','scan')) OR EXISTS(SELECT 1 FROM native_telegram_host_gate WHERE last_started>?)", [now-COOLDOWN], |r| r.get(0))?;
+    let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM native_telegram_accounts WHERE phase IN ('confirm','scan','terminal','claimed')) OR EXISTS(SELECT 1 FROM native_telegram_host_gate WHERE last_started>?)", [now-COOLDOWN], |r| r.get(0))?;
     if busy {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
@@ -270,16 +298,24 @@ async fn login(
         api_hash: config.api_hash,
     };
     let attempt = account.attempt.to_string();
-    tx.execute("INSERT INTO native_telegram_accounts(user_id,account_key,attempt,phase,expires_at) VALUES(?,?,?,'confirm',?)
-        ON CONFLICT(user_id) DO UPDATE SET account_key=excluded.account_key,attempt=excluded.attempt,phase='confirm',telegram_id=NULL,expires_at=excluded.expires_at", params![user.id,account.account_key.to_string(),attempt,now+LIFETIME])?;
+    let prompt = prompt.map(|ext| ext.0).unwrap_or_default();
+    let desktop = cfg!(target_os = "macos") || prompt.helper().is_some();
+    let phase = if !cfg!(unix) || desktop {
+        "confirm"
+    } else {
+        "terminal"
+    };
+    tx.execute("INSERT INTO native_telegram_accounts(user_id,account_key,attempt,phase,expires_at) VALUES(?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET account_key=excluded.account_key,attempt=excluded.attempt,phase=excluded.phase,telegram_id=NULL,expires_at=excluded.expires_at", params![user.id,account.account_key.to_string(),attempt,phase,now+LIFETIME])?;
     tx.execute(
         "INSERT OR REPLACE INTO native_telegram_host_gate VALUES(1,?)",
         [now],
     )?;
     tx.commit()?;
-    let prompt = prompt.map(|ext| ext.0).unwrap_or_default();
-    tokio::spawn(run(state.clone(), user, account, prompt));
-    Ok(status("confirm"))
+    if phase == "confirm" {
+        tokio::spawn(run(state.clone(), user, account, prompt));
+    }
+    Ok(status(phase))
 }
 
 // This is a host-side dependency. HTTP handlers never accept executable paths,
@@ -292,13 +328,17 @@ impl HostPrompt {
         Self(Some(path))
     }
 
+    fn helper(&self) -> Option<PathBuf> {
+        self.0.clone().or_else(|| {
+            std::env::var_os("POLYVIEW_TELEGRAM_HOST_HELPER")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        })
+    }
+
     async fn dialog(&self, member: &AuthUser, event: &str, value: Value) -> Result<bool, AppError> {
         let error = || AppError::internal("Local Telegram dialog unavailable");
-        let helper = self
-            .0
-            .clone()
-            .or_else(|| std::env::var_os("POLYVIEW_TELEGRAM_HOST_HELPER").map(PathBuf::from));
-        let mut cmd = match helper {
+        let mut cmd = match self.helper() {
             Some(path) if path.is_absolute() => Command::new(path),
             None if cfg!(target_os = "macos") => {
                 let mut cmd = Command::new("/usr/bin/osascript");
@@ -520,7 +560,9 @@ async fn authorize(
                 }
                 return Ok(id);
             }
-            AuthState::Password | AuthState::Unsupported => return Err("official"),
+            AuthState::Code | AuthState::Password | AuthState::Unsupported => {
+                return Err("official");
+            }
             _ => return Err("error"),
         }
         auth.changed().await.map_err(|_| "error")?;

@@ -3493,6 +3493,7 @@
       unconfigured: "请管理员先在 Telegram 原生 API 设置中配置凭据。",
       idle: "连接自己的 Telegram 账户后，可浏览频道视频和资源。",
       confirm: `请在运行 PolyView 的电脑桌面核对账户 ${state.user?.username || ""}（${state.user?.id}），确认是本人发起的连接。`,
+      terminal: `请在 NAS 本地终端为账户 ${state.user?.username || ""}（${state.user?.id}）完成授权。Docker Compose 命令：docker compose exec polyview polyview telegram-native-login --member-id ${state.user?.id}`,
       scan: "请在手机 Telegram 的「设置 → 设备 → 连接桌面设备」中，扫描 PolyView 宿主机桌面显示的二维码，再在宿主机确认绑定的账户。",
       official: "本次原生连接已停止。请在官方 Telegram 客户端完成额外验证。该客户端的会话独立于 PolyView。若扫码仍要求两步密码，可通过下方 tdl 方式在宿主机授权，导入单条视频。",
       authorized: "已连接 Telegram。", declined: "宿主机已拒绝此次连接。",
@@ -3512,7 +3513,7 @@
         const result = await api(path, { method });
         if (!active()) return;
         status.textContent = labels[result.state] || labels.error;
-        if (["confirm", "scan"].includes(result.state)) {
+        if (["confirm", "scan", "terminal"].includes(result.state)) {
           actions.append(button("取消连接申请", "subtle", () => load("DELETE")));
           timer = setTimeout(() => load(), 2500);
         } else if (result.state === "authorized") {
@@ -5136,7 +5137,7 @@
   });
   document.addEventListener("click", (event) => {
     if (
-      event.target === document.body &&
+      event.target === $("app-shell") &&
       document.body.classList.contains("nav-open")
     )
       setNavigation(false);
