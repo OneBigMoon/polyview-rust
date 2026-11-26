@@ -343,7 +343,12 @@
         type: "button",
         class: "poster-button",
         "aria-label": `播放 ${item.title}`,
-        on: { click: () => play(item) },
+        on: { click: () => {
+          const key = item.kind === "episode" && seriesKey(item);
+          if (!key) return play(item);
+          const episodes = state.library.filter((entry) => entry.kind === "episode" && seriesKey(entry) === key);
+          play(item, false, episodes, episodes.indexOf(item));
+        } },
       },
       make("div", { class: `poster-art tone-${index % 6}` }, [
         make("span", { class: "poster-label", text: label }),
@@ -733,6 +738,95 @@
       player.sources.length;
     attachPlayerSource();
   }
+  function skipKey(item) {
+    if (item.source_id != null && item.media_id != null) return `online:${item.source_id}:${item.media_id}`;
+    return !item.remote_url && item.id != null ? `local:${item.id}` : null;
+  }
+  const pendingSkipWrites = new Map();
+  function skipPanel(key, player = null) {
+    const enabled = make("input", { type: "checkbox" });
+    const seconds = (name) => make("input", { type: "number", name, min: 0, max: 600, step: "any", required: true, value: 0 });
+    const intro = seconds("intro_sec");
+    const outro = seconds("outro_sec");
+    const message = make("span", { class: "hint", role: "status" });
+    const fields = make("fieldset", { class: "skip-fields", disabled: true, "aria-label": "跳过设置" }, [
+      make("label", { class: "checkbox-label" }, [enabled, "启用自动跳过"]),
+      make("label", {}, ["片头（秒）", intro]),
+      make("label", {}, ["片尾（秒）", outro]),
+    ]);
+    function apply(config) {
+      enabled.checked = Boolean(config?.enabled);
+      intro.value = config?.intro_sec ?? 0;
+      outro.value = config?.outro_sec ?? 0;
+      if (player && state.player === player) {
+        player.skip = { enabled: enabled.checked, intro_sec: Number(intro.value), outro_sec: Number(outro.value) };
+        skipIntro(player);
+      }
+    }
+    async function save() {
+      if (fields.disabled) return;
+      const config = { media_key: key, enabled: enabled.checked, intro_sec: Number(intro.value), outro_sec: Number(outro.value) };
+      const validSeconds = (value) => Number.isFinite(value) && value >= 0 && value <= 600;
+      if (!intro.value || !outro.value || !validSeconds(config.intro_sec) || !validSeconds(config.outro_sec)) {
+        message.textContent = "片头和片尾须在 0 到 600 秒之间。";
+        return;
+      }
+      fields.disabled = true;
+      const write = api("/api/skip", { method: "PUT", body: config });
+      pendingSkipWrites.set(key, write);
+      try {
+        await write;
+        apply(config);
+        message.textContent = "已保存跳过设置";
+      } catch (error) { message.textContent = error.message; }
+      finally {
+        if (pendingSkipWrites.get(key) === write) pendingSkipWrites.delete(key);
+        fields.disabled = false;
+      }
+    }
+    if (player) {
+      function mark(input) {
+        const video = $("video-player");
+        if (state.player !== player || !player.metadataReady || !Number.isFinite(video.duration)) {
+          message.textContent = "请等待视频载入。";
+          return;
+        }
+        const value = input === intro ? video.currentTime : video.duration - video.currentTime;
+        input.value = Math.round(value * 1000) / 1000;
+        return save();
+      }
+      fields.append(button("设当前时间为片头", "subtle small-button", () => mark(intro)),
+        button("设当前剩余为片尾", "subtle small-button", () => mark(outro)));
+    }
+    fields.append(button("保存跳过设置", "primary small-button", save));
+    const retry = button("重新读取", "subtle small-button", load, { hidden: true });
+    async function load() {
+      retry.hidden = true;
+      try {
+        // The detail panel may still be saving as playback starts.
+        const pending = pendingSkipWrites.get(key);
+        if (pending) await pending.catch(() => {});
+        apply(await api(`/api/skip?key=${encodeURIComponent(key)}`));
+        fields.disabled = false;
+        message.textContent = "";
+      } catch (error) {
+        message.textContent = error.message;
+        retry.hidden = false;
+      }
+    }
+    load();
+    return make("details", { class: "skip-panel" }, [make("summary", { text: "跳过片头/片尾" }), fields, message, retry]);
+  }
+  function skipIntro(player) {
+    const video = $("video-player");
+    if (!player.metadataReady || !player.skip || player.introChecked || !Number.isFinite(video.duration) || video.duration <= 0) return;
+    player.introChecked = true;
+    const { enabled, intro_sec } = player.skip;
+    if (enabled && video.currentTime < intro_sec && intro_sec < video.duration) {
+      video.currentTime = intro_sec;
+      toast("已跳过片头");
+    }
+  }
   function attachPlayerSource() {
     const player = state.player;
     if (!player) return;
@@ -824,6 +918,8 @@
           (player.item.remote_url ? n(player.item.position) < video.duration : n(player.item.position) < video.duration - 1)
         )
           video.currentTime = player.item.position;
+        player.metadataReady = true;
+        skipIntro(player);
         if (!hlsSource || nativeHls || !state.hls) startPlayback();
       };
   }
@@ -903,6 +999,9 @@
       errorShown: false,
       guideCollapsed: false,
       guideAvailable: false,
+      metadataReady: false,
+      introChecked: false,
+      finishing: false,
     };
     $("player-title").textContent = item.title || item.name || "正在播放";
     $("player-kind").textContent = live
@@ -920,6 +1019,10 @@
     updatePlayerControls();
     $("player-hud-title").textContent = $("player-title").textContent;
     $("player-hud-kind").textContent = $("player-kind").textContent;
+    const key = live ? null : skipKey(item);
+    const skipHost = $("player-skip");
+    skipHost.hidden = !key;
+    skipHost.replaceChildren(...(key ? [skipPanel(key, state.player)] : []));
     attachPlayerSource();
   }
 
@@ -945,7 +1048,7 @@
     if (!force && Date.now() - current.lastSaved < 10000) return;
     const item = current.item;
     const remote = Boolean(item.remote_url);
-    const completed = video.ended || video.currentTime / video.duration > 0.9;
+    const completed = current.finishing || video.ended || video.currentTime / video.duration > 0.9;
     let trackingSave;
     if (remote && item.tracking_id && completed && !item.marked_watched) {
       item.marked_watched = true;
@@ -960,7 +1063,7 @@
     }
     if (remote && (item.source_id == null || item.media_id == null)) return trackingSave;
     const body = {
-      position: Math.min(video.duration, Math.max(0, n(video.currentTime))),
+      position: current.finishing ? video.duration : Math.min(video.duration, Math.max(0, n(video.currentTime))),
       duration: video.duration,
       ...(remote ? {
         source_id: item.source_id,
@@ -1152,7 +1255,7 @@
           },
           [
             channel.logo
-              ? make("img", { class: "epg-logo", src: channel.logo, alt: "" })
+              ? posterImage(channel.logo, { class: "epg-logo" })
               : make("span", { class: "epg-logo", text: "◉" }),
             make("span", { class: "epg-channel-copy" }, [
               make("strong", { text: channel.name }),
@@ -1497,16 +1600,23 @@
     });
     return changed;
   };
+  function posterImage(src, attrs = {}) {
+    const image = make("img", { alt: "", loading: "lazy", referrerpolicy: "no-referrer", ...attrs });
+    let retried = false;
+    image.addEventListener("error", () => {
+      if (retried) {
+        image.remove();
+        return;
+      }
+      retried = true;
+      image.setAttribute("src", `/api/image?url=${encodeURIComponent(src)}`);
+    });
+    image.setAttribute("src", src);
+    return image;
+  }
   const updateCatalogCard = (card, item) => {
     if (item.cover && !card._cover && card._art) {
-      const image = make("img", {
-        src: item.cover,
-        alt: "",
-        loading: "lazy",
-        referrerpolicy: "no-referrer",
-      });
-      image.addEventListener("error", () => image.remove());
-      card._art.prepend(image);
+      card._art.prepend(posterImage(item.cover));
       card._cover = item.cover;
     }
     const quality = sourceQuality(item.sources?.[0] || item);
@@ -1581,18 +1691,7 @@
     const paint = () => {
       const group = items[active];
       if (!group) return;
-      art.replaceChildren(
-        ...(group.cover
-          ? [
-              make("img", {
-                src: group.cover,
-                alt: "",
-                loading: "lazy",
-                referrerpolicy: "no-referrer",
-              }),
-            ]
-          : []),
-      );
+      art.replaceChildren(...(group.cover ? [posterImage(group.cover)] : []));
       title.textContent = displayCatalogTitle(group.title, group.year);
       const quality = sourceQuality(group.sources?.[0] || group);
       meta.textContent = [
@@ -1646,7 +1745,7 @@
   function savedCard(item, index, playLabel, onPlay, removeLabel, onRemove) {
     const title = item.title || item.name;
     const art = make("div", { class: `poster-art tone-${index % 6}` }, [
-      item.cover || item.logo ? make("img", { src: item.cover || item.logo, alt: "", loading: "lazy", referrerpolicy: "no-referrer" }) : null,
+      item.cover || item.logo ? posterImage(item.cover || item.logo) : null,
       make("span", { class: "poster-name", text: title }),
       item.duration > 0 ? make("progress", { class: "media-progress", max: item.duration, value: item.position || 0 }) : null,
     ]);
@@ -2129,14 +2228,7 @@
       ...[
         (() => {
           const art = make("div", { class: "catalog-hero-art tone-2" });
-          if (item.cover)
-            art.append(
-              make("img", {
-                src: item.cover,
-                alt: "",
-                referrerpolicy: "no-referrer",
-              }),
-            );
+          if (item.cover) art.append(posterImage(item.cover, { loading: "eager" }));
           return make("section", { class: "catalog-hero" }, [
             art,
             make("div", { class: "catalog-hero-shade" }),
@@ -2261,6 +2353,7 @@
                 text: tracked.auto_download ? "自动下载已开启" : "已订阅更新",
               }),
         ]),
+        skipPanel(skipKey(favoriteData)),
       );
       if (!detail.groups.length) {
         content.append(
@@ -2626,12 +2719,7 @@
           }, [
             make("span", { class: "series-cover" },
               subscription.cover
-                ? make("img", {
-                    src: subscription.cover,
-                    alt: "",
-                    loading: "lazy",
-                    referrerpolicy: "no-referrer",
-                  })
+                ? posterImage(subscription.cover)
                 : "▤",
             ),
             make("div", { class: "series-info" }, [
@@ -3040,6 +3128,82 @@
     );
     return panel;
   }
+  const sourceAdvancedFields = [
+    ["custom_ua", "User-Agent"], ["custom_referer", "Referer"],
+    ["custom_cookie", "Cookie", "password"], ["proxy_url", "代理地址"],
+    ["timeout_secs", "超时（秒）", "number"], ["searchable", "允许搜索", "checkbox"],
+  ];
+  function settingsFields(definitions, values) {
+    const inputs = definitions.map(([name, label, type = "text"]) => {
+      const attrs = { name, type };
+      if (type === "checkbox") attrs.checked = Boolean(values[name]);
+      else attrs.value = values[name] ?? "";
+      if (type === "number") Object.assign(attrs, { min: 3, max: 60, required: true });
+      const input = make("input", attrs);
+      return { name, type, input, label: make("label", { class: type === "checkbox" ? "checkbox-label" : "" },
+        type === "checkbox" ? [input, label] : [label, input]) };
+    });
+    return {
+      labels: inputs.map((field) => field.label),
+      values: () => Object.fromEntries(inputs.map(({ name, type, input }) => [name,
+        type === "checkbox" ? Boolean(input.checked) : type === "number" ? Number(input.value) : input.value.trim(),
+      ])),
+    };
+  }
+  async function networkSettings() {
+    const panel = make("section", { class: "network-settings" }, make("h3", { text: "播放与网络" }));
+    try {
+      const fields = settingsFields([
+        ["ad_block", "HLS 保守去广告", "checkbox"], ["play_referer", "播放 Referer"],
+        ["play_ua", "播放 User-Agent"], ["image_referer", "图片 Referer"],
+      ], await api("/api/settings/play"));
+      panel.append(make("form", { class: "form-row", on: { submit: async (event) => {
+        event.preventDefault();
+        try {
+          await api("/api/settings/play", { method: "PUT", body: fields.values() });
+          toast("播放与网络设置已保存");
+        } catch (error) { toast(error.message, true); }
+      } } }, [...fields.labels, button("保存播放设置", "primary", null, { type: "submit" })]));
+    } catch (error) { panel.append(make("p", { class: "form-error", text: error.message })); }
+    return panel;
+  }
+  function sourceHealth(source) {
+    const ok = source.last_probe_ok, ms = source.last_latency_ms;
+    const color = ok == null ? "unknown" : !ok ? "failed" : ms == null ? "unknown" : ms < 500 ? "fast" : ms < 1500 ? "medium" : "slow";
+    const text = ok == null ? "未测速" : !ok ? "测速失败" : ms == null ? "可用" : `${ms} ms`;
+    return make("span", { class: `source-health ${color}`, text:
+      source.cooldown_until > Date.now() / 1000 ? `${text} · 冷却中` : text });
+  }
+  function sourceBatchDialog(sources) {
+    const data = make("textarea", { rows: 10, "aria-label": "影视源 JSON", spellcheck: "false" });
+    const title = make("h3");
+    const dialog = make("dialog", { class: "info-dialog source-batch-dialog", "aria-labelledby": "source-batch-title" });
+    title.setAttribute("id", "source-batch-title");
+    const submit = button("确认导入", "primary", async () => {
+      submit.disabled = true;
+      try {
+        const rows = JSON.parse(data.value);
+        if (!Array.isArray(rows)) throw new Error("请粘贴影视源 JSON 数组");
+        const result = await api("/api/sources/batch", { method: "POST", body: rows });
+        dialog.close();
+        toast(`已导入 ${result.imported} 个，跳过 ${result.skipped} 个`);
+        render();
+      } catch (error) { toast(error.message, true); }
+      finally { submit.disabled = false; }
+    });
+    dialog.append(title, data, submit, button("关闭", "subtle", () => dialog.close()));
+    function open(exporting) {
+      const keys = ["name", "url", "enabled", "adult", "priority", ...sourceAdvancedFields.map(([key]) => key)];
+      title.textContent = exporting ? "导出影视源 JSON" : "导入影视源 JSON";
+      data.value = exporting ? JSON.stringify(sources.map((source) =>
+        Object.fromEntries(keys.map((key) => [key, source[key]]))), null, 2) : "";
+      data.readOnly = exporting;
+      submit.hidden = exporting;
+      dialog.showModal();
+      if (exporting) data.select?.();
+    }
+    return [button("导入 JSON", "subtle", () => open(false)), button("导出 JSON", "subtle", () => open(true)), dialog];
+  }
   async function sourceSettings() {
     const panel = make("section", { class: "panel source-settings" }, [
       make("h2", { text: "在线影视源" }),
@@ -3093,6 +3257,16 @@
           text: "关闭后成人源不会出现在浏览、搜索和电视端。只有管理员能修改。",
         }),
       );
+      function advancedEditor(source = {}) {
+        const fields = settingsFields(sourceAdvancedFields, { searchable: true, timeout_secs: 12, ...source });
+        return {
+          values: fields.values,
+          panel: make("details", { class: "source-advanced" }, [
+            make("summary", { text: "高级配置" }), make("div", { class: "form-row" }, fields.labels),
+          ]),
+        };
+      }
+      const newAdvanced = advancedEditor();
       const newForm = make(
         "form",
         {
@@ -3110,6 +3284,7 @@
                     name: form.elements.name.value.trim(),
                     url: form.elements.url.value.trim(),
                     adult: form.elements.adult.checked,
+                    ...newAdvanced.values(),
                   },
                 });
                 toast("影视源已添加");
@@ -3141,11 +3316,33 @@
             make("input", { type: "checkbox", name: "adult" }),
             "成人源",
           ]),
+          newAdvanced.panel,
           button("添加影视源", "primary", null, { type: "submit" }),
         ],
       );
       panel.append(newForm);
-      sources.forEach((source) => {
+      const badges = new Map();
+      const probe = async (source) => {
+        try {
+          const results = await api("/api/sources/probe", { method: "POST", body: source ? { source_id: source.id } : {} });
+          const updated = await api("/api/sources");
+          updated.forEach((item) => badges.get(item.id)?.replaceChildren(sourceHealth(item)));
+          toast(`测速完成：${results.filter((result) => result.ok).length} / ${results.length} 个可用`);
+        } catch (error) { toast(error.message, true); }
+      };
+      panel.append(make("div", { class: "form-row" }, [button("全部测速", "subtle", () => probe()), ...sourceBatchDialog(sources)]));
+      const move = async (index, offset) => {
+        const ids = sources.map((source) => source.id);
+        [ids[index], ids[index + offset]] = [ids[index + offset], ids[index]];
+        try {
+          await api("/api/sources/reorder", { method: "POST", body: { ids } });
+          await render();
+        } catch (error) { toast(error.message, true); }
+      };
+      sources.forEach((source, index) => {
+        const badge = make("span", {}, sourceHealth(source));
+        badges.set(source.id, badge);
+        const advanced = advancedEditor(source);
         const name = make("input", {
           name: "name",
           value: source.name,
@@ -3177,15 +3374,13 @@
               submit: async (event) => {
                 event.preventDefault();
                 try {
-                  await api(`/api/sources/${source.id}`, {
-                    method: "PUT",
-                    body: {
-                      name: name.value.trim(),
-                      url: url.value.trim(),
-                      enabled: enabled.checked,
-                      adult: adult.checked,
-                    },
-                  });
+                  const body = {
+                    name: name.value.trim(), url: url.value.trim(),
+                    enabled: enabled.checked, adult: adult.checked,
+                    priority: source.priority, ...advanced.values(),
+                  };
+                  await api(`/api/sources/${source.id}`, { method: "PUT", body });
+                  Object.assign(source, body);
                   toast("影视源已保存");
                 } catch (error) {
                   toast(error.message, true);
@@ -3198,6 +3393,11 @@
             url,
             make("label", { class: "checkbox-label" }, [enabled, "启用"]),
             make("label", { class: "checkbox-label" }, [adult, "成人源"]),
+            badge,
+            button("测速", "subtle small-button", () => probe(source)),
+            button("上移", "subtle small-button", () => move(index, -1), { disabled: index === 0 }),
+            button("下移", "subtle small-button", () => move(index, 1), { disabled: index === sources.length - 1 }),
+            advanced.panel,
             button("保存", "subtle small-button", null, { type: "submit" }),
             button("移除", "danger small-button", async () => {
               if (
@@ -3228,6 +3428,7 @@
     } catch (error) {
       panel.append(make("p", { class: "form-error", text: error.message }));
     }
+    panel.append(await networkSettings());
     return panel;
   }
   async function tvboxSettings() {
@@ -3897,21 +4098,41 @@
   for (const event of ["play", "pause", "volumechange"])
     $("video-player").addEventListener(event, updatePlayerControls);
 
-  $("video-player").addEventListener("timeupdate", () => saveProgress());
-  $("video-player").addEventListener("pause", () => saveProgress(true));
-  $("video-player").addEventListener("ended", async () => {
+  $("video-player").addEventListener("timeupdate", () => {
     const player = state.player;
-    await saveProgress(true);
-    if (
-      player &&
-      player === state.player &&
-      !player.live &&
-      player.playlist?.length &&
-      player.playlistIndex < player.playlist.length - 1
-    ) {
-      toast("即将播放下一集");
-      playPlaylist(1, true);
+    if (!player?.metadataReady || player.live || player.finishing) return;
+    const video = $("video-player");
+    skipIntro(player);
+    const config = player.skip;
+    if (config?.enabled && config.outro_sec > 0 && !video.paused && !video.ended &&
+        Number.isFinite(video.duration) && video.duration > config.intro_sec + config.outro_sec + 30 &&
+        video.currentTime >= video.duration - config.outro_sec && video.currentTime < video.duration) {
+      return finishEpisode(true);
     }
+    return saveProgress();
+  });
+  $("video-player").addEventListener("pause", () => {
+    if (state.player?.metadataReady) return saveProgress(true);
+  });
+  async function finishEpisode(skippedOutro) {
+    const player = state.player;
+    if (!player || player.live || player.finishing) return;
+    player.finishing = true;
+    try {
+      if (skippedOutro) {
+        const video = $("video-player");
+        video.currentTime = video.duration;
+        toast("已跳过片尾");
+      }
+      await saveProgress(true);
+      if (player === state.player && player.playlistIndex < player.playlist.length - 1) {
+        toast(skippedOutro ? "已跳过片尾，正在播放下一集" : "即将播放下一集");
+        playPlaylist(1, true);
+      }
+    } finally { player.finishing = false; }
+  }
+  $("video-player").addEventListener("ended", () => {
+    if ($("video-player").ended) return finishEpisode(false);
   });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) saveProgress(true, true);

@@ -1,4 +1,4 @@
-use crate::{AppError, Shared, auth::AuthUser};
+use crate::{AppError, Shared, auth::AuthUser, settings::play_settings};
 use axum::{
     Router,
     body::Body,
@@ -14,9 +14,12 @@ use url::Url;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PLAYLIST_BYTES: usize = 2 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn router() -> Router<Shared> {
-    Router::new().route("/api/playback", get(proxy))
+    Router::new()
+        .route("/api/playback", get(proxy))
+        .route("/api/image", get(image))
 }
 
 #[derive(Deserialize)]
@@ -60,7 +63,11 @@ fn proxy_url(base: &Url, raw: &str) -> Result<String, AppError> {
     Ok(format!("/api/playback?{query}"))
 }
 
-fn rewrite_playlist(bytes: &[u8], base: &Url) -> Result<String, AppError> {
+fn cue_out(line: &str) -> bool {
+    line == "#EXT-X-CUE-OUT" || line.starts_with("#EXT-X-CUE-OUT:")
+}
+
+fn rewrite_playlist(bytes: &[u8], base: &Url, ad_block: bool) -> Result<String, AppError> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| source_error("HLS playlist is not valid UTF-8"))?;
     let text = text.trim_start_matches('\u{feff}').trim_start();
@@ -68,8 +75,36 @@ fn rewrite_playlist(bytes: &[u8], base: &Url) -> Result<String, AppError> {
         return Err(source_error("Source did not return an HLS playlist"));
     }
     let mut output = String::with_capacity(text.len());
-    for raw_line in text.lines() {
+    let mut lines = text.lines();
+    let mut preserve = 0;
+    while let Some(raw_line) = lines.next() {
         let line = raw_line.trim();
+        if preserve > 0 {
+            preserve -= 1;
+        } else if ad_block && cue_out(line) {
+            // Commit the skip only after finding a single unambiguous cue pair.
+            let mut ahead = lines.clone();
+            let mut depth = 1;
+            let mut nested = false;
+            for candidate in ahead.by_ref() {
+                preserve += 1;
+                let candidate = candidate.trim();
+                if cue_out(candidate) {
+                    depth += 1;
+                    nested = true;
+                } else if candidate == "#EXT-X-CUE-IN" {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if depth == 0 && !nested {
+                lines = ahead;
+                preserve = 0;
+                continue;
+            }
+        }
         if line.is_empty() {
             output.push('\n');
             continue;
@@ -157,6 +192,83 @@ fn binary_content_type(upstream: &HeaderMap) -> Result<HeaderValue, AppError> {
     ))
 }
 
+fn configured_header(value: &str) -> Option<HeaderValue> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    HeaderValue::from_str(value).ok()
+}
+
+async fn image(
+    State(state): State<Shared>,
+    _user: AuthUser,
+    Query(query): Query<PlaybackQuery>,
+) -> Result<Response, AppError> {
+    let url = http_url(&query.url)?;
+    let settings = play_settings(&*state.conn()?)?;
+    let referer = configured_header(&settings.image_referer)
+        .or_else(|| configured_header(&url[..url::Position::BeforePath]))
+        .ok_or_else(|| source_error("Invalid image origin"))?;
+    let upstream = state
+        .client
+        .get(url)
+        .header(header::REFERER, referer)
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| source_error("Could not connect to the image source"))?;
+    if upstream.status() != StatusCode::OK {
+        return Err(source_error("Image source returned an unsuccessful status"));
+    }
+    let media_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap_or_default()
+        .trim();
+    // Use canonical raster MIME types so document types and upstream parameters never reach a browser.
+    let raster_type = [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/avif",
+        "image/bmp",
+        "image/x-icon",
+        "image/vnd.microsoft.icon",
+        "image/apng",
+        "image/tiff",
+        "image/jxl",
+        "image/heic",
+        "image/heif",
+    ]
+    .into_iter()
+    .find(|candidate| media_type.eq_ignore_ascii_case(candidate))
+    .ok_or_else(|| source_error("Image source did not return a supported raster image"))?;
+    if upstream
+        .content_length()
+        .is_some_and(|len| len > MAX_IMAGE_BYTES as u64)
+    {
+        return Err(source_error("Image exceeds the 8 MiB limit"));
+    }
+    let bytes = axum::body::to_bytes(Body::from_stream(upstream.bytes_stream()), MAX_IMAGE_BYTES)
+        .await
+        .map_err(|_| source_error("Image transfer failed or exceeded the 8 MiB limit"))?;
+    let mut response = Response::new(Body::from(bytes));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(raster_type));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=86400"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
+}
+
 async fn proxy(
     State(state): State<Shared>,
     _user: AuthUser,
@@ -164,10 +276,19 @@ async fn proxy(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let url = http_url(&query.url)?;
+    let settings = play_settings(&*state.conn()?)?;
     let mut request = state
         .client
         .get(url)
         .header(header::ACCEPT_ENCODING, "identity");
+    for (name, value) in [
+        (header::REFERER, &settings.play_referer),
+        (header::USER_AGENT, &settings.play_ua),
+    ] {
+        if let Some(value) = configured_header(value) {
+            request = request.header(name, value);
+        }
+    }
     for name in [header::RANGE, header::IF_RANGE] {
         if let Some(value) = headers.get(&name) {
             request = request.header(name, value.clone());
@@ -235,7 +356,7 @@ async fn proxy(
         let bytes = tokio::time::timeout(REQUEST_TIMEOUT, collect)
             .await
             .map_err(|_| source_error("HLS playlist transfer timed out"))??;
-        let rewritten = rewrite_playlist(&bytes, &final_url)?;
+        let rewritten = rewrite_playlist(&bytes, &final_url, settings.ad_block)?;
         downstream_headers.remove(header::CONTENT_RANGE);
         downstream_headers.remove(header::ACCEPT_RANGES);
         downstream_headers.insert(
@@ -287,7 +408,7 @@ async fn proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AppState, auth};
+    use crate::AppState;
     use axum::{body::to_bytes, http::Request};
     use rusqlite::Connection;
     use std::{
@@ -301,7 +422,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let media_dir = temp.path().canonicalize().unwrap();
         let conn = Connection::open_in_memory().unwrap();
-        auth::init_schema(&conn).unwrap();
+        crate::init_schema(&conn).unwrap();
         conn.execute("INSERT INTO users(id,username,password_hash,role,created_at) VALUES(1,'user','unused','user',0)", []).unwrap();
         conn.execute(
             "INSERT INTO sessions(token,user_id,expires_at) VALUES('local-session',1,?1)",
@@ -321,8 +442,12 @@ mod tests {
     }
 
     fn request(url: &str, authenticated: bool) -> axum::http::request::Builder {
+        proxy_request("/api/playback", url, authenticated)
+    }
+
+    fn proxy_request(path: &str, url: &str, authenticated: bool) -> axum::http::request::Builder {
         let uri = format!(
-            "/api/playback?{}",
+            "{path}?{}",
             url::form_urlencoded::Serializer::new(String::new())
                 .append_pair("url", url)
                 .finish()
@@ -332,6 +457,187 @@ mod tests {
             request = request.header(header::COOKIE, "polyview_session=local-session");
         }
         request
+    }
+
+    #[test]
+    fn ad_block_removes_only_unambiguous_closed_cue_blocks() {
+        let base = Url::parse("https://example.org/list.m3u8").unwrap();
+        let before = "#EXTM3U\n#EXT-X-CUE-OUT-CONT:6/30\n#EXTINF:4,\nbefore.ts\n";
+        let ad = "#EXT-X-CUE-OUT:8\n#EXTINF:4,\nad1.ts\n#EXTINF:4,\nad2.ts\n#EXT-X-CUE-IN\n";
+        let after = "#EXTINF:4,\nafter.ts\n#EXT-X-CUE-OUT\n#EXTINF:4,\nopen.ts\n";
+        let playlist = format!("{before}{ad}{ad}{after}");
+        let expected = format!("{before}{after}");
+        assert_eq!(
+            rewrite_playlist(playlist.as_bytes(), &base, true).unwrap(),
+            rewrite_playlist(expected.as_bytes(), &base, false).unwrap(),
+        );
+        let intact = rewrite_playlist(playlist.as_bytes(), &base, false).unwrap();
+        assert_eq!(intact.matches("ad1.ts").count(), 2);
+        for body in [
+            "#EXT-X-CUE-OUT\nmain.ts\n#EXT-X-CUE-IN-UNRELATED\n",
+            "#EXT-X-CUE-OUT\na.ts\n#EXT-X-CUE-OUT\nb.ts\n#EXT-X-CUE-IN\n#EXT-X-CUE-IN\n",
+        ] {
+            let playlist = format!("#EXTM3U\n{body}");
+            assert_eq!(
+                rewrite_playlist(playlist.as_bytes(), &base, true).unwrap(),
+                rewrite_playlist(playlist.as_bytes(), &base, false).unwrap(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn image_proxy_and_playback_use_persisted_settings() {
+        let (_temp, state) = state();
+        state
+            .conn()
+            .unwrap()
+            .execute("UPDATE users SET role='admin' WHERE id=1", [])
+            .unwrap();
+        let app = crate::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let expected_origin = origin.clone();
+        let upstream = Router::new()
+            .route(
+                "/cover",
+                get(move |headers: HeaderMap| async move {
+                    assert_eq!(headers[header::REFERER].to_str().unwrap(), expected_origin);
+                    assert!(!headers.contains_key(header::COOKIE));
+                    (
+                        [(header::CONTENT_TYPE, "image/png")],
+                        b"\x89PNG\r\n\x1a\n".as_slice(),
+                    )
+                }),
+            )
+            .route(
+                "/custom",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(headers[header::REFERER], "https://posters.test/");
+                    (
+                        [(header::CONTENT_TYPE, "image/jpeg")],
+                        b"\xff\xd8\xff\xd9".as_slice(),
+                    )
+                }),
+            )
+            .route(
+                "/html",
+                get(|| async { axum::response::Html("<p>document</p>") }),
+            )
+            .route(
+                "/svg",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "Image/SVG+XML; charset=utf-8")],
+                        "<svg/>",
+                    )
+                }),
+            )
+            .route(
+                "/chunked/{extra}",
+                get(
+                    |axum::extract::Path(extra): axum::extract::Path<usize>| async move {
+                        use axum::body::Bytes;
+                        let chunk = Bytes::from_static(&[1; 64 * 1024]);
+                        let chunks = (0..MAX_IMAGE_BYTES / chunk.len() + extra)
+                            .map(move |_| Ok::<_, io::Error>(chunk.clone()));
+                        (
+                            [(header::CONTENT_TYPE, "image/png")],
+                            Body::from_stream(stream::iter(chunks)),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/list.m3u8",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(headers[header::REFERER], "https://play.test/");
+                    assert_eq!(headers[header::USER_AGENT], "PolyViewTest/1");
+                    "#EXTM3U\n#EXT-X-CUE-OUT:4\nad.ts\n#EXT-X-CUE-IN\nmain.ts\n"
+                }),
+            );
+        let task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let fetch = |path: &str, upstream: &str, auth| {
+            app.clone().oneshot(
+                proxy_request(path, upstream, auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let cover = format!("{origin}/cover");
+        assert_eq!(
+            fetch("/api/image", &cover, false).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            fetch("/api/image", "file:///cover.png", true)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let response = fetch("/api/image", &cover, true).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, max-age=86400"
+        );
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), 8).await.unwrap().as_ref(),
+            b"\x89PNG\r\n\x1a\n"
+        );
+        for resource in ["html", "svg", "chunked/1"] {
+            let response = fetch("/api/image", &format!("{origin}/{resource}"), true)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{resource}");
+        }
+        let exact = fetch("/api/image", &format!("{origin}/chunked/0"), true)
+            .await
+            .unwrap();
+        assert_eq!(exact.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(exact.into_body(), MAX_IMAGE_BYTES)
+                .await
+                .unwrap()
+                .len(),
+            MAX_IMAGE_BYTES
+        );
+
+        let settings = serde_json::json!({ "ad_block": true, "play_referer": "https://play.test/", "play_ua": "PolyViewTest/1", "image_referer": "https://posters.test/" });
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::put("/api/settings/play")
+                    .header(header::COOKIE, "polyview_session=local-session")
+                    .header("x-polyview-request", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(settings.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(updated.status().is_success());
+        assert_eq!(
+            fetch("/api/image", &format!("{origin}/custom"), true)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let media = fetch("/api/playback", &format!("{origin}/list.m3u8"), true)
+            .await
+            .unwrap();
+        assert_eq!(media.status(), StatusCode::OK);
+        let body = to_bytes(media.into_body(), 512).await.unwrap();
+        let playlist = std::str::from_utf8(&body).unwrap();
+        assert!(playlist.contains("main.ts"));
+        assert!(!playlist.contains("ad.ts"));
+        task.abort();
     }
 
     #[test]
@@ -347,7 +653,7 @@ mod tests {
     #[test]
     fn playlists_rewrite_relative_paths_attributes_and_query_tokens() {
         let base = Url::parse("https://example.org/hls/master.m3u8?auth=one").unwrap();
-        let playlist=rewrite_playlist(b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"../keys/key.bin?token=a&b=2\",IV=0x01\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegments/one.ts?token=one%20two\n#EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio/list.m3u8\"\n",&base).unwrap();
+        let playlist=rewrite_playlist(b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"../keys/key.bin?token=a&b=2\",IV=0x01\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegments/one.ts?token=one%20two\n#EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio/list.m3u8\"\n",&base,false).unwrap();
         assert!(playlist.contains("URI=\"/api/playback?url=https%3A%2F%2Fexample.org%2Fkeys%2Fkey.bin%3Ftoken%3Da%26b%3D2\",IV=0x01"));
         let media_line = playlist
             .lines()
@@ -362,15 +668,18 @@ mod tests {
             "https://example.org/hls/segments/one.ts?token=one%20two"
         );
         assert!(playlist.contains("audio%2Flist.m3u8"));
-        assert!(rewrite_playlist(b"<html>not HLS</html>", &base).is_err());
+        assert!(rewrite_playlist(b"<html>not HLS</html>", &base, false).is_err());
         assert!(
             rewrite_playlist(
                 b"#EXTM3U\n#EXT-X-KEY:URI=\"data:text/plain,secret\"\n",
-                &base
+                &base,
+                false
             )
             .is_err()
         );
-        assert!(rewrite_playlist(b"#EXTM3U\n#EXT-X-KEY:URI=\"unterminated\n", &base).is_err());
+        assert!(
+            rewrite_playlist(b"#EXTM3U\n#EXT-X-KEY:URI=\"unterminated\n", &base, false).is_err()
+        );
         for raw in [
             "file:///etc/passwd",
             "data:text/plain,test",

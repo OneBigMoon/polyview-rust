@@ -5,6 +5,7 @@ pub mod legacy;
 pub mod library;
 pub mod network;
 pub mod playback;
+pub mod settings;
 pub mod tracking;
 pub mod tvbox;
 pub mod user_data;
@@ -132,6 +133,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     tvbox::init_schema(conn)?;
     epg::init_schema(conn)?;
     user_data::init_schema(conn)?;
+    settings::init_schema(conn)?;
     Ok(())
 }
 
@@ -153,6 +155,7 @@ pub fn router(state: Shared) -> Router {
         .merge(tracking::router())
         .merge(tvbox::router())
         .merge(user_data::router())
+        .merge(settings::router())
         .fallback(|| async { AppError::not_found("Not found") })
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(security_headers))
@@ -173,13 +176,17 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
     {
         return AppError(StatusCode::FORBIDDEN, "Missing request header".into()).into_response();
     }
+    let image_request = request.uri().path() == "/api/image";
     let mut response = next.run(request).await;
+    let cache_image = image_request && response.status().is_success();
     let headers = response.headers_mut();
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
     headers.insert(header::REFERRER_POLICY, "same-origin".parse().unwrap());
     headers.insert(header::CONTENT_SECURITY_POLICY, "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; media-src 'self' https: http: blob:; connect-src 'self' https: http:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'".parse().unwrap());
-    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    if !cache_image {
+        headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    }
     response
 }
 

@@ -31,6 +31,10 @@ pub struct ImportReport {
     pub channel_favorites_imported: usize,
     #[serde(default)]
     pub search_history_imported: usize,
+    #[serde(default)]
+    pub skip_configs_imported: usize,
+    #[serde(default)]
+    pub skip_configs_retained_by_reason: BTreeMap<String, i64>,
     pub legacy_jobs: i64,
     pub legacy_unfinished_jobs: i64,
     pub legacy_rows_retained: BTreeMap<String, i64>,
@@ -146,7 +150,7 @@ pub fn supplement_legacy(state: &Shared) -> Result<Option<ImportReport>, AppErro
         }
         init_import_schema(&conn)?;
         conn.query_row(
-            "SELECT path FROM legacy_imports WHERE version < 2",
+            "SELECT path FROM legacy_imports WHERE version < 3",
             [],
             |r| r.get(0),
         )
@@ -196,11 +200,11 @@ pub fn import_legacy(
     let previous = if let Some((raw, version)) = previous {
         let mut report: ImportReport = serde_json::from_str(&raw)
             .map_err(|_| AppError::internal("Legacy import report is invalid"))?;
-        if version >= 2 || !Path::new(path).try_exists()? {
+        if version >= 3 || !Path::new(path).try_exists()? {
             report.already_imported = true;
             return Ok(report);
         }
-        Some(report)
+        Some((report, version))
     } else {
         None
     };
@@ -225,8 +229,11 @@ pub fn import_legacy(
             "This is not an original PolyView database",
         ));
     }
-    if let Some(mut report) = previous {
-        import_user_data(&legacy, &tx, &mut report)?;
+    if let Some((mut report, version)) = previous {
+        if version < 2 {
+            import_user_data(&legacy, &tx, &mut report)?;
+        }
+        import_skip_configs(&legacy, &tx, &mut report)?;
         save_report(&tx, path, &report)?;
         tx.commit()?;
         return Ok(report);
@@ -248,11 +255,11 @@ pub fn import_legacy(
     import_subscriptions(&legacy, &tx, &mut report)?;
     import_tokens(&legacy, &tx, &mut report)?;
     import_user_data(&legacy, &tx, &mut report)?;
+    import_skip_configs(&legacy, &tx, &mut report)?;
     for table in [
         "play_progress",
         "favorites",
         "live_favorites",
-        "skip_configs",
         "search_history",
         "sessions",
     ] {
@@ -466,12 +473,82 @@ fn import_search_history(legacy: &Connection, tx: &Transaction<'_>) -> Result<us
     Ok(count)
 }
 
+fn import_skip_configs(
+    legacy: &Connection,
+    tx: &Transaction<'_>,
+    report: &mut ImportReport,
+) -> Result<(), AppError> {
+    if !table_exists(legacy, "skip_configs")? {
+        return Ok(());
+    }
+    let mut select = legacy.prepare(
+        "SELECT user_id,media_id,enabled,intro_sec,outro_sec FROM skip_configs ORDER BY user_id,media_id",
+    )?;
+    let mut users = tx.prepare("SELECT user_id FROM legacy_user_map WHERE legacy_id=?")?;
+    let mut sources = tx.prepare("SELECT source_id FROM legacy_source_map WHERE legacy_key=?")?;
+    let mut insert = tx.prepare(
+        "INSERT INTO skip_configs(user_id,media_key,enabled,intro_sec,outro_sec) VALUES(?,?,?,?,?)
+         ON CONFLICT(user_id,media_key) DO NOTHING",
+    )?;
+    let mut rows = select.query([])?;
+    while let Some(row) = rows.next()? {
+        let mut retain = |reason: &str| {
+            *report
+                .skip_configs_retained_by_reason
+                .entry(reason.into())
+                .or_default() += 1;
+        };
+        let owner: Option<i64> = users
+            .query_row([row.get::<_, rusqlite::types::Value>(0)?], |r| r.get(0))
+            .optional()?;
+        let Some(owner) = owner else {
+            retain("unmapped user");
+            continue;
+        };
+        // The legacy importer has no local library ID map. A matching numeric ID
+        // in the destination cannot establish that it identifies the same file.
+        let media = row.get_ref(1)?.as_str().unwrap_or("");
+        let Some((source, media_id)) = catalog_identity("", media) else {
+            retain("unmapped media");
+            continue;
+        };
+        let mapped: Option<i64> = sources.query_row([source], |r| r.get(0)).optional()?;
+        let Some(source_id) = mapped else {
+            retain("unmapped source");
+            continue;
+        };
+        let (Ok(enabled @ (0 | 1)), Ok(intro), Ok(outro)) = (
+            row.get::<_, i64>(2),
+            row.get::<_, f64>(3),
+            row.get::<_, f64>(4),
+        ) else {
+            retain("invalid skip values");
+            continue;
+        };
+        if !(0.0..=600.0).contains(&intro) || !(0.0..=600.0).contains(&outro) {
+            retain("invalid skip values");
+            continue;
+        }
+        let key = format!("online:{source_id}:{media_id}");
+        if insert.execute(params![owner, key, enabled, intro, outro])? == 0 {
+            retain("existing destination setting");
+        } else {
+            report.skip_configs_imported += 1;
+        }
+    }
+    report.legacy_rows_retained.insert(
+        "skip_configs".into(),
+        report.skip_configs_retained_by_reason.values().sum(),
+    );
+    Ok(())
+}
+
 fn save_report(tx: &Transaction<'_>, path: &str, report: &ImportReport) -> Result<(), AppError> {
     let encoded = serde_json::to_string(report)
         .map_err(|_| AppError::internal("Could not save legacy import report"))?;
     tx.execute(
-        "INSERT INTO legacy_imports(path,imported_at,report_json,version) VALUES(?,?,?,2)
-         ON CONFLICT(path) DO UPDATE SET report_json=excluded.report_json,version=2",
+        "INSERT INTO legacy_imports(path,imported_at,report_json,version) VALUES(?,?,?,3)
+         ON CONFLICT(path) DO UPDATE SET report_json=excluded.report_json,version=excluded.version",
         params![path, now(), encoded],
     )?;
     Ok(())
@@ -1067,5 +1144,80 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM catalog_favorites", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+    #[test]
+    fn original_skip_settings_migrate_once_on_fresh_and_m2_installations() {
+        for upgrade in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = state(temp.path());
+            let path = temp.path().join("original.db");
+            let old = legacy(&path);
+            old.execute_batch("INSERT INTO users VALUES(7,'matched','','user',0);
+                INSERT INTO source_config VALUES('cms','Original','cms','https://example.org/cms',0,1);
+                INSERT INTO favorites VALUES(7,'cms:a');").unwrap();
+            state.conn().unwrap().execute_batch("INSERT INTO users(id,username,password_hash,role,created_at) VALUES(91,'matched','existing','user',1);
+                INSERT INTO catalog_sources(id,name,url) VALUES(15,'Matched','https://example.org/cms');
+                INSERT INTO skip_configs VALUES(91,'online:15:b',1,42,42);").unwrap();
+            if upgrade {
+                import_legacy(&state, &path, None).unwrap();
+                state.conn().unwrap().execute_batch("UPDATE legacy_imports SET version=2, report_json=json_remove(report_json,'$.skip_configs_imported','$.skip_configs_retained_by_reason');
+                    DELETE FROM catalog_favorites;").unwrap();
+            }
+            old.execute_batch(
+                "CREATE TABLE skip_configs (
+                    user_id INTEGER NOT NULL DEFAULT 1, media_id TEXT NOT NULL,
+                    enabled INTEGER DEFAULT 0, intro_sec REAL DEFAULT 0, outro_sec REAL DEFAULT 0,
+                    PRIMARY KEY(user_id,media_id));
+                INSERT INTO skip_configs VALUES(7,'cms:a',0,12.5,600),(7,'cms:b',1,10,20),
+                    (9,'cms:a',1,0,0),(7,'unknown:4',1,0,0),(7,'4',1,0,0),
+                    (7,'cms:c',1,601,0),(7,'cms:d',1,'invalid',0);",
+            )
+            .unwrap();
+            drop(old);
+            let before = std::fs::read(&path).unwrap();
+            let report = if upgrade {
+                supplement_legacy(&state).unwrap().unwrap()
+            } else {
+                import_legacy(&state, &path, None).unwrap()
+            };
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(report.skip_configs_imported, 1);
+            assert_eq!(report.legacy_rows_retained["skip_configs"], 6);
+            assert_eq!(
+                report.skip_configs_retained_by_reason,
+                BTreeMap::from([
+                    ("existing destination setting".into(), 1),
+                    ("unmapped user".into(), 1),
+                    ("unmapped source".into(), 1),
+                    ("unmapped media".into(), 1),
+                    ("invalid skip values".into(), 2),
+                ])
+            );
+            let conn = state.conn().unwrap();
+            let count = |sql| conn.query_row(sql, [], |r| r.get::<_, usize>(0)).unwrap();
+            assert_eq!(
+                count(
+                    "SELECT COUNT(*) FROM skip_configs WHERE user_id=91 AND ((media_key='online:15:a' AND enabled=0 AND intro_sec=12.5 AND outro_sec=600) OR (media_key='online:15:b' AND intro_sec=42 AND outro_sec=42))"
+                ),
+                2
+            );
+            assert_eq!(
+                count("SELECT COUNT(*) FROM catalog_favorites"),
+                usize::from(!upgrade)
+            );
+            conn.execute("DELETE FROM skip_configs", []).unwrap();
+            drop(conn);
+            assert!(supplement_legacy(&state).unwrap().is_none());
+            assert!(import_legacy(&state, &path, None).unwrap().already_imported);
+            assert_eq!(
+                state
+                    .conn()
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM skip_configs", [], |r| r
+                        .get::<_, usize>(0))
+                    .unwrap(),
+                0
+            );
+        }
     }
 }

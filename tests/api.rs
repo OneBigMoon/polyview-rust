@@ -1,3 +1,7 @@
+#[path = "cases/play_settings.rs"]
+mod play_settings;
+#[path = "cases/source_ops.rs"]
+mod source_ops;
 #[path = "cases/suggest.rs"]
 mod suggest;
 #[path = "cases/user_data.rs"]

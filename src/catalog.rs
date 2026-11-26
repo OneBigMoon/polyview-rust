@@ -6,18 +6,20 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 use futures_util::{StreamExt, stream};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+const SOURCE_SELECT: &str = "SELECT id,name,url,enabled,adult,priority,searchable,custom_ua,
+    custom_referer,custom_cookie,proxy_url,timeout_secs,last_latency_ms,last_probe_ok,last_probe_at,
+    fail_streak,cooldown_until FROM catalog_sources";
 
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
@@ -38,6 +40,22 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "adult",
         "INTEGER NOT NULL DEFAULT 0 CHECK(adult IN (0,1))",
     )?;
+    for (column, definition) in [
+        ("priority", "INTEGER NOT NULL DEFAULT 100"),
+        ("searchable", "INTEGER NOT NULL DEFAULT 1"),
+        ("custom_ua", "TEXT NOT NULL DEFAULT ''"),
+        ("custom_referer", "TEXT NOT NULL DEFAULT ''"),
+        ("custom_cookie", "TEXT NOT NULL DEFAULT ''"),
+        ("proxy_url", "TEXT NOT NULL DEFAULT ''"),
+        ("timeout_secs", "INTEGER NOT NULL DEFAULT 12"),
+        ("last_latency_ms", "INTEGER"),
+        ("last_probe_ok", "INTEGER"),
+        ("last_probe_at", "INTEGER"),
+        ("fail_streak", "INTEGER NOT NULL DEFAULT 0"),
+        ("cooldown_until", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        crate::ensure_column(conn, "catalog_sources", column, definition)?;
+    }
     conn.execute(
         "INSERT OR IGNORE INTO settings(key,value) VALUES ('adult_sources_enabled','0')",
         [],
@@ -57,6 +75,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
 pub fn router() -> Router<Shared> {
     Router::new()
         .route("/api/sources", get(list_sources).post(create_source))
+        .route("/api/sources/probe", post(probe_sources))
+        .route("/api/sources/reorder", post(reorder_sources))
+        .route("/api/sources/batch", post(batch_sources))
         .route(
             "/api/sources/{id}",
             delete(delete_source).put(update_source),
@@ -72,13 +93,33 @@ pub fn router() -> Router<Shared> {
         .route("/api/catalog/{source_id}/detail", get(detail_handler))
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Source {
     pub id: i64,
     pub name: String,
     pub url: String,
     pub enabled: bool,
     pub adult: bool,
+    pub priority: i64,
+    pub searchable: bool,
+    custom_ua: String,
+    custom_referer: String,
+    custom_cookie: String,
+    proxy_url: String,
+    timeout_secs: u64,
+    last_latency_ms: Option<i64>,
+    last_probe_ok: Option<bool>,
+    last_probe_at: Option<i64>,
+    fail_streak: i64,
+    cooldown_until: i64,
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Source")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 fn source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
@@ -88,14 +129,31 @@ fn source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
         url: row.get(2)?,
         enabled: row.get(3)?,
         adult: row.get(4)?,
+        priority: row.get(5)?,
+        searchable: row.get(6)?,
+        custom_ua: row.get(7)?,
+        custom_referer: row.get(8)?,
+        custom_cookie: row.get(9)?,
+        proxy_url: row.get(10)?,
+        timeout_secs: row.get(11)?,
+        last_latency_ms: row.get(12)?,
+        last_probe_ok: row.get(13)?,
+        last_probe_at: row.get(14)?,
+        fail_streak: row.get(15)?,
+        cooldown_until: row.get(16)?,
     })
 }
 
 pub fn sources(state: &Shared) -> Result<Vec<Source>, AppError> {
     let conn = state.conn()?;
-    let mut stmt =
-        conn.prepare("SELECT id,name,url,enabled,adult FROM catalog_sources ORDER BY id")?;
+    let mut stmt = conn.prepare(&format!("{SOURCE_SELECT} ORDER BY priority,id"))?;
     Ok(stmt.query_map([], source_row)?.collect::<Result<_, _>>()?)
+}
+
+fn source_by_id(conn: &Connection, id: i64) -> Result<Source, AppError> {
+    conn.query_row(&format!("{SOURCE_SELECT} WHERE id=?"), [id], source_row)
+        .optional()?
+        .ok_or_else(|| AppError::not_found("Source not found"))
 }
 
 pub fn adult_sources_enabled(conn: &Connection) -> Result<bool, AppError> {
@@ -117,12 +175,12 @@ pub fn active_sources(state: &Shared) -> Result<Vec<Source>, AppError> {
     };
     Ok(sources(state)?
         .into_iter()
-        .filter(|source| source.enabled && (show_adult || !source.adult))
+        .filter(|source| source.enabled && source.searchable && (show_adult || !source.adult))
         .collect())
 }
 
 fn ensure_source_visible(conn: &Connection, source: &Source) -> Result<(), AppError> {
-    if source.adult && !adult_sources_enabled(conn)? {
+    if !source.enabled || (source.adult && !adult_sources_enabled(conn)?) {
         return Err(AppError::not_found("Source not found or disabled"));
     }
     Ok(())
@@ -131,16 +189,19 @@ fn ensure_source_visible(conn: &Connection, source: &Source) -> Result<(), AppEr
 async fn list_sources(
     State(state): State<Shared>,
     user: AuthUser,
-) -> Result<Json<Vec<Source>>, AppError> {
-    let show_adult = {
-        let conn = state.conn()?;
-        user.role == "admin" || adult_sources_enabled(&conn)?
-    };
-    let mut list = sources(&state)?;
-    if user.role != "admin" {
-        list.retain(|source| source.enabled && (show_adult || !source.adult));
+) -> Result<Json<Vec<Value>>, AppError> {
+    if user.role == "admin" {
+        return Ok(Json(
+            sources(&state)?
+                .into_iter()
+                .map(|source| serde_json::json!(source))
+                .collect(),
+        ));
     }
-    Ok(Json(list))
+    Ok(Json(active_sources(&state)?.into_iter().map(|source| serde_json::json!({
+        "id": source.id, "name": source.name, "enabled": source.enabled, "adult": source.adult,
+        "priority": source.priority, "searchable": source.searchable
+    })).collect()))
 }
 
 #[derive(Debug, Serialize)]
@@ -184,7 +245,7 @@ async fn save_settings_handler(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct SourceInput {
     name: String,
     url: String,
@@ -192,6 +253,13 @@ struct SourceInput {
     enabled: bool,
     #[serde(default)]
     adult: bool,
+    priority: Option<i64>,
+    searchable: Option<bool>,
+    custom_ua: Option<String>,
+    custom_referer: Option<String>,
+    custom_cookie: Option<String>,
+    proxy_url: Option<String>,
+    timeout_secs: Option<u64>,
 }
 
 fn enabled_by_default() -> bool {
@@ -225,6 +293,38 @@ fn validate_source(input: &SourceInput) -> Result<(String, String), AppError> {
             "Source name must contain 1–100 characters",
         ));
     }
+    if input.timeout_secs.is_some_and(|n| !(3..=60).contains(&n)) {
+        return Err(AppError::bad_request("Source timeout must be 3–60 seconds"));
+    }
+    for value in [
+        &input.custom_ua,
+        &input.custom_referer,
+        &input.custom_cookie,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.len() > 8192
+            || value.chars().any(char::is_control)
+            || reqwest::header::HeaderValue::from_str(value).is_err()
+        {
+            return Err(AppError::bad_request("Invalid source header"));
+        }
+    }
+    if let Some(raw) = input.proxy_url.as_deref().filter(|value| !value.is_empty()) {
+        let valid = raw.len() <= 4096
+            && !raw.chars().any(char::is_control)
+            && Url::parse(raw).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            });
+        if !valid {
+            return Err(AppError::bad_request("Invalid HTTP proxy URL"));
+        }
+    }
     let mut url = http_url(input.url.trim())?;
     url.set_fragment(None);
     Ok((name.to_owned(), url.to_string()))
@@ -250,23 +350,32 @@ async fn create_source(
     Json(input): Json<SourceInput>,
 ) -> Result<(StatusCode, Json<Source>), AppError> {
     require_admin(&user)?;
-    let (name, url) = validate_source(&input)?;
     let conn = state.conn()?;
+    let id = insert_source(&conn, &input)?;
+    Ok((StatusCode::CREATED, Json(source_by_id(&conn, id)?)))
+}
+
+fn insert_source(conn: &Connection, input: &SourceInput) -> Result<i64, AppError> {
+    let (name, url) = validate_source(input)?;
     conn.execute(
-        "INSERT INTO catalog_sources(name,url,enabled,adult) VALUES(?,?,?,?)",
-        params![name, url, input.enabled, input.adult],
-    )
-    .map_err(source_write_error)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(Source {
-            id: conn.last_insert_rowid(),
+        "INSERT INTO catalog_sources(name,url,enabled,adult,priority,searchable,custom_ua,
+        custom_referer,custom_cookie,proxy_url,timeout_secs) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        params![
             name,
             url,
-            enabled: input.enabled,
-            adult: input.adult,
-        }),
-    ))
+            input.enabled,
+            input.adult,
+            input.priority.unwrap_or(100),
+            input.searchable.unwrap_or(true),
+            input.custom_ua.as_deref().unwrap_or_default(),
+            input.custom_referer.as_deref().unwrap_or_default(),
+            input.custom_cookie.as_deref().unwrap_or_default(),
+            input.proxy_url.as_deref().unwrap_or_default(),
+            input.timeout_secs.unwrap_or(12)
+        ],
+    )
+    .map_err(source_write_error)?;
+    Ok(conn.last_insert_rowid())
 }
 
 async fn update_source(
@@ -277,24 +386,102 @@ async fn update_source(
 ) -> Result<Json<Source>, AppError> {
     require_admin(&user)?;
     let (name, url) = validate_source(&input)?;
-    if state
-        .conn()?
-        .execute(
-            "UPDATE catalog_sources SET name=?,url=?,enabled=?,adult=? WHERE id=?",
-            params![name, url, input.enabled, input.adult, id],
-        )
-        .map_err(source_write_error)?
-        == 0
-    {
+    let conn = state.conn()?;
+    if conn.execute(
+        "UPDATE catalog_sources SET name=?1,url=?2,enabled=?3,adult=?4,priority=COALESCE(?5,priority),
+        searchable=COALESCE(?6,searchable),custom_ua=COALESCE(?7,custom_ua),custom_referer=COALESCE(?8,custom_referer),
+        custom_cookie=COALESCE(?9,custom_cookie),proxy_url=COALESCE(?10,proxy_url),timeout_secs=COALESCE(?11,timeout_secs)
+        WHERE id=?12",
+        params![name,url,input.enabled,input.adult,input.priority,input.searchable,input.custom_ua,
+            input.custom_referer,input.custom_cookie,input.proxy_url,input.timeout_secs,id],
+    ).map_err(source_write_error)? == 0 {
         return Err(AppError::not_found("Source not found"));
     }
-    Ok(Json(Source {
-        id,
-        name,
-        url,
-        enabled: input.enabled,
-        adult: input.adult,
-    }))
+    Ok(Json(source_by_id(&conn, id)?))
+}
+
+#[derive(Deserialize)]
+struct BatchOrder {
+    ids: Vec<i64>,
+}
+
+async fn reorder_sources(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Json(order): Json<BatchOrder>,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&user)?;
+    let mut conn = state.conn()?;
+    let tx = conn.transaction()?;
+    let count: usize = tx.query_row("SELECT COUNT(*) FROM catalog_sources", [], |r| r.get(0))?;
+    if order.ids.len() != count || order.ids.iter().collect::<BTreeSet<_>>().len() != count {
+        return Err(AppError::bad_request("Include every source exactly once"));
+    }
+    for (priority, id) in order.ids.into_iter().enumerate() {
+        if tx.execute(
+            "UPDATE catalog_sources SET priority=? WHERE id=?",
+            params![priority, id],
+        )? == 0
+        {
+            return Err(AppError::bad_request("Unknown source in reorder request"));
+        }
+    }
+    tx.commit()?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn batch_sources(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Json(rows): Json<Vec<Value>>,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&user)?;
+    let mut conn = state.conn()?;
+    let tx = conn.transaction()?;
+    let total = rows.len();
+    let mut imported = 0;
+    for row in rows {
+        let Ok(input) = serde_json::from_value(row) else {
+            continue;
+        };
+        match insert_source(&tx, &input) {
+            Ok(_) => imported += 1,
+            Err(AppError(StatusCode::BAD_REQUEST | StatusCode::CONFLICT, _)) => (),
+            Err(error) => return Err(error),
+        }
+    }
+    tx.commit()?;
+    Ok(Json(
+        serde_json::json!({"imported":imported,"skipped":total-imported}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ProbeInput {
+    source_id: Option<i64>,
+}
+
+async fn probe_sources(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Json(input): Json<ProbeInput>,
+) -> Result<Json<Vec<Value>>, AppError> {
+    require_admin(&user)?;
+    let selected = if let Some(id) = input.source_id {
+        let conn = state.conn()?;
+        vec![source_by_id(&conn, id)?]
+    } else {
+        sources(&state)?.into_iter().filter(|s| s.enabled).collect()
+    };
+    let state = &state;
+    let results = stream::iter(selected.into_iter().map(|source| async move {
+        let start = Instant::now();
+        let result = request_cms(state, &source, &[("ac", "list")]).await;
+        let latency = start.elapsed().as_millis() as i64;
+        record_health(state, &source, result.is_ok(), Some(latency))?;
+        Ok::<_, AppError>(serde_json::json!({"source_id":source.id,"ok":result.is_ok(),"latency_ms":latency,"error":result.err()}))
+    })).buffered(8).collect::<Vec<_>>().await;
+    Ok(Json(results.into_iter().collect::<Result<_, _>>()?))
 }
 
 async fn delete_source(
@@ -501,7 +688,7 @@ pub async fn search(state: &Shared, query: &str) -> Result<SearchResponse, AppEr
         let result = fetch_items(state, &source, &[("ac", "detail"), ("wd", query)]).await;
         (source, result)
     }))
-    .buffer_unordered(6);
+    .buffered(6);
     let mut response = SearchResponse {
         results: Vec::new(),
         errors: Vec::new(),
@@ -513,22 +700,22 @@ pub async fn search(state: &Shared, query: &str) -> Result<SearchResponse, AppEr
             let _ = remember_types(&conn, source.id, &page.items);
         }
         match result {
-            Ok(page) => response.results.extend(
-                page.items
-                    .iter()
-                    .filter_map(|item| summary(&source, item))
-                    .take(1000),
-            ),
+            Ok(page) => {
+                let start = response.results.len();
+                response.results.extend(
+                    page.items
+                        .iter()
+                        .filter_map(|item| summary(&source, item))
+                        .take(1000),
+                );
+                response.results[start..].sort_by(|a, b| (&a.title, &a.id).cmp(&(&b.title, &b.id)));
+            }
             Err(message) => response.errors.push(SourceError {
                 source_id: source.id,
                 message,
             }),
         }
     }
-    response
-        .results
-        .sort_by(|a, b| (a.source_id, &a.title, &a.id).cmp(&(b.source_id, &b.title, &b.id)));
-    response.errors.sort_by_key(|error| error.source_id);
     Ok(response)
 }
 
@@ -630,9 +817,13 @@ async fn categories_handler(
     {
         return Err(AppError::bad_request("Unknown media kind"));
     }
-    let mut statement =
-        conn.prepare("SELECT DISTINCT type_name FROM catalog_types ORDER BY type_name")?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT type_name FROM catalog_types JOIN catalog_sources ON catalog_sources.id=catalog_types.source_id
+         WHERE enabled=1 AND searchable=1 AND (adult=0 OR ?1) ORDER BY type_name",
+    )?;
+    let rows = statement.query_map([adult_sources_enabled(&conn)?], |row| {
+        row.get::<_, String>(0)
+    })?;
     let mut categories = BTreeSet::new();
     for row in rows {
         let name = row?;
@@ -789,7 +980,7 @@ pub async fn discover(
         }
         fetched.push((source, result));
     }
-    fetched.sort_by_key(|(source, _)| source.id);
+    fetched.sort_by_key(|(source, _)| (source.priority, source.id));
     let mut seen = BTreeSet::new();
     let mut result = DiscoverResponse {
         results: Vec::new(),
@@ -845,19 +1036,7 @@ async fn detail_handler(
 
 pub async fn detail(state: &Shared, source_id: i64, id: &str) -> Result<CatalogDetail, AppError> {
     let id = validate_text(id, "Media ID", 256)?;
-    let source = state
-        .conn()?
-        .query_row(
-            "SELECT id,name,url,enabled,adult FROM catalog_sources WHERE id=? AND enabled=1",
-            [source_id],
-            source_row,
-        )
-        .optional()?
-        .ok_or_else(|| AppError::not_found("Source not found or disabled"))?;
-    {
-        let conn = state.conn()?;
-        ensure_source_visible(&conn, &source)?;
-    }
+    let source = visible_source(state, source_id)?;
     let page = fetch_items(state, &source, &[("ac", "detail"), ("ids", id)])
         .await
         .map_err(|message| AppError(StatusCode::BAD_GATEWAY, message))?;
@@ -1064,25 +1243,61 @@ pub async fn cms_query(
             return Err(AppError::bad_request("Page must be between 1 and 10000"));
         }
     }
-    let source = state
-        .conn()?
-        .query_row(
-            "SELECT id,name,url,enabled,adult FROM catalog_sources WHERE id=? AND enabled=1",
-            [source_id],
-            source_row,
-        )
-        .optional()?
-        .ok_or_else(|| AppError::not_found("Source not found or disabled"))?;
+    let source = visible_source(state, source_id)?;
+    if !source.searchable
+        && (parameters.iter().any(|(key, _)| *key == "wd")
+            || !parameters.iter().any(|(key, _)| *key == "ids"))
     {
-        let conn = state.conn()?;
-        ensure_source_visible(&conn, &source)?;
+        return Err(AppError::not_found("Source search is disabled"));
     }
     fetch_cms_value(state, &source, parameters)
         .await
         .map_err(|message| AppError(StatusCode::BAD_GATEWAY, message))
 }
 
+fn visible_source(state: &Shared, id: i64) -> Result<Source, AppError> {
+    let conn = state.conn()?;
+    let source = source_by_id(&conn, id)?;
+    ensure_source_visible(&conn, &source)?;
+    Ok(source)
+}
+
+fn record_health(
+    state: &Shared,
+    source: &Source,
+    ok: bool,
+    probe_latency: Option<i64>,
+) -> Result<(), AppError> {
+    state.conn()?.execute(
+        "UPDATE catalog_sources SET fail_streak=CASE WHEN ?1 THEN 0 ELSE fail_streak+1 END,
+        cooldown_until=CASE WHEN ?1 THEN 0 WHEN fail_streak>=2 THEN ?2+120 ELSE 0 END,
+        last_latency_ms=COALESCE(?3,last_latency_ms),
+        last_probe_at=CASE WHEN ?3 IS NULL THEN last_probe_at ELSE ?2 END,
+        last_probe_ok=CASE WHEN ?3 IS NULL THEN last_probe_ok ELSE ?1 END WHERE id=?4 AND url=?5",
+        params![ok, crate::now(), probe_latency, source.id, source.url],
+    )?;
+    Ok(())
+}
+
 async fn fetch_cms_value(
+    state: &Shared,
+    source: &Source,
+    query: &[(&str, &str)],
+) -> Result<Value, String> {
+    let available: bool = state.conn().map_err(|_| "Could not open source database")?.query_row(
+        "SELECT EXISTS(SELECT 1 FROM catalog_sources WHERE id=? AND url=? AND cooldown_until<=?)",
+        params![source.id,source.url,crate::now()], |row| row.get(0),
+    ).map_err(|_| "Could not read source health")?;
+    if !available {
+        return Err("Source is cooling down or unavailable".to_owned());
+    }
+    let result = request_cms(state, source, query).await;
+    record_health(state, source, result.is_ok(), None)
+        .map_err(|_| "Could not update source health")?;
+    result
+}
+
+async fn request_cms(
     state: &Shared,
     source: &Source,
     query: &[(&str, &str)],
@@ -1099,11 +1314,54 @@ async fn fetch_cms_value(
             .map(|(key, value)| (key.to_string(), value.to_string())),
     );
     url.query_pairs_mut().clear().extend_pairs(pairs);
+    let timeout = Duration::from_secs(source.timeout_secs.clamp(3, 60));
     let fetch = async {
-        let response = state
-            .client
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            (reqwest::header::USER_AGENT, &source.custom_ua),
+            (reqwest::header::REFERER, &source.custom_referer),
+            (reqwest::header::COOKIE, &source.custom_cookie),
+        ] {
+            if !value.is_empty() {
+                let mut value = reqwest::header::HeaderValue::from_str(value)
+                    .map_err(|_| "Invalid source header")?;
+                value.set_sensitive(true);
+                headers.insert(name, value);
+            }
+        }
+        let custom_client;
+        let client = if headers.is_empty() && source.proxy_url.is_empty() {
+            &state.client
+        } else {
+            // Configured headers belong only to the administrator-selected origin.
+            let mut builder = reqwest::Client::builder().referer(false).redirect(
+                reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() < 5
+                        && attempt
+                            .previous()
+                            .first()
+                            .is_some_and(|url| url.origin() == attempt.url().origin())
+                    {
+                        attempt.follow()
+                    } else {
+                        attempt.stop()
+                    }
+                }),
+            );
+            if !source.proxy_url.is_empty() {
+                builder = builder.proxy(
+                    reqwest::Proxy::all(&source.proxy_url).map_err(|_| "Invalid source proxy")?,
+                );
+            }
+            custom_client = builder
+                .build()
+                .map_err(|_| "Could not configure source client")?;
+            &custom_client
+        };
+        let response = client
             .get(url)
-            .timeout(REQUEST_TIMEOUT)
+            .headers(headers)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|_| "Source request failed".to_owned())?;
@@ -1136,16 +1394,16 @@ async fn fetch_cms_value(
         }) {
             return Err("Source reported an unsuccessful CMS response".to_owned());
         }
-        if !value.get("list").is_some_and(Value::is_array)
-            && !value.get("class").is_some_and(Value::is_array)
-        {
-            return Err("Source JSON does not contain CMS lists or categories".to_owned());
+        let categories_only =
+            query.contains(&("ac", "list")) && value.get("class").is_some_and(Value::is_array);
+        if !value.get("list").is_some_and(Value::is_array) && !categories_only {
+            return Err("Source JSON does not contain the requested CMS list".to_owned());
         }
         Ok(value)
     };
-    tokio::time::timeout(REQUEST_TIMEOUT, fetch)
+    tokio::time::timeout(timeout, fetch)
         .await
-        .map_err(|_| "Source timed out after 15 seconds".to_owned())?
+        .map_err(|_| format!("Source timed out after {} seconds", timeout.as_secs()))?
 }
 
 #[cfg(test)]
@@ -1244,6 +1502,7 @@ mod tests {
             url: "https://cms.example/api.php".into(),
             enabled: true,
             adult: false,
+            ..Default::default()
         };
         assert_eq!(
             create_source(State(state.clone()), viewer, Json(input()))
@@ -1322,7 +1581,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "normal");
+        assert_eq!(list[0]["name"], "normal");
         assert_eq!(
             settings_handler(State(state.clone()), viewer.clone())
                 .await
@@ -1436,12 +1695,14 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         for path in ["/oversize", "/html"] {
-            let source = Source {
-                id: 1,
-                name: "test".into(),
-                url: format!("{base}{path}?key=private"),
-                enabled: true,
-                adult: false,
+            let source = {
+                let conn = state.conn().unwrap();
+                conn.execute(
+                    "INSERT INTO catalog_sources(name,url) VALUES ('test',?)",
+                    [format!("{base}{path}?key=private")],
+                )
+                .unwrap();
+                source_by_id(&conn, conn.last_insert_rowid()).unwrap()
             };
             let error = fetch_items(&state, &source, &[("ac", "detail")])
                 .await

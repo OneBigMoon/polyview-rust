@@ -126,6 +126,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "auth-password",
     "auth-reveal",
     "connection-banner",
+    "player-skip",
     "auth-title",
     "auth-description",
     "auth-submit",
@@ -2053,4 +2054,272 @@ test("guide stars filter favorite channels and the player star removes a favorit
   await star.listeners.click[0]();
   assert.deepEqual(savedMutation(app, "/api/channels/1/favorite", "PUT"), { favorite: false });
   assert.equal(star.getAttribute("aria-pressed"), "false");
+});
+
+async function adminSourcePage() {
+  const sources = [
+    { id: 4, name: "甲", url: "https://one.example/", enabled: true, adult: false, last_probe_ok: true, last_latency_ms: 499, priority: 1 },
+    { id: 7, name: "乙", url: "https://two.example/", enabled: true, adult: false, last_probe_ok: true, last_latency_ms: 500, priority: 2 },
+    { id: 9, name: "丙", url: "https://three.example/", enabled: false, last_probe_ok: false, cooldown_until: Math.floor(Date.now() / 1000) + 120 },
+  ];
+  const app = environment({ "/api/sources": sources, "/api/catalog/settings": {}, "/api/settings/play": {
+    ad_block: false, play_referer: "https://player.example/", play_ua: "old", image_referer: "https://images.example/",
+  }, "/api/sources/probe": [{ source_id: 4, ok: true }], "/api/sources/batch": { imported: 1, skipped: 0 } });
+  app.state.page = "settings";
+  app.state.settingsTab = "sources";
+  app.state.user = { id: 1, role: "admin" };
+  return { app, page: await app.settings(), sources };
+}
+
+test("admin probes individual or all sources and sees latency and cooldown", async () => {
+  const { app, page, sources } = await adminSourcePage();
+  assert.deepEqual(pageClass(page, "source-health").map((badge) => badge.textContent), ["499 ms", "500 ms", "测速失败 · 冷却中"]);
+  assert.equal(pageClass(page, "fast").length, 1);
+  assert.equal(pageClass(page, "medium").length, 1);
+  sources[0].last_latency_ms = 1710;
+  await pageButton(page, "测速").listeners.click[0]();
+  assert.equal(pageClass(page, "slow")[0].textContent, "1710 ms");
+  await pageButton(page, "全部测速").listeners.click[0]();
+  assert.deepEqual(app.calls.filter((call) => call.url === "/api/sources/probe").map((call) => JSON.parse(call.options.body)), [{ source_id: 4 }, {}]);
+});
+
+test("admin saves playback request headers and conservative ad blocking", async () => {
+  const { app, page } = await adminSourcePage();
+  const panel = pageClass(page, "network-settings")[0];
+  const field = (key) => pageNodes(panel).find((node) => node.attributes?.name === key);
+  field("ad_block").checked = true;
+  field("play_ua").value = "PolyView Test";
+  await pageNodes(panel).find((node) => node.tagName === "FORM").listeners.submit[0]({ preventDefault() {} });
+  const call = app.calls.find((item) => item.url === "/api/settings/play" && item.options.method === "PUT");
+  assert.deepEqual(JSON.parse(call.options.body), { ad_block: true, play_ua: "PolyView Test", play_referer: "https://player.example/", image_referer: "https://images.example/" });
+});
+
+test("admin saves advanced fields, exports configuration, imports JSON and reorders sources", async () => {
+  const { app, page } = await adminSourcePage();
+  const row = pageClass(page, "source-row")[0];
+  const field = (key) => pageNodes(row).find((node) => node.attributes?.name === key);
+  field("custom_cookie").value = "demo=1";
+  field("searchable").checked = false;
+  field("timeout_secs").value = "24";
+  await row.listeners.submit[0]({ preventDefault() {} });
+  const saved = JSON.parse(app.calls.find((call) => call.url === "/api/sources/4").options.body);
+  assert.equal(saved.custom_cookie, "demo=1");
+  assert.equal(saved.timeout_secs, 24);
+  assert.equal(saved.searchable, false);
+  pageButton(page, "导出 JSON").dispatchEvent("click");
+  const dialog = pageClass(page, "source-batch-dialog")[0];
+  const data = pageNodes(dialog).find((node) => node.tagName === "TEXTAREA");
+  assert.equal(dialog.open, true);
+  const exported = JSON.parse(data.value);
+  assert.equal(exported[0].custom_cookie, "demo=1");
+  assert.equal("last_probe_ok" in exported[0], false);
+  pageButton(dialog, "关闭").dispatchEvent("click");
+  pageButton(page, "导入 JSON").dispatchEvent("click");
+  data.value = JSON.stringify(exported);
+  await pageButton(dialog, "确认导入").listeners.click[0]();
+  assert.deepEqual(JSON.parse(app.calls.find((call) => call.url === "/api/sources/batch").options.body), exported);
+  assert.equal(pageButton(row, "上移").disabled, true);
+  await pageButton(row, "下移").listeners.click[0]();
+  assert.deepEqual(JSON.parse(app.calls.find((call) => call.url === "/api/sources/reorder").options.body), { ids: [7, 4, 9] });
+});
+
+const flushSkipEvents = () => new Promise((resolve) => setImmediate(resolve));
+
+function skipInputs(root) {
+  const panel = playbackNode(root, (node) => node.tagName === "DETAILS" && node.textContent.includes("跳过片头/片尾"), "skip panel");
+  const input = (attr, value) => playbackNode(panel, (node) => node.tagName === "INPUT" && node.getAttribute(attr) === value, value);
+  return { panel, enabled: input("type", "checkbox"), intro: input("name", "intro_sec"), outro: input("name", "outro_sec") };
+}
+
+test("detail skip settings persist for the selected catalog source and open with disabled zero defaults", async () => {
+  const { app, dialog } = await openTwoEpisodeDetail();
+  await flushSkipEvents();
+  const { panel, enabled, intro, outro } = skipInputs(dialog);
+  assert.equal(panel.open, false);
+  assert.equal(enabled.checked, false);
+  assert.equal(intro.value, "0");
+  assert.equal(outro.value, "0");
+  assert.ok(app.calls.some(({ url }) => url === "/api/skip?key=online%3A3%3A42"));
+  assert.doesNotMatch(panel.textContent, /设当前时间为片头/);
+  enabled.checked = true;
+  intro.value = 601;
+  const save = pageButton(panel, "保存跳过设置");
+  await save.listeners.click[0]();
+  assert.equal(app.calls.some(({ url }) => url === "/api/skip"), false);
+  intro.value = 11.5;
+  outro.value = 35;
+  await save.listeners.click[0]();
+  assert.deepEqual(savedMutation(app, "/api/skip", "PUT"), {
+    media_key: "online:3:42", enabled: true, intro_sec: 11.5, outro_sec: 35,
+  });
+});
+
+test("the VOD player saves the current intro time and remaining outro time", async () => {
+  const app = environment();
+  app.play({ id: 9, title: "本地测试" });
+  await flushSkipEvents();
+  assert.ok(app.calls.some(({ url }) => url === "/api/skip?key=local%3A9"));
+  const { panel, enabled, intro, outro } = skipInputs(app.elements.get("player-skip"));
+  const video = app.elements.get("video-player");
+  video.onloadedmetadata();
+  enabled.checked = true;
+  video.currentTime = 12.25;
+  await pageButton(panel, "设当前时间为片头").listeners.click[0]();
+  assert.equal(intro.value, "12.25");
+  video.currentTime = 75.5;
+  await pageButton(panel, "设当前剩余为片尾").listeners.click[0]();
+  assert.equal(outro.value, "24.5");
+  assert.deepEqual(app.calls.filter(({ url }) => url === "/api/skip").map(({ options }) => JSON.parse(options.body)), [
+    { media_key: "local:9", enabled: true, intro_sec: 12.25, outro_sec: 0 },
+    { media_key: "local:9", enabled: true, intro_sec: 12.25, outro_sec: 24.5 },
+  ]);
+});
+
+test("catalog skipping seeks past the intro once, completes progress and tracking, and autoplays the next episode once", async () => {
+  const key = "online:7:a/b";
+  const app = environment({ [`/api/skip?key=${encodeURIComponent(key)}`]: { media_key: key, enabled: true, intro_sec: 10, outro_sec: 30 } });
+  const playlist = [1, 2].map((number) => ({ title: `第${number}集`, source_id: 7, media_id: "a/b", episode_number: number,
+    episode_index: number - 1, tracking_id: 5, remote_url: `https://media.test/${number}.mp4` }));
+  const video = app.elements.get("video-player");
+  app.play(playlist[0], false, playlist, 0, true);
+  video.onloadedmetadata();
+  await flushSkipEvents();
+  assert.equal(video.currentTime, 10);
+  assert.match(app.elements.get("toast").textContent, /已跳过片头/);
+  assert.equal(video.paused, false);
+  video.currentTime = 3;
+  video.dispatchEvent("timeupdate");
+  assert.equal(video.currentTime, 3, "seeking back allows rewatching the intro");
+  video.currentTime = 69.9;
+  video.dispatchEvent("timeupdate");
+  assert.equal(app.state.player.playlistIndex, 0);
+  video.currentTime = 70;
+  video.dispatchEvent("timeupdate");
+  video.dispatchEvent("timeupdate");
+  video.ended = true;
+  video.dispatchEvent("ended");
+  await flushSkipEvents();
+  assert.equal(app.state.player.playlistIndex, 1);
+  assert.equal(app.state.player.autoplay, true);
+  assert.deepEqual(savedMutation(app, "/api/tracking/5", "PUT"), { watched_episodes: 1 });
+  const completed = app.calls.filter(({ url, options }) => url === "/api/progress" && options.method === "PUT")
+    .map(({ options }) => JSON.parse(options.body)).filter((body) => body.position === body.duration);
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].remote_url, playlist[0].remote_url);
+  video.ended = false;
+  video.currentTime = 0;
+  video.onloadedmetadata();
+  assert.equal(video.playCalls, 2);
+});
+
+test("local series opened from the library marks a skipped episode watched before advancing", async () => {
+  const episodes = [1, 2].map((id) => ({ id, title: `剧集 ${id}`, kind: "episode", series_id: 8, series: "故事" }));
+  const app = environment({ "/api/library": episodes, "/api/skip?key=local%3A1": { enabled: true, intro_sec: 0, outro_sec: 35 } });
+  app.state.filter = "episode";
+  const page = await app.library();
+  savedAction(page, "播放 剧集 1").dispatchEvent("click");
+  const video = app.elements.get("video-player");
+  await flushSkipEvents();
+  video.onloadedmetadata();
+  await video.play();
+  video.currentTime = 65;
+  video.dispatchEvent("timeupdate");
+  await flushSkipEvents();
+  assert.deepEqual(savedMutation(app, "/api/library/1/progress", "PUT"), { position: 100, duration: 100, watched: true });
+  assert.equal(app.state.player.item.id, 2);
+  assert.equal(app.state.player.autoplay, true);
+});
+
+test("resume preserves later positions, short episodes keep their outro, and live channels do not load skip settings", async () => {
+  const app = environment({ "/api/skip?key=local%3A4": { enabled: true, intro_sec: 15, outro_sec: 25 } });
+  const video = app.elements.get("video-player");
+  app.play({ id: 4, title: "恢复", position: 48.5 });
+  await flushSkipEvents();
+  video.duration = 70;
+  video.onloadedmetadata();
+  assert.equal(video.currentTime, 48.5);
+  assert.equal(video.playCalls, 0);
+  await video.play();
+  video.dispatchEvent("timeupdate");
+  await flushSkipEvents();
+  assert.equal(video.currentTime, 48.5, "the duration must strictly exceed intro + outro + 30");
+  video.duration = 100;
+  video.pause();
+  video.currentTime = 77;
+  video.dispatchEvent("timeupdate");
+  assert.equal(video.currentTime, 77, "previewing the credits while paused does not finish the episode");
+  app.play({ name: "直播", id: 9, url: "https://media.test/live.m3u8" }, true);
+  assert.equal(app.elements.get("player-skip").hidden, true);
+  assert.deepEqual(app.calls.filter(({ url }) => url.startsWith("/api/skip?")).map(({ url }) => url), ["/api/skip?key=local%3A4"]);
+});
+
+test("a delayed skip reply cannot seek the replacement title", async () => {
+  const app = environment();
+  const fetch = app.context.fetch;
+  let release;
+  app.context.fetch = (url, options) => url === "/api/skip?key=local%3A1"
+    ? new Promise((resolve) => { release = () => resolve({ ok: true, text: async () => JSON.stringify({ enabled: true, intro_sec: 32, outro_sec: 0 }) }); })
+    : fetch(url, options);
+  const video = app.elements.get("video-player");
+  app.play({ id: 1, title: "上一个标题" });
+  video.onloadedmetadata();
+  app.play({ id: 2, title: "当前标题" });
+  video.onloadedmetadata();
+  release();
+  await flushSkipEvents();
+  assert.equal(video.currentTime, 0);
+  assert.equal(skipInputs(app.elements.get("player-skip")).enabled.checked, false);
+});
+
+test("poster surfaces retry the original URL once through the image proxy before removing the image", async () => {
+  const cover = "https://images.test/海报.jpg?size=large&key=A%2FB";
+  const item = { id: "1", source_id: 1, source_name: "甲源", title: "故事", cover };
+  const app = environment({ ...pageDiscoveryRoutes([item]), "/api/tracking": [], "/api/catalog/1/detail?id=1": { ...item, groups: [] },
+    "/api/progress": [{ ...item, entry_kind: "online", media_id: item.id, position: 30, duration: 90 }], "/api/favorites": { catalog: [item] } });
+  const discovery = await app.online();
+  await app.openCatalogDetail(item);
+  const roots = [
+    pageClass(discovery, "catalog-art")[0], pageClass(discovery, "spotlight")[0], pageClass(discovery, "continue-section")[0],
+    app.elements.get("catalog-dialog"), await app.favorites(), app.trackingRows([{ ...item, watched_episodes: 0, total_episodes: 2 }]),
+  ];
+  for (const root of roots) {
+    const image = playbackNode(root, (node) => node.tagName === "IMG", "poster");
+    let removed = false;
+    image.remove = () => { removed = true; };
+    assert.equal(image.getAttribute("src"), cover);
+    image.dispatchEvent("error");
+    assert.equal(image.getAttribute("src"), `/api/image?url=${encodeURIComponent(cover)}`);
+    assert.equal(removed, false);
+    image.dispatchEvent("error");
+    assert.equal(removed, true);
+  }
+});
+
+test("opening playback while a detail save is pending uses the newly saved skip times", async () => {
+  const { app, dialog } = await openTwoEpisodeDetail();
+  await flushSkipEvents();
+  const key = "/api/skip?key=online%3A3%3A42";
+  const fetch = app.context.fetch;
+  let persisted = { enabled: false, intro_sec: 0, outro_sec: 0 };
+  let commit;
+  app.context.fetch = async (url, options) => {
+    if (url === "/api/skip" && options.method === "PUT") {
+      await new Promise((resolve) => { commit = resolve; });
+      persisted = JSON.parse(options.body);
+    } else if (url !== key) return fetch(url, options);
+    const raw = JSON.stringify(persisted);
+    return { ok: true, text: async () => raw };
+  };
+  const { panel, enabled, intro } = skipInputs(dialog);
+  enabled.checked = true;
+  intro.value = 18.5;
+  const saving = pageButton(panel, "保存跳过设置").listeners.click[0]();
+  pageButton(dialog, "在线播放").dispatchEvent("click");
+  const video = app.elements.get("video-player");
+  video.onloadedmetadata();
+  commit();
+  await saving;
+  await flushSkipEvents();
+  assert.equal(video.currentTime, 18.5);
+  assert.equal(video.playCalls, 0);
 });
