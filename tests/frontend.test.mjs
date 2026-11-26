@@ -278,7 +278,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, favorites, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
+      "globalThis.hooks = {calendar, state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, favorites, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
     ),
     context,
   );
@@ -1708,7 +1708,7 @@ test("settings tabs render one panel at a time", async () => {
   app.state.user = { id: 1, username: "root", role: "admin" };
   const page = await app.settings();
   assert.deepEqual(pageClass(page, "filter-chip").map((chip) => chip.textContent),
-    ["账户安全", "家庭成员", "在线影视源", "电视节目单", "影视仓订阅"]);
+    ["账户安全", "家庭成员", "在线影视源", "电视节目单", "通知与日历", "影视仓订阅"]);
   const panelTitles = (view) => pageNodes(pageClass(view, "settings-panel")[0])
     .filter((node) => node.tagName === "H2").map((node) => node.textContent);
   assert.deepEqual(panelTitles(page), ["修改密码"]);
@@ -2322,4 +2322,203 @@ test("opening playback while a detail save is pending uses the newly saved skip 
   await flushSkipEvents();
   assert.equal(video.currentTime, 18.5);
   assert.equal(video.playCalls, 0);
+});
+
+test("tracking pause and resume persist only the selected subscription and update its badge", async () => {
+  const app = environment();
+  const list = app.trackingRows([{ id: 7, title: "故事", paused: false }, { id: 9, title: "另一部", paused: true }]);
+  const [row, other] = pageClass(list, "tracking-row");
+  const badge = pageClass(row, "paused")[0];
+  assert.equal(badge.hidden, true);
+  assert.equal(pageClass(other, "paused")[0].hidden, false);
+  await pageButton(row, "暂停检查").listeners.click[0]();
+  assert.equal(badge.hidden, false);
+  assert.equal(badge.textContent, "已暂停");
+  await pageButton(row, "恢复检查").listeners.click[0]();
+  assert.equal(badge.hidden, true);
+  assert.ok(pageButton(row, "暂停检查"));
+  assert.equal(pageClass(other, "paused")[0].hidden, false);
+  assert.deepEqual(app.calls.map(({ url, options }) => [url, options.method, JSON.parse(options.body)]), [
+    ["/api/tracking/7", "PUT", { paused: true }], ["/api/tracking/7", "PUT", { paused: false }],
+  ]);
+  app.context.fetch = async () => { throw new Error("无法保存"); };
+  await pageButton(row, "暂停检查").listeners.click[0]();
+  assert.equal(badge.hidden, true);
+  assert.equal(pageButton(row, "暂停检查").disabled, false);
+  assert.match(app.elements.get("toast").textContent, /无法保存/);
+});
+
+test("notification and calendar forms load and save their respective configurations", async () => {
+  const notifyPath = "/api/settings/notify", calendarPath = "/api/settings/calendar";
+  const app = environment({
+    [notifyPath]: { bark_url: "https://push.test/key", webhook_post_url: "", webhook_get_url: "https://get.test/old" },
+    [calendarPath]: { enabled: true, api_url: "https://calendar.test/original" },
+  });
+  app.state.user = { role: "admin" };
+  app.state.settingsTab = "notify";
+  const page = await app.settings();
+  const field = (name) => pageNodes(page).find((node) => node.attributes?.name === name);
+  assert.equal(field("bark_url").value, "https://push.test/key");
+  assert.equal(field("enabled").checked, true);
+  assert.equal(field("api_url").value, "https://calendar.test/original");
+  field("webhook_post_url").value = "https://post.test/new";
+  field("webhook_get_url").value = "";
+  field("enabled").checked = false;
+  field("api_url").value = "https://mirror.test/calendar";
+  for (const form of pageNodes(page).filter((node) => node.tagName === "FORM")) {
+    await form.listeners.submit[0]({ preventDefault() {} });
+  }
+  assert.deepEqual(app.calls.filter(({ options }) => options.method === "PUT").map(({ url, options }) =>
+    [url, JSON.parse(options.body), options.headers["X-PolyView-Request"]]), [
+    [notifyPath, { bark_url: "https://push.test/key", webhook_post_url: "https://post.test/new", webhook_get_url: "" }, "1"],
+    [calendarPath, { enabled: false, api_url: "https://mirror.test/calendar" }, "1"],
+  ]);
+});
+
+test("test sending reports each notification channel, empty configurations and request failures", async () => {
+  const result = { results: [
+    { channel: "bark", ok: true, message: "accepted" },
+    { channel: "webhook_post", ok: false, message: "unreachable" },
+  ] };
+  const path = "/api/settings/notify/test";
+  const app = environment({ [path]: result });
+  app.state.user = { role: "admin" };
+  app.state.settingsTab = "notify";
+  const page = await app.settings();
+  const send = pageButton(page, "测试发送");
+  const output = pageNodes(page).find((node) => node.attributes?.role === "status");
+  await send.listeners.click[0]();
+  assert.deepEqual(app.calls.filter(({ url }) => url === path).map(({ options }) =>
+    [options.method, options.headers["X-PolyView-Request"]]), [["POST", "1"]]);
+  assert.match(output.textContent, /bark：成功 · accepted/);
+  assert.match(output.textContent, /webhook_post：失败 · unreachable/);
+  result.results = [];
+  await send.listeners.click[0]();
+  assert.equal(output.textContent, "尚未配置通知渠道");
+  app.context.fetch = async () => { throw new Error("无法连接"); };
+  await send.listeners.click[0]();
+  assert.match(output.textContent, /测试发送失败：无法连接/);
+  assert.equal(send.disabled, false);
+});
+
+test("notification and calendar settings stay private to administrators", async () => {
+  const app = environment();
+  app.state.user = { role: "member" };
+  app.state.settingsTab = "notify";
+  const page = await app.settings();
+  assert.equal(app.state.settingsTab, "account");
+  assert.doesNotMatch(page.textContent, /通知与日历/);
+  assert.equal(app.calls.length, 0);
+});
+
+test("recommendations work without CMS and search the selected title across sources", async () => {
+  const cover = "https://images.example.test/poster.jpg";
+  const title = "远方";
+  const search = `/api/catalog/search?q=${encodeURIComponent(title)}`;
+  const sources = [];
+  const app = environment({
+    "/api/sources": sources,
+    "/api/catalog/recommend": { origin: "douban", groups: [
+      { title: "热门电影", kind: "movie", items: [{ title, cover, rating: "8.5" }] },
+      { title: "热门剧集", kind: "series", items: [{ title: "晴天" }] },
+    ] },
+    [search]: { results: [] },
+  });
+  const page = await app.online();
+  await new Promise(setImmediate);
+  assert.deepEqual(pageClass(page, "recommend-heading").map((node) => node.textContent), ["热门电影豆瓣", "热门剧集豆瓣"]);
+  const card = pageClass(page, "discovery-poster")[0];
+  const image = pageNodes(card).find((node) => node.tagName === "IMG");
+  assert.equal(image.attributes.src, cover);
+  image.dispatchEvent("error");
+  assert.equal(image.attributes.src, `/api/image?url=${encodeURIComponent(cover)}`);
+  card.dispatchEvent("click");
+  assert.equal(app.elements.get("search-input").value, title);
+  await new Promise(setImmediate);
+  assert.match(app.elements.get("content").textContent, /先连接一个影视源/);
+  sources.push({ id: 1, enabled: true });
+  await app.online();
+  assert.ok(app.calls.some(({ url }) => url === search));
+  assert.equal(app.calls.filter(({ url }) => url === "/api/catalog/recommend").length, 1);
+});
+
+test("CMS fallback recommendations open their source detail directly", async () => {
+  const item = { title: "晴天", source_id: 2, id: "42" };
+  const detail = "/api/catalog/2/detail?id=42";
+  const app = environment({
+    "/api/sources": [{ id: 2, enabled: true }],
+    "/api/catalog/discover?page=1": { results: [] },
+    "/api/catalog/recommend": { origin: "fallback", groups: [{ title: "热门剧集", kind: "series", items: [item] }] },
+    [detail]: { ...item, groups: [] }, "/api/tracking": [],
+  });
+  const page = await app.online();
+  assert.equal(pageClass(page, "recommend-origin")[0].textContent, "各源最新");
+  await pageClass(page, "discovery-poster")[0].listeners.click[0]();
+  assert.ok(app.calls.some(({ url }) => url === detail));
+  assert.equal(app.elements.get("catalog-dialog").open, true);
+  assert.equal(app.state.query, "");
+});
+
+test("recommendations are absent for every discovery filter and search", async () => {
+  for (const [key, value] of Object.entries({ onlineSource: "2", onlineKind: "movie", onlineCategory: "喜剧", onlineYear: "2025", onlineLang: "国语", onlineArea: "日本", query: "题名" })) {
+    const app = environment({ "/api/sources": [] });
+    app.state[key] = value;
+    const page = await app.online();
+    assert.equal(pageClass(page, "recommend-section").length, 0, key);
+    assert.equal(app.calls.some(({ url }) => url === "/api/catalog/recommend"), false, key);
+  }
+});
+
+test("calendar switches weekdays locally and tracks the selected catalog match", async () => {
+  const title = "漫长的旅程";
+  const match = { title, source_id: 3, id: "91", kind: "series" };
+  const search = `/api/catalog/search?q=${encodeURIComponent(title)}`;
+  const app = environment({
+    "/api/calendar": { enabled: true, days: [
+      { weekday: 1, items: [{ id: 123, title_cn: title, title_raw: "Journey", score: 8.1, cover: "https://poster.test/one.jpg" }] },
+      { weekday: 7, items: [{ id: 456, title_raw: "Sunday show" }] },
+    ] },
+    "/api/sources": [{ id: 3, enabled: true }], [search]: { results: [match] },
+    "/api/catalog/3/detail?id=91": { ...match, groups: [{ name: "HLS", direct: true, episodes: [{ name: "第1集", url: "https://source.test/1.m3u8" }] }] },
+    "/api/tracking": [],
+  });
+  Object.assign(app.state, { page: "calendar", query: "old", onlinePage: 2, onlineSource: "7", onlineKind: "movie", onlineYear: "2024", onlineCategory: "喜剧", onlineLang: "英语", onlineArea: "美国" });
+  const page = await app.calendar();
+  const weekdays = pageClass(page, "filter-chip");
+  assert.equal(weekdays.length, 7);
+  assert.equal(weekdays[(new Date().getDay() + 6) % 7].attributes["aria-pressed"], "true");
+  pageButton(page, "周日").dispatchEvent("click");
+  assert.match(page.textContent, /Sunday show/);
+  pageButton(page, "周一").dispatchEvent("click");
+  assert.doesNotMatch(page.textContent, /Sunday show/);
+  assert.equal(pageButton(page, "周一").attributes["aria-pressed"], "true");
+  assert.equal(app.calls.filter(({ url }) => url === "/api/calendar").length, 1);
+  const card = pageClass(page, "discovery-poster")[0];
+  assert.equal(card.attributes["aria-label"], title);
+  assert.match(card.textContent, /8\.1 分/);
+  card.dispatchEvent("click");
+  await new Promise(setImmediate);
+  assert.equal(app.state.page, "online");
+  assert.equal(app.elements.get("search-input").value, title);
+  assert.equal(app.state.onlineSource, "all");
+  assert.equal(app.state.onlinePage, 1);
+  for (const key of ["onlineKind", "onlineCategory", "onlineYear", "onlineLang", "onlineArea"]) assert.equal(app.state[key], "");
+  assert.ok(app.calls.some(({ url }) => url === search));
+  const result = pageClass(app.elements.get("content"), "poster-button")[0];
+  await result.listeners.click[0]();
+  await pageButton(app.elements.get("catalog-dialog"), "加入追剧").listeners.click[0]();
+  const request = app.calls.find(({ url, options }) => url === "/api/tracking" && options.method === "POST");
+  assert.equal(JSON.parse(request.options.body).source_id, 3);
+  assert.equal(JSON.parse(request.options.body).media_id, "91");
+});
+
+test("empty and disabled calendar responses are usable without sources", async () => {
+  const missing = environment();
+  const page = await missing.calendar();
+  assert.equal(pageClass(page, "filter-chip").length, 7);
+  assert.match(page.textContent, /当天暂无放送/);
+  const disabled = environment({ "/api/calendar": { enabled: false, days: [] } });
+  const disabledPage = await disabled.calendar();
+  assert.equal(pageClass(disabledPage, "filter-chip").length, 0);
+  assert.match(disabledPage.textContent, /放送日历已关闭/);
 });

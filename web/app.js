@@ -323,7 +323,7 @@
       document.createTextNode("影音空间 "),
       make("span", { text: "/" }),
       document.createTextNode(
-        ` ${{ online: "影视发现", library: "媒体库", live: "电视直播", favorites: "我的收藏", series: "追剧清单", downloads: "下载任务", settings: "账户与设置" }[page]}`,
+        ` ${{ online: "影视发现", calendar: "放送日历", library: "媒体库", live: "电视直播", favorites: "我的收藏", series: "追剧清单", downloads: "下载任务", settings: "账户与设置" }[page]}`,
       ),
     );
     render();
@@ -1818,6 +1818,82 @@
     }
     return root;
   }
+  function searchCatalogTitle(title) {
+    Object.assign(state, {
+      onlineSource: "all", onlineKind: "",
+      onlineCategory: "", onlineYear: "", onlineLang: "", onlineArea: "", categories: null,
+    });
+    submitSearch(title, true);
+  }
+
+  function discoveryPoster(title, cover, metadata, index, action) {
+    return make("button", {
+      type: "button", class: "poster-button discovery-poster", "aria-label": title, on: { click: action },
+    }, [
+      make("div", { class: `poster-art catalog-art tone-${index % 6}` }, [
+        cover ? posterImage(cover) : null,
+        make("span", { class: "poster-name", text: title }),
+      ]),
+      metadata ? make("span", { class: "discovery-meta", text: metadata }) : null,
+    ]);
+  }
+
+  async function loadRecommendations(box) {
+    try {
+      const data = await api("/api/catalog/recommend");
+      for (const group of data.groups || []) {
+        if (!group.items?.length) continue;
+        box.append(make("section", { class: "recommend-section" }, [
+          make("header", { class: "recommend-heading" }, [
+            make("h2", { text: group.title }),
+            make("span", { class: "recommend-origin", text: data.origin === "douban" ? "豆瓣" : "各源最新" }),
+          ]),
+          make("div", { class: "recommend-strip" }, group.items.map((item, index) =>
+            discoveryPoster(item.title, item.cover, [item.year, Number(item.rating) > 0 ? `${item.rating} 分` : null].filter(Boolean).join(" · "), index,
+              () => item.source_id != null && item.id != null
+                ? openCatalogDetail({ ...item, kind: group.kind }) : searchCatalogTitle(item.title)),
+          )),
+        ]));
+      }
+    } catch (error) {
+      box.append(make("p", { class: "hint", text: `热门榜单暂不可用：${error.message}` }));
+    }
+  }
+
+  async function calendar() {
+    const data = await api("/api/calendar");
+    const root = make("div", {}, head("放送日历", "按放送日查看剧集，搜索片源后可加入追剧清单。"));
+    if (data.enabled === false) {
+      root.append(empty("▤", "放送日历已关闭", "管理员可以在设置中开启放送日历。"));
+      return root;
+    }
+    const tabs = make("div", { class: "filters", "aria-label": "放送星期" });
+    const list = make("div", { class: "media-grid" });
+    const days = data.days || [];
+    const selectDay = (weekday) => {
+      Array.from(tabs.children).forEach((tab, index) => {
+        const active = weekday === index + 1;
+        tab.classList.toggle("active", active);
+        tab.setAttribute("aria-pressed", String(active));
+      });
+      const items = days.find((day) => day.weekday === weekday)?.items || [];
+      list.replaceChildren(...items.map((item, index) => {
+        const title = item.title_cn || item.title_raw;
+        return discoveryPoster(title, item.cover, Number(item.score) > 0 ? `${item.score} 分` : "暂无评分", index,
+          () => searchCatalogTitle(title));
+      }));
+      if (!items.length) list.append(empty("▤", "当天暂无放送", "可以查看其他日期。"));
+    };
+    [..."一二三四五六日"].forEach((day, index) => {
+      tabs.append(make("button", {
+        type: "button", class: "filter-chip", text: `周${day}`, on: { click: () => selectDay(index + 1) },
+      }));
+    });
+    selectDay(new Date().getDay() || 7);
+    root.append(tabs, list);
+    return root;
+  }
+
   async function online() {
     const sequence = renderSequence;
     state.onlineObserver?.disconnect();
@@ -1829,6 +1905,13 @@
       {},
       head("影视发现", "搜索影片、在线观看，把想追的故事加入清单。"),
     );
+    const defaultView = !state.query && state.onlineSource === "all" && !state.onlineKind &&
+      !state.onlineCategory && !state.onlineYear && !state.onlineLang && !state.onlineArea;
+    if (defaultView) {
+      const recommendations = make("div");
+      root.append(recommendations);
+      void loadRecommendations(recommendations);
+    }
     if (!state.query) {
       try {
         const entries = await api("/api/progress");
@@ -2057,15 +2140,7 @@
       }
     };
     syncGroupOrder();
-    if (
-      !state.query &&
-      !state.onlineKind &&
-      state.onlineSource === "all" &&
-      !state.onlineCategory &&
-      !state.onlineYear &&
-      !state.onlineArea &&
-      groupOrder.length
-    ) {
+    if (defaultView && groupOrder.length) {
       const featured = groupOrder.map((key) => groups.get(key)).filter((group) => group.cover).slice(0, 5);
       root.insertBefore(spotlightCard(featured.length ? featured : [groups.get(groupOrder[0])]), summary);
     }
@@ -2675,6 +2750,19 @@
             },
           },
         });
+        const pausedBadge = make("span", { class: "tracking-status paused", text: "已暂停", hidden: !subscription.paused });
+        const pause = button(subscription.paused ? "恢复检查" : "暂停检查", "subtle small-button", async () => {
+          const paused = !subscription.paused;
+          pause.disabled = true;
+          try {
+            await api(`/api/tracking/${subscription.id}`, { method: "PUT", body: { paused } });
+            subscription.paused = paused;
+            pausedBadge.hidden = !paused;
+            pause.textContent = paused ? "恢复检查" : "暂停检查";
+            toast(paused ? "已暂停检查更新" : "已恢复检查更新");
+          } catch (error) { toast(error.message, true); }
+          finally { pause.disabled = false; }
+        });
         const form = make(
           "form",
           {
@@ -2728,6 +2816,7 @@
                 class: `tracking-status${statusLabel === "来源异常" ? " error" : ""}`,
                 text: statusLabel,
               }),
+              pausedBadge,
               make("progress", {
                 class: "tracking-progress-bar",
                 max: 100,
@@ -2753,6 +2842,7 @@
                   title: subscription.title,
                 }),
               ),
+              pause,
               make("label", { class: "checkbox-label" }, [auto, "自动下载"]),
               button("取消追剧", "danger small-button", async () => {
                 if (
@@ -3663,6 +3753,49 @@
     }
     return users;
   }
+  async function notificationCalendarSettings() {
+    async function settingsPanel(path, title, definitions, actions) {
+      const panel = make("section", { class: "panel" }, make("h2", { text: title }));
+      try {
+        const fields = settingsFields(definitions, await api(path));
+        const save = button(`保存${title}设置`, "primary", null, { type: "submit" });
+        panel.append(make("form", { class: "stack", on: { submit: async (event) => {
+          event.preventDefault();
+          save.disabled = true;
+          try {
+            await api(path, { method: "PUT", body: fields.values() });
+            toast(`${title}设置已保存`);
+          } catch (error) { toast(error.message, true); }
+          finally { save.disabled = false; }
+        } } }, [...fields.labels, save]));
+        if (actions) panel.append(...actions);
+      } catch (error) { panel.append(make("p", { class: "form-error", text: error.message })); }
+      return panel;
+    }
+    const results = make("div", { role: "status", "aria-live": "polite" });
+    const test = button("测试发送", "subtle", async () => {
+      test.disabled = true;
+      results.textContent = "正在测试已保存的通知渠道…";
+      try {
+        const response = await api("/api/settings/notify/test", { method: "POST" });
+        if (!response.results.length) results.textContent = "尚未配置通知渠道";
+        else results.replaceChildren(...response.results.map(({ channel, ok, message }) =>
+          make("p", { class: ok ? "hint" : "form-error", text: `${channel}：${ok ? "成功" : "失败"} · ${message}` })));
+      } catch (error) { results.textContent = `测试发送失败：${error.message}`; }
+      finally { test.disabled = false; }
+    });
+    return Promise.all([
+      settingsPanel("/api/settings/notify", "通知", [
+        ["bark_url", "Bark 地址", "url"],
+        ["webhook_post_url", "POST Webhook 地址", "url"],
+        ["webhook_get_url", "GET Webhook 地址", "url"],
+      ], [make("p", { class: "hint", text: "留空可停用该渠道。测试发送使用已保存的地址。" }), test, results]),
+      settingsPanel("/api/settings/calendar", "放送日历", [
+        ["enabled", "启用放送日历", "checkbox"],
+        ["api_url", "日历 API 或镜像地址", "url"],
+      ]),
+    ]);
+  }
   async function settings() {
     const root = make(
       "div",
@@ -3676,6 +3809,7 @@
             ["family", "家庭成员"],
             ["sources", "在线影视源"],
             ["epg", "电视节目单"],
+            ["notify", "通知与日历"],
           ]
         : []),
       ["tvbox", "影视仓订阅"],
@@ -3709,6 +3843,7 @@
     else if (active === "family") body.append(await familySettings());
     else if (active === "sources") body.append(await sourceSettings());
     else if (active === "epg") body.append(await epgSettings());
+    else if (active === "notify") body.append(...await notificationCalendarSettings());
     else if (active === "tvbox") body.append(await tvboxSettings());
     root.append(body);
     return root;
@@ -3747,6 +3882,7 @@
     try {
       const page =
         pageName === "favorites" ? await favorites() :
+        pageName === "calendar" ? await calendar() :
         pageName === "online"
           ? await online()
           : pageName === "library"

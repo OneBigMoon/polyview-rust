@@ -1,9 +1,11 @@
 pub mod auth;
+pub mod calendar;
 pub mod catalog;
 pub mod epg;
 pub mod legacy;
 pub mod library;
 pub mod network;
+pub mod notify;
 pub mod playback;
 pub mod settings;
 pub mod tracking;
@@ -156,6 +158,8 @@ pub fn router(state: Shared) -> Router {
         .merge(tvbox::router())
         .merge(user_data::router())
         .merge(settings::router())
+        .merge(calendar::router())
+        .merge(notify::router())
         .fallback(|| async { AppError::not_found("Not found") })
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(security_headers))

@@ -10,10 +10,12 @@ use axum::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS remote_cache (cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL, fetched_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS skip_configs (
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             media_key TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
@@ -21,6 +23,22 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
             PRIMARY KEY(user_id, media_key)
         );",
     )?;
+    Ok(())
+}
+
+pub fn read_cached(conn: &Connection, key: &str, max_age: i64) -> Result<Option<Value>, AppError> {
+    let now = crate::now();
+    let raw: Option<String> = conn.query_row(
+        "SELECT payload FROM remote_cache WHERE cache_key=?1 AND fetched_at>?2 AND fetched_at<=?3",
+        params![key, now.saturating_sub(max_age), now], |row| row.get(0)
+    ).optional()?;
+    Ok(raw.and_then(|text| serde_json::from_str(&text).ok()))
+}
+
+pub fn write_cached(conn: &Connection, key: &str, value: &Value) -> Result<(), AppError> {
+    let raw = serde_json::to_string(value)
+        .map_err(|_| AppError::internal("Could not serialize remote cache"))?;
+    conn.execute("INSERT INTO remote_cache(cache_key,payload,fetched_at) VALUES(?,?,?) ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload,fetched_at=excluded.fetched_at", params![key, raw, crate::now()])?;
     Ok(())
 }
 

@@ -2,7 +2,7 @@ use crate::{
     AppError, Shared,
     auth::AuthUser,
     catalog::{self, CatalogDetail},
-    network, now,
+    ensure_column, network, notify, now,
 };
 use axum::{
     Json, Router,
@@ -39,6 +39,14 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
         );
         CREATE INDEX IF NOT EXISTS tracking_user ON tracking_subscriptions(user_id,id);",
     )?;
+    for column in ["paused", "notified_episodes"] {
+        ensure_column(
+            conn,
+            "tracking_subscriptions",
+            column,
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     Ok(())
 }
 
@@ -59,6 +67,7 @@ pub struct Subscription {
     pub total_episodes: i64,
     pub watched_episodes: i64,
     pub auto_download: bool,
+    pub paused: bool,
     pub last_checked: Option<i64>,
     pub error: Option<String>,
     pub queued_episodes: i64,
@@ -70,7 +79,7 @@ const SUBSCRIPTION_SELECT: &str =
             s.watched_episodes,s.auto_download,s.last_checked,s.error,
             (SELECT COUNT(*) FROM tracking_downloads td WHERE td.subscription_id=s.id),
             (SELECT COUNT(*) FROM tracking_downloads td JOIN downloads d ON d.id=td.download_id
-             WHERE td.subscription_id=s.id AND d.status='completed')
+             WHERE td.subscription_id=s.id AND d.status='completed'), s.paused
      FROM tracking_subscriptions s";
 
 fn subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
@@ -87,6 +96,7 @@ fn subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
         error: row.get(9)?,
         queued_episodes: row.get(10)?,
         completed_downloads: row.get(11)?,
+        paused: row.get(12)?,
     })
 }
 
@@ -190,6 +200,7 @@ async fn create(
 struct UpdateInput {
     watched_episodes: Option<i64>,
     auto_download: Option<bool>,
+    paused: Option<bool>,
 }
 
 async fn update(
@@ -200,11 +211,11 @@ async fn update(
 ) -> Result<Json<Subscription>, AppError> {
     {
         let conn = state.conn()?;
-        let (watched, total, auto): (i64, i64, bool) = conn
+        let (watched, total): (i64, i64) = conn
             .query_row(
-                "SELECT watched_episodes,total_episodes,auto_download FROM tracking_subscriptions WHERE id=? AND user_id=?",
+                "SELECT watched_episodes,total_episodes FROM tracking_subscriptions WHERE id=? AND user_id=?",
                 params![id, user.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| AppError::not_found("Subscription not found"))?;
@@ -215,8 +226,8 @@ async fn update(
             ));
         }
         conn.execute(
-            "UPDATE tracking_subscriptions SET watched_episodes=?,auto_download=? WHERE id=? AND user_id=?",
-            params![watched, input.auto_download.unwrap_or(auto), id, user.id],
+            "UPDATE tracking_subscriptions SET watched_episodes=?,auto_download=COALESCE(?,auto_download),paused=COALESCE(?,paused) WHERE id=? AND user_id=?",
+            params![watched, input.auto_download, input.paused, id, user.id],
         )?;
     }
     if input.auto_download == Some(true) {
@@ -261,7 +272,7 @@ pub async fn check_user(state: &Shared, user_id: Option<i64>) -> Result<CheckRes
     let subscriptions: Vec<(i64, i64)> = {
         let conn = state.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id,user_id FROM tracking_subscriptions WHERE (?1 IS NULL OR user_id=?1) ORDER BY id",
+            "SELECT id,user_id FROM tracking_subscriptions WHERE paused=0 AND (?1 IS NULL OR user_id=?1) ORDER BY id",
         )?;
         stmt.query_map([user_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?
@@ -282,13 +293,19 @@ pub async fn check_user(state: &Shared, user_id: Option<i64>) -> Result<CheckRes
 
 async fn check_one(state: &Shared, id: i64, user_id: i64) -> Result<usize, AppError> {
     let subscription = owned_subscription(state, id, user_id)?;
+    if subscription.paused {
+        return Ok(0);
+    }
     let detail = catalog::detail(state, subscription.source_id, &subscription.media_id).await;
     let result = detail.and_then(|detail| apply_detail(state, id, user_id, &detail));
     if let Err(ref error) = result {
-        state.conn()?.execute(
-            "UPDATE tracking_subscriptions SET last_checked=?,error=? WHERE id=? AND user_id=?",
+        let updated = state.conn()?.execute(
+            "UPDATE tracking_subscriptions SET last_checked=?,error=? WHERE id=? AND user_id=? AND paused=0",
             params![now(), error.1, id, user_id],
         )?;
+        if updated == 0 && owned_subscription(state, id, user_id)?.paused {
+            return Ok(0);
+        }
     }
     result
 }
@@ -299,6 +316,16 @@ fn apply_detail(
     user_id: i64,
     detail: &CatalogDetail,
 ) -> Result<usize, AppError> {
+    let mut conn = state.conn()?;
+    let tx = conn.transaction()?;
+    let (paused, watched, automatic, old_total, notified): (bool, i64, bool, i64, i64) = tx.query_row(
+        "SELECT paused,watched_episodes,auto_download,total_episodes,notified_episodes FROM tracking_subscriptions WHERE id=? AND user_id=?",
+        params![id, user_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional()?.ok_or_else(|| AppError::not_found("Subscription not found"))?;
+    if paused {
+        return Ok(0);
+    }
     let episodes = &detail
         .groups
         .iter()
@@ -315,21 +342,11 @@ fn apply_detail(
             "A subscription supports at most 10,000 episodes",
         ));
     }
-    let mut conn = state.conn()?;
-    let tx = conn.transaction()?;
-    let current: Option<(i64, bool)> = tx
-        .query_row(
-            "SELECT watched_episodes,auto_download FROM tracking_subscriptions WHERE id=? AND user_id=?",
-            params![id, user_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((watched, automatic)) = current else {
-        return Err(AppError::not_found("Subscription not found"));
-    };
+    let total = episodes.len() as i64;
+    let send_update = total > old_total && total > notified;
     tx.execute(
-        "UPDATE tracking_subscriptions SET title=?,cover=?,total_episodes=?,last_checked=?,error=NULL WHERE id=? AND user_id=?",
-        params![detail.title, detail.cover, episodes.len() as i64, now(), id, user_id],
+        "UPDATE tracking_subscriptions SET title=?,cover=?,total_episodes=?,notified_episodes=?,last_checked=?,error=NULL WHERE id=? AND user_id=?",
+        params![detail.title, detail.cover, total, if send_update { total } else { notified }, now(), id, user_id],
     )?;
     let mut queued = 0;
     if automatic {
@@ -367,6 +384,13 @@ fn apply_detail(
         }
     }
     tx.commit()?;
+    if send_update {
+        notify::send_in_background(
+            state,
+            "追剧更新",
+            format!("{} 已更新至 {total} 集", detail.title),
+        );
+    }
     Ok(queued)
 }
 
@@ -406,6 +430,7 @@ mod tests {
         catalog::init_schema(&conn).unwrap();
         network::init_schema(&conn).unwrap();
         init_schema(&conn).unwrap();
+        crate::settings::init_schema(&conn).unwrap();
         let state = Arc::new(AppState {
             db: Mutex::new(conn),
             media_dir,
@@ -534,7 +559,7 @@ mod tests {
                 Path(subscription.id),
                 Json(UpdateInput {
                     watched_episodes: Some(1),
-                    auto_download: None
+                    ..Default::default()
                 }),
             )
             .await
@@ -556,6 +581,7 @@ mod tests {
             Json(UpdateInput {
                 watched_episodes: Some(1),
                 auto_download: Some(true),
+                paused: None,
             }),
         )
         .await
@@ -572,7 +598,7 @@ mod tests {
                 Path(subscription.id),
                 Json(UpdateInput {
                     watched_episodes: Some(3),
-                    auto_download: None
+                    ..Default::default()
                 })
             )
             .await
@@ -656,6 +682,7 @@ mod tests {
                 Json(UpdateInput {
                     watched_episodes: Some(watched),
                     auto_download: Some(true),
+                    paused: None,
                 }),
             )
             .await

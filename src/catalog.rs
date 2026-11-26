@@ -1,3 +1,5 @@
+mod recommend;
+
 use crate::{
     AppError, Shared,
     auth::{AuthUser, require_admin},
@@ -89,6 +91,7 @@ pub fn router() -> Router<Shared> {
         .route("/api/catalog/search", get(search_handler))
         .route("/api/catalog/suggest", get(suggest_handler))
         .route("/api/catalog/discover", get(discover_handler))
+        .route("/api/catalog/recommend", get(recommend::handler))
         .route("/api/catalog/categories", get(categories_handler))
         .route("/api/catalog/{source_id}/detail", get(detail_handler))
 }

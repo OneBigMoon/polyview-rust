@@ -600,7 +600,9 @@ pub fn start_worker(state: Shared) -> JoinHandle<()> {
                         })
                         .await
                         {
-                            Ok(Ok(_)) => {}
+                            Ok(Ok(_)) => {
+                                crate::notify::send_in_background(&state, "下载已入库", job.title)
+                            }
                             Ok(Err(error)) => {
                                 tracing::warn!(error = %error.1, "Downloaded video was saved, but library scan failed")
                             }
