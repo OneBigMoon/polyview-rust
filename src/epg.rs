@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
-    sync::Mutex,
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 use tokio::task::JoinHandle;
@@ -41,14 +41,137 @@ const CHANNEL_ALIASES: &[(&str, &str)] = &[
     ("苏州4k", "苏州新闻综合"),
     ("青岛qtv2", "青岛TV2"),
     ("青岛qtv5", "青岛TV5"),
-    ("凤凰香港", "凤凰中文"),
+    ("鳳凰香港台", "凤凰香港"),
     ("cgtn西语", "CGTN西班牙语"),
-    ("人间卫视", "人間衛視"),
-    ("无线新闻", "無綫新聞台"),
+    ("人間衛視", "人间卫视"),
+    ("无线新闻", "无线新闻台"),
+    ("無綫新聞台", "无线新闻台"),
+    ("無線新聞台", "无线新闻台"),
     ("好消息综合台", "好消息"),
+    ("好消息綜合台", "好消息"),
     ("cgtn阿语", "CGTN阿拉伯语"),
     ("法国24", "France 24"),
+    ("CCTV1综合", "CCTV1"),
+    ("中央一套", "CCTV1"),
+    ("央视综合", "CCTV1"),
+    ("CCTV2财经", "CCTV2"),
+    ("中央二套", "CCTV2"),
+    ("CCTV3综艺", "CCTV3"),
+    ("中央三套", "CCTV3"),
+    ("CCTV4中文国际", "CCTV4"),
+    ("中央四套", "CCTV4"),
+    ("CCTV4欧洲", "CCTV4欧洲版"),
+    ("CCTV4美洲", "CCTV4美洲版"),
+    ("CCTV4亚洲", "CCTV4亚洲版"),
+    ("CCTV5体育", "CCTV5"),
+    ("中央五套", "CCTV5"),
+    ("CCTV5+体育赛事", "CCTV5+"),
+    ("CCTV5plus", "CCTV5+"),
+    ("CCTV体育赛事", "CCTV5+"),
+    ("CCTV6电影", "CCTV6"),
+    ("中央六套", "CCTV6"),
+    ("CCTV7国防军事", "CCTV7"),
+    ("中央七套", "CCTV7"),
+    ("CCTV8电视剧", "CCTV8"),
+    ("中央八套", "CCTV8"),
+    ("中央九套", "CCTV9"),
+    ("CCTV10科教", "CCTV10"),
+    ("中央十套", "CCTV10"),
+    ("CCTV11戏曲", "CCTV11"),
+    ("CCTV12社会与法", "CCTV12"),
+    ("CCTV13新闻", "CCTV13"),
+    ("央视新闻", "CCTV13"),
+    ("CCTV14少儿", "CCTV14"),
+    ("央视少儿", "CCTV14"),
+    ("CCTV15音乐", "CCTV15"),
+    ("CCTV16奥林匹克", "CCTV16"),
+    ("CCTV17农业农村", "CCTV17"),
+    ("CCTV4K超高清", "CCTV4K"),
+    ("CCTV8K超高清", "CCTV8K"),
+    ("CCTV第一剧场", "第一剧场"),
+    ("CCTV怀旧剧场", "怀旧剧场"),
+    ("CCTV风云剧场", "风云剧场"),
+    ("CCTV风云足球", "风云足球"),
+    ("CCTV高尔夫网球", "高尔夫网球"),
+    ("CCTV央视台球", "央视台球"),
+    ("CCTV电视指南", "电视指南"),
+    ("CCTV文化精品", "央视文化精品"),
+    ("CGTN英语", "CGTN"),
+    ("CGTN法语", "CGTN法语频道"),
+    ("CGTN俄语", "CGTN俄语频道"),
+    ("CGTN Documentary", "CGTN纪录"),
+    ("北京电视台卫视频道", "北京卫视"),
+    ("BTV北京卫视", "北京卫视"),
+    ("上海东方卫视", "东方卫视"),
+    ("上海卫视", "东方卫视"),
+    ("湖南电视台卫视频道", "湖南卫视"),
+    ("浙江电视台卫视频道", "浙江卫视"),
+    ("江苏电视台卫视频道", "江苏卫视"),
+    ("山东电视台卫视频道", "山东卫视"),
+    ("天津电视台卫视频道", "天津卫视"),
+    ("重庆电视台卫视频道", "重庆卫视"),
+    ("安徽电视台卫视频道", "安徽卫视"),
+    ("河南电视台卫视频道", "河南卫视"),
+    ("湖北电视台卫视频道", "湖北卫视"),
+    ("江西电视台卫视频道", "江西卫视"),
+    ("四川电视台卫视频道", "四川卫视"),
+    ("广东电视台卫视频道", "广东卫视"),
+    ("广东南方卫视", "大湾区卫视"),
+    ("南方卫视", "大湾区卫视"),
+    ("深圳电视台卫视频道", "深圳卫视"),
+    ("福建东南卫视", "东南卫视"),
+    ("厦门电视台卫视频道", "厦门卫视"),
+    ("黑龙江电视台卫视频道", "黑龙江卫视"),
+    ("辽宁电视台卫视频道", "辽宁卫视"),
+    ("吉林电视台卫视频道", "吉林卫视"),
+    ("贵州电视台卫视频道", "贵州卫视"),
+    ("云南电视台卫视频道", "云南卫视"),
+    ("广西电视台卫视频道", "广西卫视"),
+    ("旅游卫视", "海南卫视"),
+    ("湖南金鹰卡通", "金鹰卡通"),
+    ("上海炫动卡通", "哈哈炫动"),
+    ("北京卡酷少儿", "卡酷少儿"),
+    ("江苏优漫卡通", "优漫卡通"),
+    ("广东嘉佳卡通", "嘉佳卡通"),
+    ("广东体育频道", "广东体育"),
+    ("上海五星体育", "五星体育"),
+    ("北京体育休闲", "北京广播电视台体育休闲频道"),
+    ("鳳凰衛視中文台", "凤凰中文"),
+    ("凤凰中文台", "凤凰中文"),
+    ("凤凰卫视资讯台", "凤凰资讯"),
+    ("凤凰资讯台", "凤凰资讯"),
+    ("TVB翡翠台", "翡翠台"),
+    ("無綫翡翠台", "翡翠台"),
+    ("TVB明珠台", "明珠台"),
+    ("TVB Pearl", "明珠台"),
+    ("TVB Jade", "翡翠台"),
+    ("TVB News Channel", "无线新闻台"),
+    ("ViuTV 99", "ViuTV"),
+    ("ViuTVsix 96", "ViuTVsix"),
+    ("澳視澳門", "澳视澳门台"),
+    ("澳門綜藝", "澳视综艺台"),
+    ("台灣電視台", "台视主频"),
+    ("台視", "台视主频"),
+    ("中視主頻", "中视"),
+    ("華視主頻", "华视"),
+    ("民視無線台", "民视"),
+    ("公共電視台", "公视"),
+    ("東森新聞台", "东森新闻"),
+    ("東森幼幼台", "东森幼幼"),
+    ("緯來體育台", "纬来体育"),
+    ("緯來日本台", "纬来日本"),
 ];
+
+// Index both spellings so an XMLTV feed may use either side of an alias.
+static CHANNEL_NAMES: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
+    let mut names = HashMap::new();
+    for &(alias, target) in CHANNEL_ALIASES {
+        let key = normalize(target);
+        names.insert(normalize(alias), key.clone());
+        names.entry(key.clone()).or_insert(key);
+    }
+    names
+});
 const EPG_STALE_SECONDS: i64 = 6 * 60 * 60;
 const CATCHUP_SECONDS: i64 = 7 * 24 * 3600;
 pub(crate) const ALIASES_KEY: &str = "epg_aliases";
@@ -613,14 +736,7 @@ fn parse_xmltv(body: &str) -> Result<ParsedEpg, AppError> {
 
 fn channel_key(name: &str, custom: &HashMap<String, String>) -> String {
     let key = normalize(name);
-    if let Some(target) = custom.get(&key) {
-        return target.clone();
-    }
-    CHANNEL_ALIASES
-        .iter()
-        .find(|(local, _)| *local == key)
-        .map(|(_, target)| normalize(target))
-        .unwrap_or(key)
+    custom.get(&key).cloned().unwrap_or(key)
 }
 
 fn find_channel<'a>(
@@ -636,37 +752,120 @@ fn find_channel<'a>(
 fn normalize(value: &str) -> String {
     value
         .chars()
+        .map(fold_channel_char)
         .flat_map(char::to_lowercase)
         .filter(|c| c.is_alphanumeric() || *c == '+')
         .collect()
 }
 
-fn canonical(value: &str) -> String {
+// Playlist and XMLTV names commonly mix simplified, traditional and full-width text.
+fn fold_channel_char(c: char) -> char {
+    match c {
+        '！'..='～' => char::from_u32(c as u32 - 0xfee0).unwrap(),
+        '臺' => '台',
+        '衛' => '卫',
+        '視' => '视',
+        '綜' => '综',
+        '藝' => '艺',
+        '體' => '体',
+        '賽' => '赛',
+        '電' => '电',
+        '劇' => '剧',
+        '頻' => '频',
+        '國' => '国',
+        '際' => '际',
+        '聞' => '闻',
+        '軍' => '军',
+        '紀' => '纪',
+        '錄' => '录',
+        '財' => '财',
+        '經' => '经',
+        '樂' => '乐',
+        '兒' => '儿',
+        '戲' => '戏',
+        '會' => '会',
+        '與' => '与',
+        '奧' => '奥',
+        '農' => '农',
+        '業' => '业',
+        '歐' => '欧',
+        '亞' => '亚',
+        '線' | '綫' => '线',
+        '東' => '东',
+        '廣' => '广',
+        '滬' => '沪',
+        '蘇' => '苏',
+        '龍' => '龙',
+        '遼' => '辽',
+        '寧' => '宁',
+        '雲' => '云',
+        '貴' => '贵',
+        '慶' => '庆',
+        '門' => '门',
+        '廈' => '厦',
+        '島' => '岛',
+        '灣' => '湾',
+        '區' => '区',
+        '藍' => '蓝',
+        '標' => '标',
+        '無' => '无',
+        '鳳' => '凤',
+        '資' => '资',
+        '訊' => '讯',
+        '來' => '来',
+        '緯' => '纬',
+        '華' => '华',
+        '間' => '间',
+        '優' => '优',
+        '鷹' => '鹰',
+        '動' => '动',
+        '風' => '风',
+        '語' => '语',
+        '場' => '场',
+        '懷' => '怀',
+        '舊' => '旧',
+        '爾' => '尔',
+        '網' => '网',
+        '時' => '时',
+        _ => c,
+    }
+}
+
+pub(crate) fn public_channel_key(key: &str) -> bool {
+    CHANNEL_NAMES.contains_key(key)
+}
+
+pub(crate) fn canonical(value: &str) -> String {
     let mut name = normalize(value);
-    for suffix in ["高清", "超清", "蓝光", "4k", "hd", "频道", "台"] {
-        if let Some(stripped) = name.strip_suffix(suffix) {
-            name = stripped.to_string();
+    // A trailing number, '+', or region is part of a station's identity. Only
+    // remove recognized presentation suffixes, after trying the full name.
+    loop {
+        if let Some(target) = CHANNEL_NAMES.get(&name) {
+            return target.clone();
         }
-    }
-    let Some(rest) = name.strip_prefix("cctv") else {
-        return name;
-    };
-    let mut digits = String::new();
-    let mut plus = false;
-    for c in rest.chars() {
-        if c.is_ascii_digit() && !plus {
-            digits.push(c);
-        } else if c == '+' && !digits.is_empty() {
-            plus = true;
-            break;
-        } else {
-            break;
-        }
-    }
-    if digits.is_empty() {
-        name
-    } else {
-        format!("cctv{digits}{}", if plus { "+" } else { "" })
+        let Some(suffix) = [
+            "超高清",
+            "高清",
+            "超清",
+            "标清",
+            "蓝光",
+            "1080p",
+            "1080i",
+            "720p",
+            "uhd",
+            "fhd",
+            "hd",
+            "sd",
+            "8k",
+            "4k",
+            "频道",
+            "台",
+        ]
+        .into_iter()
+        .find(|&suffix| name.len() > suffix.len() && name.ends_with(suffix)) else {
+            return name;
+        };
+        name.truncate(name.len() - suffix.len());
     }
 }
 
@@ -978,6 +1177,45 @@ mod tests {
             Some("2")
         );
     }
+    #[test]
+    fn public_aliases_match_both_xmltv_spellings_and_preserve_distinct_stations() {
+        let unique: HashSet<_> = CHANNEL_ALIASES
+            .iter()
+            .map(|(alias, _)| normalize(alias))
+            .collect();
+        assert!(unique.len() >= 80);
+        for &(alias, target) in CHANNEL_ALIASES {
+            for (feed_name, local_name) in [(alias, target), (target, alias)] {
+                let feed = parse_xmltv(&format!(
+                    "<tv><channel id='station'><display-name>{feed_name}</display-name></channel></tv>"
+                )).unwrap();
+                assert_eq!(
+                    find_channel(&default_key(local_name), &feed.aliases, &feed.canonical)
+                        .map(String::as_str),
+                    Some("station"),
+                    "{local_name} against {feed_name}"
+                );
+            }
+        }
+        assert_eq!(
+            canonical("ＣＣＴＶ－５＋體育賽事 高清"),
+            canonical("CCTV5+")
+        );
+        assert_eq!(canonical("東方衛視 超高清"), canonical("上海东方卫视"));
+        for (left, right) in [
+            ("CCTV-1 4K", "CCTV10高清"),
+            ("CCTV5体育", "CCTV5+体育赛事"),
+            ("CCTV4K", "CCTV4"),
+            ("CCTV8K", "CCTV8"),
+            ("CCTV4欧洲版", "CCTV4美洲版"),
+            ("鳳凰香港台", "鳳凰衛視中文台"),
+            ("青岛QTV2", "青岛QTV5"),
+            ("東森新聞台", "東森財經新聞台"),
+        ] {
+            assert_ne!(canonical(left), canonical(right), "{left} / {right}");
+        }
+    }
+
     #[test]
     fn curated_channel_aliases_match_xmltv_names() {
         let body = r#"<?xml version="1.0"?>

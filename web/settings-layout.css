@@ -1,0 +1,169 @@
+.settings-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 20px;
+}
+
+.settings-layout > .page-head { margin-bottom: 0; }
+.settings-layout > .settings-tabs,
+.settings-layout .panel {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--glass-surface);
+  backdrop-filter: var(--glass-filter);
+  box-shadow: var(--shadow), var(--inner-highlight);
+}
+
+.settings-layout > .settings-tabs {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin: 0;
+  padding: 6px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scroll-padding-inline: 8px;
+}
+.settings-layout > .settings-tabs > button {
+  flex: none;
+  min-height: 44px;
+  padding-inline: 14px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  white-space: nowrap;
+  color: var(--ink);
+  background: transparent;
+}
+.settings-layout > .settings-tabs > button[aria-pressed="true"] {
+  border-color: var(--line-strong);
+  color: var(--ink);
+  background: var(--accent-soft);
+  font-weight: 700;
+}
+.settings-category { display: none; }
+.settings-layout .settings-panel,
+.settings-layout .cloud-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+  min-width: 0;
+}
+.settings-layout .panel { min-width: 0; margin: 0; padding: clamp(16px, 2vw, 24px); }
+.settings-layout fieldset { min-inline-size: 0; }
+.settings-layout :is(.panel, fieldset, legend, label, .hint, .media-record) { overflow-wrap: anywhere; }
+
+/* Two fields per row when space permits, including on wide TV screens. */
+.settings-layout :is(.settings-form-grid, form.stack, .form-row:has(> label), form.source-row, .media-fields, .cloud-binding, .cloud-import > .stack) {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, max(260px, calc(50% - 8px))), 1fr));
+  align-items: end;
+  gap: 16px;
+}
+.settings-layout :is(.settings-full-row, .source-advanced, .cloud-editor > h3, .cloud-actions, .settings-form-grid > h3, .settings-form-grid > p) { grid-column: 1 / -1; }
+.settings-layout .panel label {
+  display: flex;
+  flex-wrap: wrap;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  min-width: 0;
+  gap: 6px 8px;
+  color: var(--ink);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+.settings-layout .panel label > :is(input:not([type="checkbox"]), select, textarea) {
+  flex: 1 0 100%;
+  width: 100%;
+  min-width: 0;
+}
+.settings-layout .panel :is(input:not([type="checkbox"]):not([type="file"]), select) {
+  height: 40px;
+  min-height: 40px;
+  min-width: 0;
+  border-radius: 10px;
+}
+.settings-layout :is(input[type="password"], input[type="url"], .source-batch-dialog textarea, [name="channels_json"], .tvbox-configs input, .tvbox-links input) {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.settings-layout .configured-badge {
+  justify-self: start;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--success) 12%, var(--surface));
+  color: var(--ink);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.settings-layout .panel :is(.checkbox-label, .cloud-check) {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  min-height: 44px;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--glass-surface);
+  cursor: pointer;
+}
+.settings-layout .panel :is(.checkbox-label, .cloud-check) > input[type="checkbox"] {
+  appearance: none;
+  display: inline-grid;
+  place-items: center start;
+  flex: 0 0 36px;
+  width: 36px;
+  height: 22px;
+  min-height: 22px;
+  padding: 2px;
+  margin: 0;
+  border: 1px solid var(--muted);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+}
+.settings-layout .panel :is(.checkbox-label, .cloud-check) > input[type="checkbox"]::before {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.settings-layout .panel :is(.checkbox-label, .cloud-check) > input[type="checkbox"]:checked {
+  justify-items: end;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--surface);
+}
+.settings-layout .panel :is(.checkbox-label, .cloud-check) > input:disabled { opacity: .55; cursor: default; }
+.settings-layout :is(input, select, textarea, button, summary, a):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.settings-layout .panel [hidden] { display: none; }
+
+@media (min-width: 1024px) {
+  .settings-layout { grid-template-columns: 208px minmax(0, 1fr); gap: 28px; }
+  .settings-layout > .page-head { grid-column: 1 / -1; }
+  .settings-layout > .settings-tabs { flex-direction: column; align-items: stretch; padding: 12px; }
+  .settings-layout > .settings-tabs > button { text-align: start; }
+  .settings-category {
+    display: block;
+    padding: 12px 12px 2px;
+    color: var(--muted);
+    font-size: 0.75rem;
+    font-weight: 700;
+  }
+  .settings-category:first-child { padding-top: 2px; }
+  .settings-category:not(:first-child) { margin-top: 4px; border-top: 1px solid var(--line); }
+}
+@media (forced-colors: active) {
+  .settings-layout .panel :is(.checkbox-label, .cloud-check) > input[type="checkbox"] { appearance: auto; }
+  .settings-layout .panel :is(.checkbox-label, .cloud-check) > input[type="checkbox"]::before { display: none; }
+}

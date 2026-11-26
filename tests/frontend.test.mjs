@@ -11,7 +11,7 @@ const application = await readFile(
 );
 const mediaScript = new vm.Script(await readFile(new URL("../web/media-settings.js", import.meta.url), "utf8"));
 
-function environment(routes = {}, { canPlayType = () => "" } = {}) {
+function environment(routes = {}, { canPlayType = () => "", storage = {} } = {}) {
   const elements = new Map();
   const calls = [];
   const order = [];
@@ -34,7 +34,6 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
           return this.classes.has(name);
         },
       };
-      this.style = { cssText: "" };
       this.open = false;
       this.currentTime = 0;
       this.duration = 100;
@@ -155,6 +154,11 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "player-speed",
     "player-guide-toggle",
     "player-guide",
+    "player-channel-toggle",
+    "player-channel-drawer",
+    "player-channel-close",
+    "player-channel-groups",
+    "player-channel-list",
     "player-stage",
     "player-prev",
     "player-next",
@@ -173,6 +177,9 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "series-badge",
     "downloads-badge",
     "theme-toggle",
+    "tv-mode-toggle",
+    "bg-mode-toggle",
+    "mobile-more",
     "nav-toggle",
     "toast",
   ]) {
@@ -230,6 +237,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     },
     getElementById: (id) => elements.get(id) ?? null,
     createElement: (tag) => new Element(tag),
+    createElementNS: (_namespace, tag) => new Element(tag),
     createTextNode: (text) => ({ nodeType: 3, textContent: text }),
     querySelector: (selector) =>
       selector === 'meta[name="theme-color"]' ? meta : null,
@@ -243,7 +251,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
       return Promise.resolve();
     },
   };
-  const storage = {};
+
   const context = vm.createContext({
     document,
     navigator: { onLine: true, clipboard: { writeText: async () => {} } },
@@ -284,7 +292,7 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
   vm.runInContext(
     application.replace(
       marker,
-      "globalThis.hooks = {cloud, calendar, state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, favorites, series, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
+      "globalThis.hooks = {setNav, cloud, calendar, state, play, closePlayer, saveProgress, openCatalogDetail, authMode, switchLiveSource, guideView, channelsWithPrograms, live, online, updateNavBadges, library, favorites, series, settings, trackingRows, downloadList, downloads, spotlightCard, syncConnection, cycleSpeed, playerGuide, statusGroup};\n})();",
     ),
     context,
   );
@@ -687,6 +695,19 @@ test("playback toggles the background pause state", () => {
   assert.equal(app.document.body.dataset.playing, "0");
   app.closePlayer();
 });
+
+test("closing an active live player resumes the background without waiting for a pause event", () => {
+  const app = environment();
+  const video = app.elements.get("video-player");
+  app.play({ name: "测试频道", url: "http://iptv.example/live.m3u8" }, true);
+  app.hlsInstances[0].emit("manifest_parsed");
+  video.dispatchEvent("play");
+  assert.equal(app.document.body.dataset.playing, "1");
+  app.elements.get("player-close").dispatchEvent("click");
+  assert.equal(app.elements.get("player-dialog").open, false);
+  assert.equal(app.document.body.dataset.playing, "0");
+});
+
 test("the live player shows current and upcoming programmes on the right", () => {
   const app = environment();
   const now = Math.floor(Date.now() / 1000);
@@ -709,6 +730,136 @@ test("the live player shows current and upcoming programmes on the right", () =>
   assert.doesNotMatch(guide.textContent, /别的频道/);
   app.closePlayer();
   assert.equal(guide.hidden, true);
+});
+
+function theaterKey(app, key, target = app.elements.get("player-stage"), options = {}) {
+  let handled = false;
+  app.elements.get("player-stage").dispatchEvent("keydown", {
+    key, target, preventDefault() { handled = true; }, stopPropagation() {}, ...options,
+  });
+  return handled;
+}
+
+test("live drawer pins favorites, filters groups and switches without closing fullscreen", () => {
+  const app = environment();
+  const channels = [
+    { id: 1, name: "综合", group_name: "央视", sources: [{ id: 11, latency_ms: 23 }] },
+    { id: 2, name: "电影", group_name: "央视", favorite: true, sources: [{ id: 21 }, { id: 22 }, { id: 23 }] },
+    { id: 3, name: "海岸", group_name: "地方", sources: [{ id: 31 }] },
+  ];
+  app.play(channels[0], true, channels.slice(0, 2), 0, false, null, channels);
+  const drawer = app.elements.get("player-channel-drawer");
+  const toggle = app.elements.get("player-channel-toggle");
+  const groups = app.elements.get("player-channel-groups");
+  const list = app.elements.get("player-channel-list");
+  app.elements.get("player-fullscreen").dispatchEvent("click");
+  assert.equal(theaterKey(app, "Enter"), true);
+  assert.equal(drawer.hidden, false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(groups.children[0].textContent, "★ 收藏");
+  assert.match(list.children[0].textContent, /电影.*3 线路/);
+  assert.match(list.children[1].textContent, /综合.*23 ms/);
+  assert.equal(list.children[1].getAttribute("aria-current"), "true");
+  pageButton(groups, "★ 收藏").dispatchEvent("click");
+  assert.equal(list.children.length, 1);
+  pageButton(groups, "地方").dispatchEvent("click");
+  list.children[0].dispatchEvent("click");
+  assert.equal(app.state.player.item.name, "海岸");
+  assert.equal(drawer.hidden, true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(app.document.fullscreenElement, app.elements.get("player-stage"));
+  assert.equal(app.order.filter((op) => op === "open:player-dialog").length, 1);
+  theaterKey(app, "M", undefined, { shiftKey: true });
+  assert.equal(drawer.hidden, false);
+  app.elements.get("player-channel-close").dispatchEvent("click");
+  assert.equal(drawer.hidden, true);
+  app.closePlayer();
+});
+
+test("live remote keys tune in both directions and leave focused inputs and VOD controls alone", () => {
+  const app = environment();
+  const channels = [1, 2, 3].map((id) => ({ id, name: String(id), sources: [1, 2, 3].map((n) => ({ id: id * 10 + n })) }));
+  app.play(channels[1], true, channels, 1);
+  assert.equal(theaterKey(app, "ArrowLeft"), true);
+  assert.equal(app.state.player.sourceIndex, 2);
+  assert.equal(theaterKey(app, "ArrowRight"), true);
+  assert.equal(app.state.player.sourceIndex, 0);
+  theaterKey(app, "ArrowUp");
+  assert.equal(app.state.player.item.id, 1);
+  theaterKey(app, "ArrowDown");
+  assert.equal(app.state.player.item.id, 2);
+  assert.equal(theaterKey(app, "ArrowDown", { tagName: "SELECT" }), false);
+  assert.equal(theaterKey(app, "ArrowDown", { isContentEditable: true }), false);
+  assert.equal(theaterKey(app, "Enter", { closest: () => ({ tagName: "BUTTON" }) }), false);
+  assert.equal(app.state.player.item.id, 2);
+  app.play({ id: 12, title: "电影" });
+  assert.equal(theaterKey(app, "m"), false);
+  assert.equal(theaterKey(app, "ArrowRight"), false);
+  assert.equal(app.elements.get("player-channel-toggle").hidden, true);
+  assert.equal(app.elements.get("video-player").controls, true);
+  app.closePlayer();
+});
+
+test("live controls fade after three fullscreen idle seconds and wake for pointer or focus", () => {
+  const app = environment();
+  const stage = app.elements.get("player-stage");
+  const timers = new Map();
+  let serial = 0;
+  app.context.setTimeout = (fn, delay) => { timers.set(++serial, { fn, delay }); return serial; };
+  app.context.clearTimeout = (handle) => timers.delete(handle);
+  app.play({ id: 1, name: "频道", sources: [{ id: 10 }] }, true);
+  stage.dispatchEvent("pointermove");
+  assert.equal(timers.size, 0);
+  app.elements.get("player-fullscreen").dispatchEvent("click");
+  function idle() {
+    const timer = [...timers.values()].find(({ delay }) => delay === 3000);
+    assert.ok(timer);
+    timer.fn();
+  }
+  idle();
+  assert.ok(stage.classes.has("controls-idle"));
+  stage.dispatchEvent("pointermove");
+  assert.equal(stage.classes.has("controls-idle"), false);
+  idle();
+  stage.dispatchEvent("focusin");
+  assert.equal(stage.classes.has("controls-idle"), false);
+  theaterKey(app, "m");
+  assert.equal(timers.size, 0);
+  theaterKey(app, "Escape");
+  app.closePlayer();
+  assert.equal(timers.size, 0);
+  assert.equal(stage.classes.has("controls-idle"), false);
+});
+
+test("player guide advances live progress and replays a protected programme from a prior day", async () => {
+  const now = Math.floor(new Date(2026, 5, 10, 12).getTime() / 1000);
+  let seconds = now;
+  const start = new Date(2026, 5, 9).getTime() / 1000;
+  const end = new Date(2026, 5, 10).getTime() / 1000;
+  const prior = { channel_id: 1, start: start + 3600, stop: start + 7200, title: "昨日新闻" };
+  const app = environment({ [`/api/epg?start=${start}&end=${end}`]: { programs: [prior] } });
+  app.context.Date = class extends Date { static now() { return seconds * 1000; } };
+  let tick;
+  app.context.setTimeout = (fn, delay) => { if (delay === 15000) tick = fn; return 1; };
+  app.state.epg = { programs: [
+    { channel_id: 1, start: now - 120, stop: now + 120, title: "午间" },
+    { channel_id: 1, start: now + 120, stop: now + 600, title: "午后" },
+  ] };
+  app.play({ id: 1, name: "综合", sources: [{ id: 10 }, { id: 11, catchup: true }] }, true);
+  const guide = app.elements.get("player-guide");
+  const meter = pageClass(guide, "guide-progress")[0];
+  assert.equal(Number(meter.value), 120);
+  seconds += 15;
+  tick();
+  assert.equal(Number(meter.value), 135);
+  const menu = pageNodes(guide).find((el) => el.tagName === "SELECT");
+  menu.value = String(start);
+  await menu.listeners.change[0]();
+  pageClass(guide, "player-guide-replay")[0].dispatchEvent("click");
+  assert.equal(app.state.player.program.title, "昨日新闻");
+  assert.equal(app.elements.get("video-player").src, `/api/channels/lines/11/stream?start=${prior.start}&end=${prior.stop}`);
+  assert.equal(app.state.player.sources.length, 1);
+  app.closePlayer();
 });
 
 test("Esc that exits fullscreen does not close the live player", () => {
@@ -785,19 +936,12 @@ test("the guide starts at the current programme and hides past programmes", () =
   assert.match(view.textContent, /后续节目/);
   assert.doesNotMatch(view.textContent, /已过期节目/);
   assert.match(view.textContent, /从当前节目开始/);
-  const programs = [];
-  const walk = (node) => {
-    if (/(^|\s)epg-program(\s|$)/.test(node?.className || "")) programs.push(node);
-    (node?.children || []).forEach((child) => {
-      if (typeof child === "object") walk(child);
-    });
-  };
-  walk(view);
+  const slots = pageNodes(view).filter((node) => node.tagName === "FOREIGNOBJECT" && node.firstChild?.className?.split(" ").includes("epg-program"));
+  const programs = slots.map((slot) => slot.firstChild);
   assert.equal(programs.length, 2);
   assert.equal(programs[0].className, "epg-program current");
-  assert.equal(programs[0].style.cssText, "left:0px;width:120px");
+  assert.deepEqual(slots.map((slot) => [slot.getAttribute("x"), slot.getAttribute("width")]), [["0", "120"], ["120", "120"]]);
   assert.match(programs[0].attributes.title, /^新闻联播 /);
-  assert.equal(programs[1].style.cssText, "left:120px;width:120px");
   app.state.liveGroup = "央视";
   const filtered = app.guideView(3600, 14400, 5400);
   assert.match(filtered.textContent, /CCTV-1 综合/);
@@ -828,6 +972,48 @@ test("the live guide keeps only channels that have programme data", () => {
   );
   assert.deepEqual(app.channelsWithPrograms(channels, []), []);
 });
+test("TV mode scales the root and restores the saved choice on a new visit", () => {
+  const storage = {};
+  const first = environment({}, { storage });
+  const button = first.elements.get("tv-mode-toggle");
+  assert.equal(button.getAttribute("aria-pressed"), "false");
+  button.dispatchEvent("click");
+  assert.equal(first.documentElement.dataset.tv, "1");
+  assert.equal(button.getAttribute("aria-pressed"), "true");
+  const second = environment({}, { storage });
+  assert.equal(second.documentElement.dataset.tv, "1");
+  second.elements.get("tv-mode-toggle").dispatchEvent("click");
+  assert.equal(storage["polyview-tv-mode"], "0");
+});
+
+test("background motion cycles through three preferences and restores static mode", () => {
+  const storage = { "polyview-bg-mode": "obsolete" };
+  const first = environment({}, { storage });
+  const control = first.elements.get("bg-mode-toggle");
+  assert.equal(first.documentElement.dataset.bgMode, "standard");
+  control.dispatchEvent("click");
+  assert.equal(first.documentElement.dataset.bgMode, "soft");
+  control.dispatchEvent("click");
+  assert.equal(storage["polyview-bg-mode"], "static");
+  const second = environment({}, { storage });
+  const restored = second.elements.get("bg-mode-toggle");
+  assert.match(restored.getAttribute("aria-label"), /静态/);
+  restored.dispatchEvent("click");
+  assert.equal(second.documentElement.dataset.bgMode, "standard");
+});
+
+test("route changes update the backdrop and indicate secondary pages under More", () => {
+  const app = environment();
+  app.setNav("settings");
+  assert.equal(app.document.body.dataset.view, "settings");
+  assert.equal(app.elements.get("mobile-more").getAttribute("aria-current"), "true");
+  app.setNav("library");
+  assert.equal(app.document.body.dataset.view, "library");
+  assert.equal(app.elements.get("mobile-more").getAttribute("aria-current"), null);
+  app.authMode(false);
+  assert.equal(app.document.body.dataset.view, "auth");
+});
+
 test("the theme toggle switches between light and dark", () => {
   const app = environment();
   const toggle = app.elements.get("theme-toggle");
@@ -1956,8 +2142,11 @@ test("settings tabs render one panel at a time", async () => {
   app.state.page = "settings";
   app.state.user = { id: 1, username: "root", role: "admin" };
   const page = await app.settings();
-  assert.deepEqual(pageClass(page, "filter-chip").map((chip) => chip.textContent),
-    ["账户安全", "家庭成员", "在线影视源", "解析接口", "网盘与资源频道", "媒体自动化", "直播与节目单", "通知与日历", "备份与工具", "影视仓订阅"]);
+  const nav = page.children.find((node) => node.className === "settings-tabs");
+  assert.deepEqual(nav.children.filter((node) => node.tagName === "BUTTON").map((chip) => chip.textContent),
+    ["账户安全", "影视仓订阅", "在线影视源", "解析接口", "网盘与资源频道", "直播与节目单", "媒体自动化", "通知与日历", "家庭成员", "备份与工具"]);
+  assert.deepEqual(pageClass(nav, "settings-category").map((label) => label.textContent), ["个人", "内容与源", "自动化与系统"]);
+  assert.equal(pageClass(page, "settings-panel")[0].getAttribute("aria-labelledby"), pageButton(nav, "账户安全").getAttribute("id"));
   const panelTitles = (view) => pageNodes(pageClass(view, "settings-panel")[0])
     .filter((node) => node.tagName === "H2").map((node) => node.textContent);
   assert.deepEqual(panelTitles(page), ["修改密码"]);
@@ -1966,6 +2155,41 @@ test("settings tabs render one panel at a time", async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(panelTitles(app.elements.get("content")), ["家庭成员"]);
   assert.ok(app.calls.some((call) => call.url === "/api/users"));
+});
+
+test("live merge setting loads, persists and restores the previous value on a failed write", async () => {
+  const path = "/api/settings/live";
+  const app = environment();
+  app.state.settingsTab = "epg";
+  app.state.user = { role: "admin" };
+  const originalFetch = app.context.fetch;
+  let saved = false, fail = false;
+  app.context.fetch = async (url, options) => {
+    if (url !== path) return originalFetch(url, options);
+    if (options.method === "PUT") {
+      assert.equal(options.headers["X-PolyView-Request"], "1");
+      if (fail) return Response.json({ error: "保存失败" }, { status: 503 });
+      saved = JSON.parse(options.body).live_merge_similar;
+    }
+    return Response.json({ live_merge_similar: saved });
+  };
+  const toggle = async () => pageNodes(await app.settings()).find((node) => node.getAttribute?.("name") === "live_merge_similar");
+  const first = await toggle();
+  assert.equal(first.checked, false);
+  first.checked = true;
+  await first.listeners.change[0]();
+  assert.equal(saved, true);
+  const reopened = await toggle();
+  assert.equal(reopened.checked, true);
+  fail = true;
+  reopened.checked = false;
+  await reopened.listeners.change[0]();
+  assert.equal(reopened.checked, true);
+  assert.equal(reopened.disabled, false);
+  app.state.settingsTab = "epg";
+  app.state.user = { role: "user" };
+  const memberNav = pageClass(await app.settings(), "settings-tabs")[0];
+  assert.deepEqual(memberNav.children.filter((node) => node.tagName === "BUTTON").map((chip) => chip.textContent), ["账户安全", "影视仓订阅"]);
 });
 
 test("tvbox copy buttons confirm success briefly", async () => {
@@ -2034,6 +2258,17 @@ test("all-view folds one series into a stack and expands on demand", async () =>
   assert.equal(pageClass(app.elements.get("content"), "media-card").length, 4);
 });
 
+test("local episode posters show scraped art, rating and file resolution", async () => {
+  const app = environment({ "/api/library": [{ id: 11, title: "回家", kind: "episode", series: "旅途", season: 2, episode: 3,
+    cover: "/art/11", rating: 8.6, relative_path: "旅途/S02E03.2160p.mkv" }] });
+  app.state.filter = "episode";
+  const page = await app.library();
+  const art = pageClass(page, "poster-art")[0];
+  assert.equal(pageNodes(art).find((node) => node.tagName === "IMG").getAttribute("src"), "/art/11");
+  assert.equal(pageClass(art, "rating-badge")[0].textContent, "8.6");
+  assert.equal(pageClass(art, "library-badge")[0].textContent, "S02 E03 · 4K");
+});
+
 function pageDiscoveryRoutes(results) {
   return {
     "/api/sources": [{ id: 1, name: "甲源", enabled: true }, { id: 2, name: "乙源", enabled: true }],
@@ -2041,6 +2276,19 @@ function pageDiscoveryRoutes(results) {
     "/api/catalog/discover?page=1": { results, errors: [], page: 1, page_count: 1, total: results.length },
   };
 }
+
+test("discovery orders feature, history, trends and filters before results and resets filters together", async () => {
+  const item = { id: "1", source_id: 1, title: "夏天", kind: "movie" };
+  const app = environment({ ...pageDiscoveryRoutes([item]), "/api/progress": [{ ...item, entry_kind: "online", position: 20 }],
+    "/api/catalog/recommend": { groups: [{ title: "热门电影", items: [item] }] } });
+  const page = await app.online();
+  const sections = ["spotlight", "continue-section", "discovery-trends", "discover-filter-bar", "media-grid"];
+  assert.deepEqual(page.children.map((node) => node.className).filter((name) => sections.includes(name)), sections);
+  assert.equal(pageClass(page, "discovery-trends")[0].tagName, "DETAILS");
+  Object.assign(app.state, { onlineKind: "movie", onlineLang: "国语", onlineArea: "日本", onlineSource: "2", onlineCategory: "剧情", onlineYear: "2025", onlinePage: 4 });
+  pageButton(page, "重置筛选").dispatchEvent("click");
+  assert.deepEqual([app.state.onlineKind, app.state.onlineLang, app.state.onlineArea, app.state.onlineSource, app.state.onlineCategory, app.state.onlineYear, app.state.onlinePage], ["", "", "", "all", "", "", 1]);
+});
 
 test("spotlight dots switch the featured title and its detail link", async () => {
   const results = [1, 2, 3].map((id) => ({
@@ -2051,7 +2299,10 @@ test("spotlight dots switch the featured title and its detail link", async () =>
   const spotlight = pageClass(await app.online(), "spotlight")[0];
   const dots = pageClass(spotlight, "spotlight-dot");
   assert.equal(dots.length, 3);
+  assert.equal(app.document.body.dataset.spotlight, undefined);
   dots[2].dispatchEvent("click");
+  assert.equal(app.document.body.dataset.spotlight, "2");
+  assert.equal(pageClass(spotlight, "spotlight-dot")[2], dots[2]);
   assert.equal(pageNodes(spotlight).find((node) => node.tagName === "H2").textContent, "影片 3");
   assert.deepEqual(pageClass(spotlight, "spotlight-dot").map((dot) => dot.attributes["aria-pressed"]), ["false", "false", "true"]);
   await pageButton(spotlight, "查看片源").listeners.click[0]();
@@ -2361,6 +2612,12 @@ test("admin saves advanced fields, exports configuration, imports JSON and reord
   assert.equal(dialog.open, true);
   const exported = JSON.parse(data.value);
   assert.equal(exported[0].custom_cookie, "demo=1");
+  assert.equal(field("custom_cookie").value, "");
+  await row.listeners.submit[0]({ preventDefault() {} });
+  assert.ok(!Object.hasOwn(JSON.parse(app.calls.filter((call) => call.url === "/api/sources/4").at(-1).options.body), "custom_cookie"));
+  field("clear_custom_cookie").checked = true;
+  await row.listeners.submit[0]({ preventDefault() {} });
+  assert.equal(JSON.parse(app.calls.filter((call) => call.url === "/api/sources/4").at(-1).options.body).custom_cookie, "");
   assert.equal("last_probe_ok" in exported[0], false);
   pageButton(dialog, "关闭").dispatchEvent("click");
   pageButton(page, "导入 JSON").dispatchEvent("click");
@@ -2874,6 +3131,11 @@ test("recommendations work without CMS and search the selected title across sour
   const page = await app.online();
   await new Promise(setImmediate);
   assert.deepEqual(pageClass(page, "recommend-heading").map((node) => node.textContent), ["热门电影豆瓣", "热门剧集豆瓣"]);
+  const trendTabs = pageClass(page, "recommend-heading");
+  trendTabs[1].dispatchEvent("click");
+  assert.equal(trendTabs[1].getAttribute("aria-pressed"), "true");
+  assert.match(pageClass(page, "recommend-strip")[0].textContent, /晴天/);
+  trendTabs[0].dispatchEvent("click");
   const card = pageClass(page, "discovery-poster")[0];
   const image = pageNodes(card).find((node) => node.tagName === "IMG");
   assert.equal(image.attributes.src, cover);
@@ -3089,6 +3351,117 @@ test("TVBox presents both configuration formats and copies the selected address"
     await pageButton(rows[index], "复制").listeners.click[0]();
   }
   assert.deepEqual(copied, ["https://polyview.test/feeds/config", "https://polyview.test/feeds/config?encode=base58"]);
+});
+
+function tvboxQrEnvironment() {
+  const paths = (token) => ({
+    config_path: `/tvbox/${token}/config.json`,
+    config_b58_path: `/tvbox/${token}/config.json?encode=base58`,
+    catalog_path: `/tvbox/${token}/vod`,
+    live_path: `/tvbox/${token}/live.m3u`,
+  });
+  const standard = "/api/tvbox/qr?mode=standard";
+  const base58 = "/api/tvbox/qr?mode=base58";
+  const host = "https://tv.polyview.test";
+  const matrix = (offset) => Array.from({ length: 21 }, (_, y) =>
+    "0".repeat((y + offset) % 21) + "1" + "0".repeat(20 - (y + offset) % 21));
+  const feeds = { first: paths("first"), next: paths("next") };
+  const routes = {
+    "/api/tvbox": feeds.first,
+    "/api/tvbox/token": feeds.next,
+    [standard]: { url: host + feeds.first.config_path, qr: matrix(0) },
+    [base58]: { url: host + feeds.first.config_b58_path, qr: matrix(1) },
+  };
+  const app = environment(routes);
+  app.state.settingsTab = "tvbox";
+  const draws = [];
+  const ctx = { fillRect(...rect) { draws.push([this.fillStyle, ...rect]); } };
+  const create = app.document.createElement;
+  app.document.createElement = (tag) => {
+    const element = create(tag);
+    if (tag === "canvas") element.getContext = (type) => type === "2d" ? ctx : null;
+    return element;
+  };
+  return { app, draws, feeds, host, routes, standard, base58 };
+}
+
+test("TVBox draws both QR modes locally with a four-module quiet zone and matching copy address", async () => {
+  const { app, draws, routes, host, feeds, standard, base58 } = tvboxQrEnvironment();
+  const page = await app.settings();
+  await new Promise((resolve) => setImmediate(resolve));
+  const canvas = pageNodes(page).find((node) => node.tagName === "CANVAS");
+  const check = (label, firstX) => {
+    assert.equal(canvas.hidden, false);
+    assert.equal(canvas.getAttribute("aria-label"), label);
+    assert.equal(pageButton(page, label).getAttribute("aria-pressed"), "true");
+    const scale = canvas.width / 29;
+    assert.equal(Number.isInteger(scale), true);
+    assert.deepEqual(draws[0], ["#fff", 0, 0, canvas.width, canvas.height]);
+    assert.deepEqual(draws[1], ["#000", (4 + firstX) * scale, 4 * scale, scale, scale]);
+    assert.equal(draws.length, 22);
+    for (const [, x, y, w, h] of draws.slice(1)) {
+      assert.ok(Math.min(x, y, canvas.width - x - w, canvas.height - y - h) >= 4 * scale);
+    }
+  };
+  check("标准配置二维码", 0);
+  draws.length = 0;
+  await pageButton(page, "Base58 配置二维码").listeners.click[0]();
+  check("Base58 配置二维码", 1);
+  assert.equal(pageButton(page, "标准配置二维码").getAttribute("aria-pressed"), "false");
+  assert.equal(pageNodes(page).find((node) => node.getAttribute?.("aria-label") === "标准配置地址").value,
+    host + feeds.first.config_path);
+  assert.deepEqual(app.calls.map(({ url }) => url), ["/api/tvbox", standard, base58]);
+  routes[standard].qr[0] = "101";
+  await pageButton(page, "标准配置二维码").listeners.click[0]();
+  assert.equal(canvas.hidden, true);
+  assert.match(pageClass(page, "tvbox-qr-status")[0].textContent, /可复制配置地址/);
+});
+
+test("TVBox ignores stale mode responses and refreshes the selected QR after token rotation", async () => {
+  const { app, draws, routes, host, feeds, standard, base58 } = tvboxQrEnvironment();
+  const fetch = app.context.fetch;
+  let finish;
+  app.context.fetch = (path, options) => {
+    if (path === standard) return new Promise((resolve) => {
+      finish = () => resolve({ ok: true, text: async () => JSON.stringify(routes[standard]) });
+    });
+    return fetch(path, options);
+  };
+  const page = await app.settings();
+  const canvas = pageNodes(page).find((node) => node.tagName === "CANVAS");
+  await pageButton(page, "Base58 配置二维码").listeners.click[0]();
+  assert.equal(draws.length, 22);
+  routes[base58] = { ...routes[base58], url: host + feeds.next.config_b58_path };
+  const rotating = pageButton(page, "重置电视访问令牌").listeners.click[0]();
+  assert.equal(canvas.hidden, true);
+  await rotating;
+  finish();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(draws.length, 44);
+  assert.equal(canvas.hidden, false);
+  assert.equal(canvas.getAttribute("aria-label"), "Base58 配置二维码");
+  assert.equal(pageNodes(page).find((node) => node.getAttribute?.("aria-label") === "直播 M3U").value,
+    host + feeds.next.live_path);
+  const rotate = app.calls.find(({ url }) => url === "/api/tvbox/token");
+  assert.equal(rotate.options.headers["X-PolyView-Request"], "1");
+  assert.equal(app.calls.filter(({ url }) => url === base58).length, 2);
+});
+
+test("TVBox reconciles QR and copy addresses after a rotation in another session", async () => {
+  const { app, feeds, host, routes, base58 } = tvboxQrEnvironment();
+  const page = await app.settings();
+  await new Promise((resolve) => setImmediate(resolve));
+  routes["/api/tvbox"] = feeds.next;
+  routes[base58] = { ...routes[base58], url: host + feeds.next.config_b58_path };
+  await pageButton(page, "Base58 配置二维码").listeners.click[0]();
+  assert.equal(app.calls.filter(({ url }) => url === "/api/tvbox").length, 2);
+  assert.equal(pageNodes(page).find((node) => node.tagName === "CANVAS").hidden, false);
+  const copied = [];
+  app.context.navigator.clipboard.writeText = async (value) => copied.push(value);
+  for (const row of pageClass(pageClass(page, "tvbox-configs")[0], "feed-row")) {
+    await pageButton(row, "复制").listeners.click[0]();
+  }
+  assert.deepEqual(copied, [host + feeds.next.config_path, host + feeds.next.config_b58_path]);
 });
 
 test("admins change member roles, disable and enable accounts, and reset another member's password", async () => {
@@ -3631,6 +4004,9 @@ test("local poster details show cached artwork and credits, switch seasons, and 
   assert.doesNotMatch(dialog.textContent, /识别与整理|重新刮削/);
   pageButton(dialog, "第 1 集 · 前奏");
   const season = m6Field(dialog, "library_season");
+  await m6Click(season, "第二季");
+  assert.equal(pageButton(season, "第二季").getAttribute("aria-pressed"), "true");
+  await m6Click(season, "第一季");
   season.value = "2";
   season.dispatchEvent("change");
   assert.doesNotMatch(dialog.textContent, /前奏/);

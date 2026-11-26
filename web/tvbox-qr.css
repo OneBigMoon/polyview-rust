@@ -1,0 +1,63 @@
+.tvbox-panel {
+  container: tvbox / inline-size;
+}
+
+.tvbox-subscription {
+  display: grid;
+  gap: 24px;
+  align-items: start;
+}
+
+.tvbox-links,
+.tvbox-links .feed-row label {
+  min-width: 0;
+}
+
+.tvbox-links .tvbox-configs {
+  display: block;
+}
+
+.tvbox-links input {
+  width: 100%;
+  min-width: 0;
+}
+
+.tvbox-qr {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--muted-bg);
+  text-align: center;
+}
+
+.tvbox-qr h3,
+.tvbox-qr-status {
+  margin: 0;
+}
+
+.tvbox-qr-modes {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+}
+
+.tvbox-qr-modes [aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.tvbox-qr canvas {
+  max-width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+}
+
+@container tvbox (min-width: 640px) {
+  .tvbox-subscription {
+    grid-template-columns: minmax(0, 1fr) 304px;
+  }
+}

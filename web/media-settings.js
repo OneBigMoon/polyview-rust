@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  globalThis.polyviewMedia = function ({ make, button, api, play, posterImage, admin, current }) {
+  globalThis.polyviewMedia = function ({ make, button, api, play, cinemaHero, admin, current }) {
     const input = (name, value = "", attrs = {}) => make("input", { name, value: value ?? "", ...attrs });
     const label = (text, node) => make("label", {}, [text, node]);
     const check = (name, text, checked) => {
@@ -21,10 +21,11 @@
     const splitKeywords = (value) => value.split(/[,，\n]+/).map((word) => word.trim()).filter(Boolean);
 
     // Keep stored credentials out of control values. Omission preserves a secret on PUT.
-    function secret(name, text, configured) {
-      const field = input(name, "", { type: "password", autocomplete: "new-password", placeholder: configured ? "已配置，留空保留" : "尚未配置" });
+    function secret(name, text, configured, sharedStatus = false) {
+      const field = input(name, "", { type: "password", autocomplete: "new-password", spellcheck: "false", placeholder: configured ? "留空保留" : "尚未配置" });
       const clear = check(`clear_${name}`, `清除已保存的${text}`, false);
-      const nodes = [label(text, field)];
+      const badge = configured && !sharedStatus ? make("span", { class: "configured-badge", text: "已配置" }) : null;
+      const nodes = [make("label", {}, [text, badge, field])];
       if (configured) nodes.push(clear.label);
       return { nodes, values: () => clear.field.checked ? { [name]: "" } : field.value ? { [name]: field.value } : {}, reset: () => { field.value = ""; } };
     }
@@ -93,17 +94,17 @@
         else play(episodes[index], false, episodes, index);
       }
       title.textContent = media.series || media.title;
-      const copy = make("div", { class: "media-detail-copy" }, [
-        media.original_title && media.original_title !== title.textContent ? make("p", { class: "media-original", text: media.original_title }) : null,
-        make("p", { class: "media-facts", text: [media.year, media.rating > 0 && `评分 ${media.rating}`, ...(media.genres || [])].filter(Boolean).join(" · ") }),
-        media.description ? make("p", { text: media.description }) : null,
-        button(media.position > 0 && !media.watched ? "继续观看" : "播放影片", "primary", () => watch(media)),
-      ]);
-      const hero = make("section", { class: "media-detail-hero" }, [
-        media.backdrop ? posterImage(media.backdrop, { class: "media-backdrop" }) : null,
-        media.cover ? posterImage(media.cover, { class: "media-cover" }) : null, copy,
-      ]);
+      const hero = cinemaHero({
+        title, cover: media.cover, backdrop: media.backdrop, close, label: media.kind === "episode" ? "本地剧集" : "本地影片",
+        info: [
+          media.original_title && media.original_title !== title.textContent ? make("p", { class: "media-original", text: media.original_title }) : null,
+          make("p", { class: "media-facts", text: [media.year, media.rating > 0 && `评分 ${media.rating}`, ...(media.genres || [])].filter(Boolean).join(" · ") }),
+          media.description ? make("p", { class: "catalog-description", text: media.description }) : null,
+          button(media.position > 0 && !media.watched ? "继续观看" : "播放影片", "primary", () => watch(media)),
+        ],
+      });
       content.replaceChildren(hero);
+      dialog.replaceChildren(content);
       for (const [name, people] of [["演员", media.cast], ["主创", media.crew]]) {
         if (people?.length) content.append(make("section", {}, [heading(name), make("ul", { class: "media-credits" }, people.map((person) => make("li", { text: [person.name, person.role].filter(Boolean).join(" · ") })))]));
       }
@@ -113,10 +114,24 @@
           const number = episode.season ?? 1;
           if (!seasons.has(number)) seasons.set(number, { number });
         }
-        const seasonSelect = select("library_season", [...seasons.keys()].sort((a, b) => a - b).map((number) => [number, seasons.get(number).title || `第 ${number} 季`]), seasons.has(media.season) ? media.season : undefined);
+        const numbers = [...seasons.keys()].sort((a, b) => a - b);
+        const seasonTabs = make("div", { class: "season-tabs", name: "library_season", role: "group", "aria-label": "选择季" });
+        seasonTabs.value = String(seasons.has(media.season) ? media.season : numbers[0]);
+        for (const number of numbers) {
+          seasonTabs.append(make("button", { type: "button", value: number, text: seasons.get(number).title || `第 ${number} 季`, on: { click: () => {
+            seasonTabs.value = String(number);
+            paintSeason();
+          } } }));
+        }
         const grid = make("div", { class: "episode-grid" });
+        const overview = make("p", { class: "hint", "aria-live": "polite" });
         function paintSeason() {
-          const number = Number(seasonSelect.value);
+          const number = Number(seasonTabs.value);
+          for (const tab of seasonTabs.children) {
+            const active = Number(tab.value) === number;
+            tab.className = `filter-chip${active ? " active" : ""}`;
+            tab.setAttribute("aria-pressed", String(active));
+          }
           const metadata = new Map((seasons.get(number)?.episodes || []).map((episode) => [episode.number, episode]));
           const files = episodes.filter((episode) => (episode.season ?? 1) === number);
           const available = new Set(files.map((episode) => episode.episode));
@@ -125,11 +140,12 @@
             if (!available.has(episode)) entries.push([episode, button(`第 ${episode} 集 · ${info.title || "未入库"}`, "subtle", null, { disabled: true, title: "未入库" })]);
           }
           grid.replaceChildren(...entries.sort(([a], [b]) => a - b).map(([, node]) => node));
+          overview.textContent = `本季共 ${entries.length} 集，已入库 ${files.length} 集`;
           if (!entries.length) grid.append(hint("本季暂无分集。"));
         }
-        seasonSelect.addEventListener("change", paintSeason);
+        seasonTabs.addEventListener("change", paintSeason);
         paintSeason();
-        content.append(make("section", {}, [label("选择季", seasonSelect), grid]));
+        content.append(make("section", {}, [heading("分集"), seasonTabs, overview, grid]));
       }
       if (admin()) {
         const feedback = status();
@@ -310,13 +326,14 @@
         const provider = select("provider", providers, client.provider);
         const name = input("name", client.name, { required: true });
         const endpoint = input("endpoint", client.endpoint, { type: "url", required: true });
-        const username = secret("username", "下载器用户名", client.has_credentials);
-        const password = secret("password", "下载器密码", client.has_credentials);
+        const username = secret("username", "下载器用户名", client.has_credentials, true);
+        const password = secret("password", "下载器密码", client.has_credentials, true);
         const members = check("members_allowed", "允许家庭成员提交任务", client.members_allowed);
         const remote = input("remote_root", client.remote_root), local = input("local_root", client.local_root);
         const edit = client.id != null;
         const target = edit ? `${path}/${encodeURIComponent(client.id)}` : path;
         return make("details", { class: "media-editor" }, [make("summary", { text: edit ? client.name : "新增下载器" }),
+          client.has_credentials ? make("span", { class: "configured-badge", text: "凭据已配置" }) : null,
           submitForm(edit ? "保存下载器" : "创建下载器", [label("名称", name), label("类型", provider), label("连接地址（Transmission 使用完整 RPC 地址）", endpoint), ...username.nodes, ...password.nodes, members.label, label("下载器文件根目录", remote), label("本地映射根目录", local)], feedback, async () => {
             await write(target, edit ? "PUT" : "POST", { name: name.value.trim(), provider: provider.value, endpoint: endpoint.value.trim(), ...username.values(), ...password.values(), members_allowed: Boolean(members.field.checked), remote_root: remote.value.trim(), local_root: local.value.trim() });
             username.reset(); password.reset(); await reload();

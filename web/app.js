@@ -203,7 +203,6 @@
         Object.entries(value).forEach(([event, fn]) => {
           if (typeof fn === "function") el.addEventListener(event, fn);
         });
-      else if (key === "style") el.style.cssText = value;
       else if (key === "checked" || key === "disabled" || key === "hidden")
         el[key] = Boolean(value);
       else el.setAttribute(key, value === true ? "" : value);
@@ -316,7 +315,13 @@
   }
   function setNav(page) {
     state.page = page;
-    document.querySelectorAll("[data-view]").forEach((el) => {
+    document.body.dataset.view = page;
+    const secondary = !["online", "live", "library", "cloud"].includes(page);
+    const more = $("mobile-more");
+    more.classList.toggle("active", secondary);
+    if (secondary) more.setAttribute("aria-current", "true");
+    else more.removeAttribute("aria-current");
+    document.querySelectorAll("button[data-view]").forEach((el) => {
       const on = el.dataset.view === page;
       el.classList.toggle("active", on);
       if (on) el.setAttribute("aria-current", "page");
@@ -334,14 +339,33 @@
   function mediaViews() {
     const owner = state.user, sequence = renderSequence;
     return globalThis.polyviewMedia({
-      make, button, api, play, posterImage, admin,
+      make, button, api, play, cinemaHero, admin,
       current: () => owner === state.user && sequence === renderSequence,
     });
+  }
+  function cinemaHero({ title, cover, backdrop, info, close, label }) {
+    const background = backdrop || cover;
+    return make("section", { class: "media-detail-hero", "aria-labelledby": title.getAttribute("id") }, [
+      background ? posterImage(background, { class: "media-backdrop" }) : null,
+      make("div", { class: "detail-poster tone-2", "aria-hidden": "true" }, cover ? posterImage(cover, { class: "media-cover", loading: "eager" }) : []),
+      make("div", { class: "media-detail-copy" }, [make("p", { class: "eyebrow", text: label }), title, ...info]),
+      close,
+    ]);
   }
   function mediaDetailButton(item) {
     return button("影片详情", "subtle small-button", () => mediaViews().detail(item), {
       "aria-label": `查看 ${item.series || item.title} 的影片详情`,
     });
+  }
+  function libraryBadges(item, episodeLabel) {
+    const filename = (item.relative_path || "").split("/").pop();
+    const resolution = /(?:^|[^a-z0-9])(2160p?|4k|1440p?|2k|1080[pi]|720p|480p|高清|超清)(?![a-z0-9])/i.exec(filename || item.title || "");
+    const quality = resolution ? sourceQuality({ remark: resolution[1] }) : "";
+    const info = [episodeLabel, quality].filter(Boolean).join(" · ");
+    return [
+      item.rating > 0 ? make("span", { class: "rating-badge", text: item.rating, "aria-label": `评分 ${item.rating}` }) : null,
+      info ? make("span", { class: "library-badge", text: info }) : null,
+    ];
   }
   function card(item, index) {
     const pct =
@@ -350,7 +374,7 @@
         : 0;
     const label =
       item.kind === "episode"
-        ? `S${String(item.season || 1).padStart(2, "0")} E${String(item.episode || 1).padStart(2, "0")}`
+        ? `S${String(item.season ?? 1).padStart(2, "0")} E${String(item.episode ?? "?").padStart(2, "0")}`
         : "电影";
     const poster = make(
       "button",
@@ -368,7 +392,7 @@
       },
       make("div", { class: `poster-art tone-${index % 6}` }, [
         item.cover ? posterImage(item.cover) : null,
-        make("span", { class: "poster-label", text: label }),
+        ...libraryBadges(item, item.kind === "episode" ? label : ""),
         make("span", { class: "poster-name", text: item.title }),
         make("span", {
           class: "poster-play",
@@ -402,7 +426,7 @@
       poster,
       fav,
       make("div", { class: "media-meta" }, [
-        make("span", { text: [meta, item.year, item.rating > 0 && `${item.rating} 分`].filter(Boolean).join(" · ") }),
+        make("span", { text: [meta, item.year].filter(Boolean).join(" · ") }),
         item.watched
           ? make("span", { class: "watched", text: "✓ 已看" })
           : null,
@@ -440,7 +464,7 @@
         }
       }
     }
-    const root = make("div");
+    const root = make("div", { class: "library-page" });
     root.append(
       head(
         "你的媒体库",
@@ -589,11 +613,9 @@
             },
             make("div", { class: `poster-art stack-art tone-${index++ % 6}` }, [
               cover ? posterImage(cover) : null,
+              ...libraryBadges({ rating: items.find((entry) => entry.rating > 0)?.rating }, `${items.length} 集`),
               make("span", { class: "poster-name", text: name }),
-              make("span", {
-                class: "stack-badge",
-                text: `共 ${items.length} 集 · 已看 ${watched} 集`,
-              }),
+              make("span", { class: "stack-badge", text: `已看 ${watched} 集` }),
             ]),
           ),
           make("div", { class: "media-meta" }, [
@@ -747,6 +769,9 @@
       channel.favorite = favorite;
       if (state.player?.live && state.player.item.id === channel.id) {
         state.player.item.favorite = favorite;
+        const directoryEntry = state.player.theater.channels.find((entry) => entry.id === channel.id);
+        if (directoryEntry) directoryEntry.favorite = favorite;
+        if (!$("player-channel-drawer").hidden) paintChannelDrawer();
         updatePlayerControls();
       }
       refresh();
@@ -782,15 +807,17 @@
     }
     const guideToggle = $("player-guide-toggle");
     guideToggle.hidden = !live;
+    $("player-channel-toggle").hidden = !live;
     if (live) {
-      const collapsed = Boolean(player.guideCollapsed);
+      const collapsed = player.guideCollapsed || !player.guideAvailable;
       guideToggle.textContent = collapsed ? "显示节目单" : "收起节目单";
       guideToggle.setAttribute("aria-label", guideToggle.textContent);
+      guideToggle.setAttribute("aria-expanded", String(!collapsed));
       guideToggle.title = guideToggle.textContent;
       guideToggle.setAttribute("aria-pressed", String(!collapsed));
     }
     video.controls = !live;
-    document.body.dataset.playing = video.paused ? "0" : "1";
+    document.body.dataset.playing = player && !video.paused ? "1" : "0";
     if (!live) return;
     setIcon($("player-toggle"), video.paused ? "play" : "pause");
     $("player-toggle").setAttribute("aria-label", video.paused ? "播放" : "暂停");
@@ -1083,73 +1110,193 @@
         if (!hlsSource || nativeHls || !state.hls) startPlayback();
       };
   }
+  function replayGuide(player, history, now) {
+    const days = guideDays(now);
+    const menu = make("select", { "aria-label": "回看日期" }, days.map((day) => make("option", { value: day.key, text: day.label })));
+    menu.value = days.some((day) => day.key === player.archiveDay) ? player.archiveDay : days[0].key;
+    const rows = make("div", { class: "player-guide-archive" });
+    const past = make("details", { class: "player-guide-history" }, [make("summary", { text: "七天回看" }), menu, rows]);
+    function paint(entries, day) {
+      const focusStart = rows.contains?.(document.activeElement) ? document.activeElement.dataset.start : null;
+      const cutoff = Math.floor(Date.now() / 1000) - CATCHUP_SECONDS;
+      const eligible = entries.filter((entry) => Number(entry.channel_id) === Number(player.item.id) &&
+        entry.start >= Math.max(cutoff, day.start) && entry.start < day.end && entry.stop <= Date.now() / 1000)
+        .sort((a, b) => b.start - a.start);
+      rows.replaceChildren(...eligible.map((entry) => {
+        const action = button(`${clockTime(entry.start)} · ${entry.title} · 回看`, "player-guide-replay", () => {
+          if (state.player === player && entry.start >= Math.floor(Date.now() / 1000) - CATCHUP_SECONDS)
+            play(player.item, true, player.playlist, player.playlistIndex, false, entry);
+        });
+        action.dataset.start = String(entry.start);
+        return action;
+      }));
+      if (!eligible.length) rows.append(make("p", { class: "hint", text: "此日暂无可回看的节目" }));
+      if (focusStart) (Array.from(rows.children).find((el) => el.dataset.start === focusStart) || menu).focus?.();
+    }
+    async function loadDay() {
+      const day = days.find((entry) => entry.key === menu.value);
+      if (!day) return;
+      player.archiveDay = day.key;
+      paint(history, day);
+      const cache = player.theater.archive;
+      if (!cache.has(day.key)) cache.set(day.key, api(`/api/epg?start=${day.start}&end=${day.end}`).then((data) => data.programs));
+      try {
+        const entries = await cache.get(day.key);
+        if (Array.isArray(entries) && state.player === player && menu.value === day.key) paint(entries, day);
+      } catch (_) {
+        cache.delete(day.key);
+        if (state.player === player && menu.value === day.key) rows.append(make("p", { class: "hint", text: "节目单加载失败，请重新选择日期。" }));
+      }
+    }
+    past.addEventListener("toggle", () => { if (past.open) loadDay(); });
+    menu.addEventListener("change", loadDay);
+    paint(history, days.find((day) => day.key === menu.value));
+    return past;
+  }
   function playerGuide(item) {
     const box = $("player-guide");
+    const player = state.player;
+    clearTimeout(player?.guideTimer);
+    const openHistory = box.querySelector?.("details")?.open;
+    const focused = box.contains?.(document.activeElement) ? document.activeElement : null;
     box.replaceChildren();
-    if (!state.player?.live) {
-      if (state.player) state.player.guideAvailable = false;
-      box.hidden = true;
-      return;
-    }
+    box.hidden = true;
+    if (!player?.live) return;
     const now = Math.floor(Date.now() / 1000);
-    const programs = (state.epg?.programs || [])
-      .filter(
-        (program) =>
-          Number(program.channel_id) === Number(item.id) &&
-          program.stop > now,
-      )
-      .sort((one, other) => one.start - other.start);
-    if (!programs.length) {
-      state.player.guideAvailable = false;
-      box.hidden = true;
-      return;
-    }
-    state.player.guideAvailable = true;
-    box.hidden = Boolean(state.player.guideCollapsed);
-    box.append(
-      make(
-        "div",
-        { class: "player-guide-head" },
-        [
-          make("strong", { text: "接下来" }),
-          make("small", { text: `${programs.length} 条节目` }),
-        ],
-      ),
-    );
-    programs.slice(0, 14).forEach((program) => {
-      const current = now >= program.start && now < program.stop;
-      const children = [
+    const programs = player.theater.programs.filter((entry) => Number(entry.channel_id) === Number(item.id))
+      .sort((a, b) => a.start - b.start);
+    const onAir = programs.filter((entry) => entry.start <= now && entry.stop > now);
+    const upcoming = programs.filter((entry) => entry.start > now);
+    const canReplay = liveSources(item).some(supportsCatchup);
+    const history = canReplay
+      ? programs.filter((entry) => entry.start >= now - CATCHUP_SECONDS && entry.stop <= now).reverse() : [];
+    player.guideAvailable = Boolean(onAir.length || upcoming.length || canReplay);
+    box.hidden = player.guideCollapsed || !player.guideAvailable;
+    $("player-guide-toggle").disabled = !player.guideAvailable;
+    if (!player.guideAvailable) return;
+    const meters = [];
+    function row(program, current) {
+      const entry = make("div", { class: `player-guide-item${current ? " current" : ""}` }, [
         make("span", { class: "player-guide-time", text: clockTime(program.start) }),
         make("strong", { text: program.title }),
-      ];
-      if (current)
-        children.push(
-          make("progress", {
-            class: "guide-progress",
-            max: 100,
-            value: Math.round(
-              ((now - program.start) / Math.max(1, program.stop - program.start)) *
-                100,
-            ),
-          }),
-        );
-      box.append(
-        make(
-          "div",
-          { class: `player-guide-item${current ? " current" : ""}` },
-          children,
-        ),
-      );
-    });
+      ]);
+      if (current) {
+        const meter = make("progress", { class: "guide-progress", "aria-label": `${program.title} 播放进度`, max: program.stop - program.start });
+        meters.push([program, meter]);
+        entry.append(meter);
+      }
+      return entry;
+    }
+    if (onAir.length) box.append(make("strong", { class: "player-guide-head", text: "正在播出" }), ...onAir.map((entry) => row(entry, true)));
+    if (upcoming.length) box.append(make("strong", { class: "player-guide-head", text: "接下来" }), ...upcoming.slice(0, 14).map((entry) => row(entry, false)));
+    if (canReplay) {
+      const past = replayGuide(player, history, now);
+      box.append(past);
+      past.open = Boolean(openHistory);
+      if (focused) {
+        const controls = Array.from(past.querySelectorAll("button, summary, select"));
+        (controls.find((el) => focused.dataset.start ? el.dataset.start === focused.dataset.start : el.tagName === focused.tagName) || controls[0])?.focus();
+      }
+    }
+    const boundary = Math.min(...onAir.map((entry) => entry.stop), upcoming[0]?.start ?? Infinity,
+      history.length ? history[history.length - 1].start + CATCHUP_SECONDS + 1 : Infinity);
+    function tick() {
+      if (state.player !== player) return;
+      const seconds = Math.floor(Date.now() / 1000);
+      if (seconds >= boundary) return playerGuide(item);
+      for (const [program, meter] of meters) meter.value = Math.max(0, seconds - program.start);
+      player.guideTimer = setTimeout(tick, Math.min(meters.length ? 15 : 3600, boundary - seconds) * 1000);
+    }
+    tick();
   }
-  function play(item, live = false, playlist = [], playlistIndex = 0, autoplay = false, program = null) {
-    if (state.player) closePlayer();
+  async function refreshTheaterGuide(theater) {
+    const now = Math.floor(Date.now() / 1000);
+    try {
+      const start = guideStart(now);
+      const result = await api(`/api/epg?start=${start - 21600}&end=${start + 86400}`);
+      if (state.player?.theater !== theater || !Array.isArray(result?.programs)) return;
+      const archive = theater.programs.filter((entry) => entry.stop <= start - 21600 && entry.start >= now - CATCHUP_SECONDS);
+      theater.programs = archive.concat(result.programs);
+      theater.archive.clear();
+      playerGuide(state.player.item);
+      updatePlayerControls();
+    } catch (_) { /* Keep the last available schedule. */ }
+  }
+
+  function paintChannelDrawer(focusGroup = false) {
+    const player = state.player;
+    const { channels, group } = player.theater;
+    const groups = $("player-channel-groups");
+    const list = $("player-channel-list");
+    const groupOf = (item) => item.group_name || "其他";
+    const labels = [[favoritesGroup, "★ 收藏"], [null, "全部"], ...Array.from(new Set(channels.map(groupOf)), (name) => [name, name])];
+    let selected;
+    groups.replaceChildren(...labels.map(([key, label]) => {
+      const chip = button(label, "filter-chip", () => {
+        player.theater.group = key;
+        paintChannelDrawer(true);
+      }, { "aria-pressed": String(group === key) });
+      if (group === key) selected = chip;
+      return chip;
+    }));
+    const visible = channels.filter((channel) => group === null || (group === favoritesGroup ? channel.favorite : groupOf(channel) === group))
+      .sort((a, b) => Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)));
+    list.replaceChildren(...visible.map((channel, index) => {
+      const active = channel === player.item || (channel.id != null && channel.id === player.item.id);
+      const lines = liveSources(channel);
+      const latency = lines.reduce((best, line) => Number.isFinite(line.latency_ms) ? Math.min(best, line.latency_ms) : best, Infinity);
+      return make("button", { type: "button", class: "player-channel-row", "aria-current": active ? "true" : null,
+        on: { click: () => play(channel, true, visible, index) } }, [
+        channel.logo ? posterImage(channel.logo, { class: "epg-logo" }) : make("span", { class: "channel-monogram", "aria-hidden": "true", text: (channel.name || "台").slice(0, 1) }),
+        make("strong", { text: channel.name || channel.title }),
+        make("small", { text: `${channel.favorite ? "★ · " : ""}${lines.length} 线路 · ${Number.isFinite(latency) ? `${latency} ms` : "未测速"}` }),
+      ]);
+    }));
+    if (!visible.length) list.append(make("p", { class: "hint", text: "暂无收藏频道" }));
+    if (focusGroup) selected?.focus?.();
+  }
+
+  function setChannelDrawer(open) {
+    $("player-channel-drawer").hidden = !open;
+    $("player-channel-toggle").setAttribute("aria-expanded", String(open));
+    if (open) paintChannelDrawer(true);
+    else $("player-stage").focus?.();
+    wakeLiveControls();
+  }
+
+  function wakeLiveControls() {
+    const stage = $("player-stage");
+    const player = state.player;
+    stage.classList.remove("controls-idle");
+    if (!player?.live) return;
+    clearTimeout(player.idleTimer);
+    const full = document.fullscreenElement || document.webkitFullscreenElement;
+    if (!full || !$("player-channel-drawer").hidden) return;
+    player.idleTimer = setTimeout(() => {
+      if (state.player === player && !document.activeElement?.matches?.("button:focus-visible, summary:focus-visible"))
+        stage.classList.add("controls-idle");
+    }, 3000);
+  }
+
+  function play(item, live = false, playlist = [], playlistIndex = 0, autoplay = false, program = null, directory = null) {
+    const previous = live && state.player?.live ? state.player : null;
+    if (previous) {
+      clearTimeout(previous.guideTimer);
+      clearTimeout(previous.idleTimer);
+    } else if (state.player) closePlayer();
+    const theater = live ? previous?.theater || {
+      channels: directory || (playlist.length ? playlist : [item]),
+      archive: new Map(),
+      group: null,
+      programs: state.page === "favorites" ? [] : state.epg?.programs || [],
+    } : null;
     state.player = {
       item,
       live,
       autoplay,
       resumePosition: n(item.position),
       sourcePending: false,
+      theater,
       program,
       sources: live ? liveSources(item).filter((line) => !program || supportsCatchup(line)) : [],
       playlist,
@@ -1161,7 +1308,7 @@
       lastSaved: 0,
       lastPayload: "",
       errorShown: false,
-      guideCollapsed: false,
+      guideCollapsed: previous?.guideCollapsed || false,
       guideAvailable: false,
       metadataReady: false,
       introChecked: false,
@@ -1169,11 +1316,26 @@
     };
     $("player-title").textContent = program ? `${item.name} · ${program.title}` : item.title || item.name || "正在播放";
     $("player-kind").textContent = live
-      ? (program ? "节目回看" : "LIVE NOW")
+      ? (program ? "节目回看" : "LIVE")
       : item.series || "NOW PLAYING";
+    $("player-kind").dataset.live = String(live && !program);
     $("player-dialog").classList.toggle("live-mode", live);
     $("player-stage").classList.toggle("live-mode", live);
-    $("player-dialog").showModal();
+    if (!$("player-dialog").open) $("player-dialog").showModal();
+    if (live) {
+      setChannelDrawer(false);
+      if (!previous) {
+        theater.refreshTimer = setInterval(() => refreshTheaterGuide(theater), 30 * 60 * 1000);
+        if (state.page === "favorites" || state.guideDay !== "live") refreshTheaterGuide(theater);
+        if (state.page === "favorites") api("/api/channels").then((result) => {
+          const channels = Array.isArray(result) ? result : result?.channels;
+          if (state.player?.theater === theater && channels?.length) {
+            theater.channels = channels;
+            if (!$("player-channel-drawer").hidden) paintChannelDrawer(true);
+          }
+        }).catch(() => {});
+      }
+    }
     const video = $("video-player");
     video.defaultPlaybackRate = live ? 1 : playbackSpeed;
     video.playbackRate = video.defaultPlaybackRate;
@@ -1272,6 +1434,14 @@
       )
         render();
     });
+    clearTimeout(state.player.guideTimer);
+    clearTimeout(state.player.idleTimer);
+    clearInterval(state.player.theater?.refreshTimer);
+    $("player-channel-drawer").hidden = true;
+    $("player-channel-toggle").setAttribute("aria-expanded", "false");
+    $("player-stage").classList.remove("controls-idle");
+    if ((document.fullscreenElement || document.webkitFullscreenElement) === $("player-stage"))
+      (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
     state.player = null;
     updatePlayerControls();
     $("player-source").hidden = true;
@@ -1326,6 +1496,14 @@
     return channels.filter((channel) => covered.has(channel.id));
   }
   const favoritesGroup = Symbol("favorite channels");
+  // SVG coordinates position the timeline while foreignObject keeps native, focusable HTML controls.
+  function guideSvg(tag, attrs, ...children) {
+    const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, String(value));
+    element.append(...children);
+    return element;
+  }
+  const guideSlot = (x, width, child) => guideSvg("foreignObject", { x, y: 0, width, height: "100%" }, child);
   function guideView(start, end, now = Math.floor(Date.now() / 1000), allChannels = state.channels) {
     const refreshGuide = () => $("live-guide")?.replaceChildren(guideView(start, end, now, allChannels));
     const guide = state.epg || {};
@@ -1403,28 +1581,17 @@
       ]),
     ]);
     scroller = make("div", { class: "epg-scroll" });
-    const inner = make("div", {
-      class: "epg-inner",
-      style: `width:${170 + trackWidth}px`,
-    });
+    const inner = make("div", { class: "epg-inner" });
     const rulerRow = make("div", { class: "epg-row epg-ruler-row" });
     rulerRow.append(make("div", { class: "epg-channel epg-corner", text: "频道" }));
-    const ruler = make("div", {
-      class: "epg-track epg-ruler",
-      style: `width:${trackWidth}px`,
-    });
+    const ruler = guideSvg("svg", { class: "epg-track epg-ruler", width: trackWidth, height: "100%" });
     for (
       let hour = Math.ceil(start / 3600) * 3600;
       hour < end;
       hour += 3600
     ) {
-      ruler.append(
-        make("span", {
-          class: "epg-hour",
-          style: `left:${((hour - start) / 60) * EPG_MINUTE_PX}px`,
-          text: clockTime(hour),
-        }),
-      );
+      const x = ((hour - start) / 60) * EPG_MINUTE_PX;
+      ruler.append(guideSlot(x, Math.min(120, trackWidth - x), make("span", { class: "epg-hour", text: clockTime(hour) })));
     }
     rulerRow.append(ruler);
     inner.append(rulerRow);
@@ -1439,7 +1606,7 @@
             type: "button",
             class: "guide-channel-play",
             "aria-label": `播放 ${channel.name}`,
-            on: { click: () => play(channel, true, channels, channelIndex) },
+            on: { click: () => play(channel, true, channels, channelIndex, false, null, allChannels) },
           },
           [
             channel.logo
@@ -1454,10 +1621,7 @@
           ],
         ),
       ]));
-      const track = make("div", {
-        class: "epg-track",
-        style: `width:${trackWidth}px`,
-      });
+      const track = guideSvg("svg", { class: "epg-track", width: trackWidth, height: "100%", role: "group", "aria-label": channel.name });
       const catchup = (channel.sources || []).some(supportsCatchup);
       const items = (byChannel.get(channel.id) || []).filter(
         (program) =>
@@ -1467,7 +1631,7 @@
             (now >= program.start && now < program.stop)),
       );
       if (!items.length) {
-        track.append(make("span", { class: "epg-nodata", text: "暂无节目单" }));
+        track.append(guideSlot(0, trackWidth, make("span", { class: "epg-nodata", text: "暂无节目单" })));
       }
       items.forEach((program) => {
         const left = Math.max(0, ((program.start - start) / 60) * EPG_MINUTE_PX);
@@ -1484,17 +1648,16 @@
         ]
           .filter(Boolean)
           .join(" ");
-        track.append(
+        track.append(guideSlot(left, right - left,
           make(
             "button",
             {
               type: "button",
               class: classes,
-              style: `left:${left}px;width:${right - left}px`,
               title: `${program.title} ${clockTime(program.start)}-${clockTime(program.stop)}${
                 program.description ? `\n${program.description}` : ""
               }`,
-              on: { click: () => play(channel, true, channels, channelIndex, false, past ? program : null) },
+              on: { click: () => play(channel, true, channels, channelIndex, false, past ? program : null, allChannels) },
             },
             [
                 make("strong", { text: `${past ? "回看 · " : ""}${program.title}` }),
@@ -1514,18 +1677,17 @@
                   : null,
               ].filter(Boolean),
           ),
-        );
+        ));
       });
       row.append(track);
       inner.append(row);
     });
     if (now >= start && now < end) {
-      inner.append(
-        make("span", {
-          class: "epg-now",
-          style: `left:${170 + ((now - start) / 60) * EPG_MINUTE_PX}px`,
-        }),
-      );
+      const x = 170 + ((now - start) / 60) * EPG_MINUTE_PX;
+      inner.append(guideSvg("svg", { class: "epg-now", width: 170 + trackWidth, height: "100%", "aria-hidden": "true" },
+        guideSvg("line", { x1: x, x2: x, y1: 34, y2: "100%" }),
+        guideSvg("circle", { cx: x, cy: 34, r: 4 }),
+      ));
     }
     scroller.append(inner);
     return make("div", { class: "live-guide" }, [
@@ -1950,6 +2112,7 @@
 
   function spotlightCard(items) {
     const art = make("div", { class: "spotlight-art tone-0" });
+    const backdrop = make("div", { class: "spotlight-backdrop", "aria-hidden": "true" });
     const title = make("h2");
     const meta = make("p", { class: "spotlight-meta" });
     const dots = make("div", { class: "spotlight-dots" });
@@ -1958,6 +2121,7 @@
       const group = items[active];
       if (!group) return;
       art.replaceChildren(...(group.cover ? [posterImage(group.cover)] : []));
+      backdrop.replaceChildren(...(group.cover ? [posterImage(group.cover)] : []));
       title.textContent = displayCatalogTitle(group.title, group.year);
       const quality = sourceQuality(group.sources?.[0] || group);
       meta.textContent = [
@@ -1968,23 +2132,20 @@
       ]
         .filter(Boolean)
         .join(" · ");
-      dots.replaceChildren(
-        ...items.map((_, index) =>
-          make("button", {
-            type: "button",
-            class: `spotlight-dot${index === active ? " active" : ""}`,
-            "aria-pressed": String(index === active),
-            "aria-label": `查看第 ${index + 1} 部焦点影片`,
-            on: {
-              click: () => {
-                active = index;
-                paint();
-              },
-            },
-          }),
-        ),
-      );
+      Array.from(dots.children).forEach((dot, index) => {
+        dot.className = `spotlight-dot${index === active ? " active" : ""}`;
+        dot.setAttribute("aria-pressed", String(index === active));
+      });
     };
+    items.forEach((_, index) => dots.append(make("button", {
+      type: "button", "aria-label": `查看第 ${index + 1} 部焦点影片`,
+      on: { click: () => {
+        if (index === active) return;
+        active = index;
+        document.body.dataset.spotlight = String(index);
+        paint();
+      } },
+    })));
     paint();
     const copy = make("div", { class: "spotlight-copy" }, [
       make("p", { class: "eyebrow", text: "本周焦点" }),
@@ -1999,7 +2160,7 @@
     return make("section", {
       class: "spotlight",
       "aria-label": "焦点影片",
-    }, [art, copy]);
+    }, [backdrop, copy, art]);
   }
   function mediaKey(item) {
     return [item.source_id, item.media_id ?? item.id].map(encodeURIComponent).join("/");
@@ -2084,11 +2245,14 @@
     }
     return root;
   }
-  function searchCatalogTitle(title) {
+  function resetDiscoveryFilters() {
     Object.assign(state, {
       onlineSource: "all", onlineKind: "",
-      onlineCategory: "", onlineYear: "", onlineLang: "", onlineArea: "", categories: null,
+      onlineCategory: "", onlineYear: "", onlineLang: "", onlineArea: "", categories: null, onlinePage: 1,
     });
+  }
+  function searchCatalogTitle(title) {
+    resetDiscoveryFilters();
     submitSearch(title, true);
   }
 
@@ -2104,22 +2268,30 @@
     ]);
   }
 
+  let trendsExpanded = true;
   async function loadRecommendations(box) {
     try {
       const data = await api("/api/catalog/recommend");
-      for (const group of data.groups || []) {
-        if (!group.items?.length) continue;
-        box.append(make("section", { class: "recommend-section" }, [
-          make("header", { class: "recommend-heading" }, [
-            make("h2", { text: group.title }),
-            make("span", { class: "recommend-origin", text: data.origin === "douban" ? "豆瓣" : "各源最新" }),
-          ]),
-          make("div", { class: "recommend-strip" }, group.items.map((item, index) =>
+      const groups = (data.groups || []).filter((group) => group.items?.length);
+      box.hidden = !groups.length;
+      const tabs = make("div", { class: "trend-tabs", role: "group", "aria-label": "榜单类型" });
+      const shelf = make("section", { class: "recommend-section" });
+      function selectGroup(group) {
+        Array.from(tabs.children).forEach((tab, index) => tab.setAttribute("aria-pressed", String(groups[index] === group)));
+        shelf.replaceChildren(make("div", { class: "recommend-strip", "aria-label": group.title }, group.items.map((item, index) =>
             discoveryPoster(item.title, item.cover, [item.year, Number(item.rating) > 0 ? `${item.rating} 分` : null].filter(Boolean).join(" · "), index,
               () => item.source_id != null && item.id != null
                 ? openCatalogDetail({ ...item, kind: group.kind }) : searchCatalogTitle(item.title)),
-          )),
+        )));
+      }
+      for (const group of groups) {
+        tabs.append(make("button", { type: "button", class: "recommend-heading", on: { click: () => selectGroup(group) } }, [
+          group.title, make("span", { class: "recommend-origin", text: data.origin === "douban" ? "豆瓣" : "各源最新" }),
         ]));
+      }
+      if (groups.length) {
+        selectGroup(groups[0]);
+        box.append(tabs, shelf);
       }
     } catch (error) {
       box.append(make("p", { class: "hint", text: `热门榜单暂不可用：${error.message}` }));
@@ -2168,16 +2340,16 @@
     const enabled = configured.filter((source) => source.enabled);
     const root = make(
       "div",
-      {},
+      { class: "discovery-page" },
       head("影视发现", "搜索影片、在线观看，把想追的故事加入清单。"),
     );
     const defaultView = !state.query && state.onlineSource === "all" && !state.onlineKind &&
       !state.onlineCategory && !state.onlineYear && !state.onlineLang && !state.onlineArea;
-    if (defaultView) {
-      const recommendations = make("div");
-      root.append(recommendations);
-      void loadRecommendations(recommendations);
-    }
+    const recommendations = defaultView ? make("details", {
+      class: "discovery-trends", open: trendsExpanded,
+      on: { toggle: (event) => { trendsExpanded = event.currentTarget.open; } },
+    }, make("summary", { text: "热门榜单" })) : null;
+    if (recommendations) void loadRecommendations(recommendations);
     if (!state.query) {
       try {
         const entries = await api("/api/progress");
@@ -2186,6 +2358,7 @@
         root.append(make("p", { class: "hint", text: `继续观看暂不可用：${error.message}` }));
       }
     }
+    if (recommendations) root.append(recommendations);
     if (!enabled.length) {
       root.append(
         empty(
@@ -2277,18 +2450,21 @@
       state.onlineCategory = "";
       state.categories = null;
     };
+    const filters = make("div", { class: "discover-filter-bar" }, [
+      chipRow("类型", mediaKinds, state.onlineKind, chooseKind),
+      chipRow("语言", languageOptions, state.onlineLang, (value) => (state.onlineLang = value)),
+      chipRow("地区", areaOptions, state.onlineArea, (value) => (state.onlineArea = value)),
+    ]);
+    const reset = button("重置筛选", "subtle small-button filter-reset", () => {
+      resetDiscoveryFilters();
+      render();
+    });
+    root.append(filters);
     if (state.query) {
       result = await api(
         `/api/catalog/search?q=${encodeURIComponent(state.query)}`,
       );
       mergeCatalogGroups(result.results, groups);
-      root.append(
-        make("div", { class: "discover-filter-bar" }, [
-          chipRow("类型", mediaKinds, state.onlineKind, chooseKind),
-          chipRow("语言", languageOptions, state.onlineLang, (value) => (state.onlineLang = value)),
-          chipRow("地区", areaOptions, state.onlineArea, (value) => (state.onlineArea = value)),
-        ]),
-      );
       root.append(
         sectionTitle(
           `“${state.query}” 的搜索结果`,
@@ -2318,11 +2494,7 @@
       )
         state.onlineCategory = "";
       const year = new Date().getFullYear();
-      root.append(
-        make("div", { class: "discover-filter-bar" }, [
-          chipRow("类型", mediaKinds, state.onlineKind, chooseKind),
-          chipRow("语言", languageOptions, state.onlineLang, (value) => (state.onlineLang = value)),
-          chipRow("地区", areaOptions, state.onlineArea, (value) => (state.onlineArea = value)),
+      filters.append(
           chipRow(
             "影视源",
             [
@@ -2353,7 +2525,6 @@
             state.onlineYear,
             (value) => (state.onlineYear = value),
           ),
-        ]),
       );
       result = await api(
         `/api/catalog/discover?${paramsFor(state.onlinePage)}`,
@@ -2361,6 +2532,7 @@
       state.onlinePage = result.page || state.onlinePage;
       mergeCatalogGroups(result.results, groups);
     }
+    filters.append(reset);
     if (result.errors?.length)
       root.append(
         make(
@@ -2408,7 +2580,7 @@
     syncGroupOrder();
     if (defaultView && groupOrder.length) {
       const featured = groupOrder.map((key) => groups.get(key)).filter((group) => group.cover).slice(0, 5);
-      root.insertBefore(spotlightCard(featured.length ? featured : [groups.get(groupOrder[0])]), summary);
+      root.insertBefore(spotlightCard(featured.length ? featured : [groups.get(groupOrder[0])]), root.children[1]);
     }
     renderNextBatch();
     if (!cards.size)
@@ -2566,31 +2738,19 @@
             ),
           ])
         : null;
-    dialog.replaceChildren(
-      ...[
-        (() => {
-          const art = make("div", { class: "catalog-hero-art tone-2" });
-          if (item.cover) art.append(posterImage(item.cover, { loading: "eager" }));
-          return make("section", { class: "catalog-hero" }, [
-            art,
-            make("div", { class: "catalog-hero-shade" }),
-            make("div", { class: "catalog-hero-copy" }, [
-              make("p", { class: "eyebrow", text: "影片详情" }),
-              make("h2", { id: "catalog-detail-title", text: item.title }),
-              make("p", {
-                class: "catalog-hero-meta",
-                text: [item.year, kindLabel(item.kind), item.source_name]
-                  .filter(Boolean)
-                  .join(" · "),
-              }),
-            ]),
-            icon("✕", "关闭影片详情", () => dialog.close()),
-          ]);
-        })(),
-        sourceBar,
-        make("p", { class: "hint", text: "正在读取影片信息…" }),
-      ].filter(Boolean),
-    );
+    const close = icon("✕", "关闭影片详情", () => dialog.close());
+    function showDetail(media, body, description) {
+      const facts = [media.year, kindLabel(item.kind), media.remark, media.source_name].filter(Boolean).join(" · ");
+      const hero = cinemaHero({
+        title: make("h2", { id: "catalog-detail-title", text: media.title }), cover: media.cover || item.cover,
+        label: "影片详情", close, info: [
+          make("p", { class: "media-facts", text: facts }),
+          description ? make("p", { class: "catalog-description", text: description }) : null,
+        ],
+      });
+      dialog.replaceChildren(...[hero, sourceBar, body].filter(Boolean));
+    }
+    showDetail(item, make("p", { class: "hint", text: "正在读取影片信息…" }));
     if (!dialog.open) dialog.showModal();
     try {
       const mediaId = item.id ?? item.media_id;
@@ -2610,22 +2770,11 @@
           subscription.media_id === detail.id,
       );
       const content = make("div", { class: "catalog-detail-content" });
-      content.append(
-        make("p", {
-          class: "media-meta",
-          text: [detail.year, detail.remark, detail.source_name]
-            .filter(Boolean)
-            .join(" · "),
-        }),
-      );
       const description = new DOMParser().parseFromString(
         detail.description || "",
         "text/html",
       ).body.textContent;
-      if (description)
-        content.append(
-          make("p", { class: "catalog-description", text: description }),
-        );
+      showDetail(detail, content, description);
       const favoriteData = {
         source_id: detail.source_id, media_id: detail.id, title: detail.title,
         cover: detail.cover || item.cover || "", year: detail.year || item.year || "",
@@ -2701,7 +2850,6 @@
         content.append(
           empty("▷", "暂无可用播放线路", "该来源没有返回 HTTP(S) 播放地址。"),
         );
-        dialog.append(content);
         return;
       }
       const groups = make(
@@ -2919,20 +3067,13 @@
           text: "播放与下载使用来源提供的地址；标为“非直链”的线路需要解析器，可能无法播放。下载完成后自动进入媒体库。",
         }),
       );
-      dialog.append(content);
       if (playImmediately) {
         if (record?.position > 0) resume();
         else if (selected()) watch(n(episodes.value), 0, true);
       }
     } catch (error) {
-      if (dialog.dataset.sequence === String(sequence))
-        dialog.append(
-          make("p", {
-            class: "form-error",
-            role: "alert",
-            text: error.message,
-          }),
-        );
+      if (dialog.dataset.sequence === String(sequence) && dialog.open)
+        showDetail(item, make("p", { class: "form-error", role: "alert", text: error.message }));
     }
   }
   async function checkTracking() {
@@ -3810,6 +3951,37 @@
     try { await load(); } catch (error) { message.textContent = error.message; }
     return make("section", { class: "panel source-settings" }, [make("h2", { text: "远程 M3U 直播源管理" }), form, refresh, rows, message]);
   }
+  async function liveMergeSettings() {
+    const path = "/api/settings/live";
+    const control = make("input", { name: "live_merge_similar", type: "checkbox", role: "switch", disabled: true });
+    const status = make("p", { class: "hint", role: "status" });
+    const panel = make("section", { class: "panel" }, [
+      make("h2", { text: "直播频道导入" }),
+      make("label", { class: "checkbox-label" }, [control, "导入时自动合并同类变体频道"]),
+      make("p", { class: "hint", text: "开启后，同一频道的高清、4K 等版本将作为多条播放线路导入。" }), status,
+    ]);
+    function apply(saved) {
+      if (typeof saved?.live_merge_similar !== "boolean") throw new Error("无法读取频道合并设置");
+      control.checked = saved.live_merge_similar;
+    }
+    try {
+      apply(await api(path));
+      control.disabled = false;
+    } catch (error) { status.textContent = error.message; }
+    control.addEventListener("change", async () => {
+      if (control.disabled) return;
+      const next = control.checked;
+      control.disabled = true;
+      try {
+        apply(await api(path, { method: "PUT", body: { live_merge_similar: next } }));
+        status.textContent = "频道导入设置已保存";
+      } catch (error) {
+        control.checked = !next;
+        status.textContent = error.message;
+      } finally { control.disabled = false; }
+    });
+    return panel;
+  }
   async function channelAliasSettings() {
     const path = "/api/epg/aliases";
     const panel = make("section", { class: "panel source-settings" }, make("h2", { text: "频道别名映射" }));
@@ -3916,9 +4088,9 @@
   }
   const sourceAdvancedFields = [
     ["custom_ua", "User-Agent"], ["custom_referer", "Referer"],
-    ["custom_cookie", "Cookie", "password"], ["proxy_url", "代理地址"],
     ["timeout_secs", "超时（秒）", "number"], ["searchable", "允许搜索", "checkbox"],
   ];
+  const sourceSecrets = [["custom_cookie", "Cookie"], ["proxy_url", "代理地址"]];
   function settingsFields(definitions, values) {
     const inputs = definitions.map(([name, label, type = "text", min = 3, max = 60]) => {
       const attrs = { name, type };
@@ -3986,7 +4158,7 @@
     });
     dialog.append(title, data, submit, button("关闭", "subtle", () => dialog.close()));
     function open(exporting) {
-      const keys = ["name", "url", "enabled", "adult", "priority", ...sourceAdvancedFields.map(([key]) => key)];
+      const keys = ["name", "url", "enabled", "adult", "priority", ...[...sourceAdvancedFields, ...sourceSecrets].map(([key]) => key)];
       title.textContent = exporting ? "导出影视源 JSON" : "导入影视源 JSON";
       data.value = exporting ? JSON.stringify(sources.map((source) =>
         Object.fromEntries(keys.map((key) => [key, source[key]]))), null, 2) : "";
@@ -4060,12 +4232,14 @@
       selected = all.checked ? null : new Set();
       paintChoices();
     });
+    const urlBadge = make("span", { class: "configured-badge", text: "已配置" });
     function edit(row) {
       editing = row;
       name.value = row?.name || "";
       url.value = "";
       url.required = !row;
       url.placeholder = row ? "留空保留原地址" : "LunaTV / TVBox 地址或 Base58 配置";
+      urlBadge.hidden = !row;
       enabled.checked = row?.enabled ?? true;
       selected = row?.selected == null ? null : new Set(row.selected);
       items = null;
@@ -4098,7 +4272,7 @@
         await load();
       });
     } } }, [
-      make("div", { class: "form-row" }, [make("label", {}, ["订阅名称", name]), make("label", {}, ["订阅地址", url]), preview]),
+      make("div", { class: "form-row" }, [make("label", {}, ["订阅名称", name]), make("label", {}, ["订阅地址", urlBadge, url]), preview]),
       make("div", { class: "subscription-options" }, [make("label", { class: "checkbox-label" }, [enabled, "启用订阅"]),
         make("label", { class: "checkbox-label" }, [all, "自动导入全部项目（含新增）"]), selectionCount]),
       choices, make("div", { class: "form-row" }, [save, cancel]),
@@ -4217,10 +4391,34 @@
       );
       function advancedEditor(source = {}) {
         const fields = settingsFields(sourceAdvancedFields, { searchable: true, timeout_secs: 12, ...source });
+        const secrets = sourceSecrets.map(([key, title]) => {
+          const input = make("input", { type: "password", name: key, autocomplete: "new-password", spellcheck: "false" });
+          const badge = make("span", { class: "configured-badge", text: "已配置" });
+          const clear = make("input", { name: `clear_${key}`, type: "checkbox" });
+          const clearLabel = make("label", { class: "checkbox-label" }, [clear, `清除已保存的${title}`]);
+          const refresh = () => {
+            badge.hidden = clearLabel.hidden = !source[key];
+            input.placeholder = source[key] ? "留空保留" : "可选";
+            clear.checked = input.disabled = false;
+            input.value = "";
+          };
+          clear.addEventListener("change", () => { input.disabled = clear.checked; });
+          refresh();
+          return { key, input, clear, refresh, labels: [make("label", {}, [title, badge, input]), clearLabel] };
+        });
         return {
-          values: fields.values,
+          values() {
+            const body = fields.values();
+            for (const { key, input, clear } of secrets) {
+              if (clear.checked) body[key] = "";
+              else if (input.value.trim()) body[key] = input.value.trim();
+            }
+            return body;
+          },
+          refresh: () => secrets.forEach((field) => field.refresh()),
           panel: make("details", { class: "source-advanced" }, [
-            make("summary", { text: "高级配置" }), make("div", { class: "form-row" }, fields.labels),
+            make("summary", { text: "高级配置" }),
+            make("div", { class: "form-row" }, [...fields.labels, ...secrets.flatMap((field) => field.labels)]),
           ]),
         };
       }
@@ -4324,6 +4522,7 @@
           type: "checkbox",
           checked: source.adult,
         });
+        const save = button("保存", "subtle small-button", null, { type: "submit" });
         const form = make(
           "form",
           {
@@ -4331,6 +4530,8 @@
             on: {
               submit: async (event) => {
                 event.preventDefault();
+                if (save.disabled) return;
+                save.disabled = true;
                 try {
                   const body = {
                     name: name.value.trim(), url: url.value.trim(),
@@ -4339,24 +4540,26 @@
                   };
                   await api(`/api/sources/${source.id}`, { method: "PUT", body });
                   Object.assign(source, body);
+                  advanced.refresh();
                   toast("影视源已保存");
                 } catch (error) {
                   toast(error.message, true);
-                }
+                } finally { save.disabled = false; }
               },
             },
           },
           [
-            name,
-            url,
+            make("label", {}, ["影视源名称", name]),
+            make("label", {}, ["JSON 接口地址", url]),
             make("label", { class: "checkbox-label" }, [enabled, "启用"]),
             make("label", { class: "checkbox-label" }, [adult, "成人源"]),
-            badge,
-            button("测速", "subtle small-button", () => probe(source)),
-            button("上移", "subtle small-button", () => move(index, -1), { disabled: index === 0 }),
-            button("下移", "subtle small-button", () => move(index, 1), { disabled: index === sources.length - 1 }),
+            make("div", { class: "form-row settings-full-row" }, [badge,
+              button("测速", "subtle small-button", () => probe(source)),
+              button("上移", "subtle small-button", () => move(index, -1), { disabled: index === 0 }),
+              button("下移", "subtle small-button", () => move(index, 1), { disabled: index === sources.length - 1 }),
+            ]),
             advanced.panel,
-            button("保存", "subtle small-button", null, { type: "submit" }),
+            save,
             button("移除", "danger small-button", async () => {
               if (
                 !window.confirm(
@@ -4405,7 +4608,7 @@
     return copy;
   }
   async function tvboxSettings() {
-    const panel = make("section", { class: "panel" }, [
+    const panel = make("section", { class: "panel tvbox-panel" }, [
       make("h2", { text: "影视仓 / TVBox 订阅" }),
       make("p", {
         class: "panel-description",
@@ -4413,48 +4616,120 @@
       }),
     ]);
     try {
-      const feed = await api("/api/tvbox");
+      let feed = await api("/api/tvbox");
+      const links = make("div", { class: "tvbox-links" });
       const configs = make("div", { class: "tvbox-configs" });
-      panel.append(configs);
-      [
-        ["标准配置地址", feed.config_path, configs],
-        ["Base58 配置地址（旧版影视仓兼容）", feed.config_b58_path, configs],
-        ["媒体库接口", feed.catalog_path, panel],
-        ["直播 M3U", feed.live_path, panel],
-      ].forEach(([label, path, container]) => {
-        if (!path) return;
-        const url = new URL(path, location.origin).href;
-        const input = make("input", {
-          value: url,
-          readonly: true,
-          "aria-label": label,
-          spellcheck: "false",
-        });
-        container.append(make("div", { class: "feed-row" }, [
+      links.append(configs);
+      const fields = [
+        ["标准配置地址", "config_path", configs],
+        ["Base58 配置地址（旧版影视仓兼容）", "config_b58_path", configs],
+        ["媒体库接口", "catalog_path", links],
+        ["直播 M3U", "live_path", links],
+      ].map(([label, key, container]) => {
+        const input = make("input", { readonly: true, "aria-label": label, spellcheck: "false" });
+        const row = make("div", { class: "feed-row" }, [
           make("label", {}, [label, input]), copyField(label, input),
-        ]));
+        ]);
+        container.append(row);
+        return { key, input, row };
       });
-      panel.append(
-        make("p", {
-          class: "hint",
-          text: "电视需要能访问当前网页地址。原有订阅在重置令牌后会立即失效，需要在影视仓重新填写新地址。",
-        }),
-        button("重置电视访问令牌", "danger small-button", async () => {
-          if (
-            !window.confirm(
-              "这会立即撤销旧电视订阅地址。继续后，需要在所有客户端填写新地址。确定重置？",
-            )
-          )
-            return;
-          try {
-            await api("/api/tvbox/token", { method: "POST", body: {} });
-            toast("电视访问令牌已重置");
-            render();
-          } catch (error) {
-            toast(error.message, true);
+      let base = location.origin;
+      function updateAddresses() {
+        for (const { key, input, row } of fields) {
+          row.hidden = !feed[key];
+          input.value = feed[key] ? new URL(feed[key], base).href : "";
+        }
+      }
+      updateAddresses();
+
+      const canvas = make("canvas", { role: "img", hidden: true });
+      const message = make("p", { class: "hint tvbox-qr-status", role: "status" });
+      const modes = [["standard", "标准配置二维码"], ["base58", "Base58 配置二维码"]];
+      const switches = modes.map(([key, label]) => button(label, "subtle small-button", () => loadQr(key), {
+        "data-mode": key,
+      }));
+      let generation = 0;
+      let mode = "standard";
+      function clearQr() {
+        generation++;
+        canvas.hidden = true;
+        canvas.width = 0;
+      }
+      async function loadQr(selected) {
+        mode = selected;
+        clearQr();
+        const request = generation;
+        const key = selected === "standard" ? "config_path" : "config_b58_path";
+        for (const [i, [name, label]] of modes.entries()) {
+          switches[i].setAttribute("aria-pressed", String(name === selected));
+          if (name === selected) canvas.setAttribute("aria-label", label);
+        }
+        message.textContent = "正在生成二维码…";
+        try {
+          const { url, qr } = await api(`/api/tvbox/qr?mode=${selected}`);
+          if (request !== generation) return;
+          if (!Array.isArray(qr) || qr.length < 21 || qr.length > 177 || (qr.length - 21) % 4 ||
+              !qr.every((row) => typeof row === "string" && row.length === qr.length && /^[01]+$/.test(row))) {
+            throw new Error("二维码不可用，可复制配置地址。");
           }
-        }),
-      );
+          const address = new URL(url);
+          if (new URL(feed[key], address.origin).href !== url) {
+            // Another session may have rotated the subscription since this panel opened.
+            const current = await api("/api/tvbox");
+            if (request !== generation) return;
+            feed = current;
+          }
+          base = address.origin;
+          updateAddresses();
+          if (!feed[key] || new URL(feed[key], base).href !== url) {
+            throw new Error("订阅地址已变更，请重新选择二维码。");
+          }
+          const ctx = canvas.getContext?.("2d");
+          if (!ctx) throw new Error("当前设备无法显示二维码，可复制配置地址。");
+          const border = 4;
+          const modules = qr.length + 2 * border;
+          const scale = Math.max(1, Math.floor(264 / modules));
+          canvas.width = canvas.height = modules * scale;
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = "#000";
+          qr.forEach((row, y) => {
+            for (let x = 0; x < row.length; x++) {
+              if (row[x] === "1") ctx.fillRect((x + border) * scale, (y + border) * scale, scale, scale);
+            }
+          });
+          canvas.hidden = false;
+          message.textContent = "在影视仓中扫码导入当前配置。";
+        } catch (error) {
+          if (request === generation) message.textContent = error.message;
+        }
+      }
+      const qrCard = make("section", { class: "tvbox-qr", "aria-label": "配置二维码" }, [
+        make("h3", { text: "扫码配置" }),
+        make("div", { class: "tvbox-qr-modes", role: "group", "aria-label": "配置格式" }, switches),
+        canvas, message,
+      ]);
+      const rotate = button("重置电视访问令牌", "danger small-button", async () => {
+        if (rotate.disabled || !window.confirm("这会立即撤销旧电视订阅地址。继续后，需要在所有客户端填写新地址。确定重置？")) return;
+        clearQr();
+        rotate.disabled = true;
+        for (const choice of switches) choice.disabled = true;
+        message.textContent = "正在更新订阅地址…";
+        try {
+          feed = await api("/api/tvbox/token", { method: "POST", body: {} });
+          updateAddresses();
+          toast("电视访问令牌已重置");
+        } catch (error) {
+          toast(error.message, true);
+        } finally {
+          rotate.disabled = false;
+          for (const choice of switches) choice.disabled = false;
+          void loadQr(mode);
+        }
+      });
+      links.append(make("p", { class: "hint", text: "电视需要能访问配置地址。重置令牌后，请在所有客户端重新导入。" }), rotate);
+      panel.append(make("div", { class: "tvbox-subscription" }, [links, qrCard]));
+      void loadQr(mode);
     } catch (error) {
       panel.append(make("p", { class: "form-error", text: error.message }));
     }
@@ -4758,13 +5033,24 @@
     async function settingsPanel(path, title, definitions, actions) {
       const panel = make("section", { class: "panel" }, make("h2", { text: title }));
       try {
-        const fields = settingsFields(definitions, await api(path));
+        const saved = await api(path);
+        const fields = settingsFields(definitions, saved);
+        const badges = [];
+        if (path === "/api/settings/notify") {
+          definitions.forEach(([name], index) => {
+            const badge = make("span", { class: "configured-badge", text: "已配置", hidden: !saved[name] });
+            fields.labels[index].insertBefore(badge, fields.labels[index].lastChild);
+            badges.push([name, badge]);
+          });
+        }
         const save = button(`保存${title}设置`, "primary", null, { type: "submit" });
         panel.append(make("form", { class: "stack", on: { submit: async (event) => {
           event.preventDefault();
           save.disabled = true;
           try {
-            await api(path, { method: "PUT", body: fields.values() });
+            const body = fields.values();
+            await api(path, { method: "PUT", body });
+            for (const [name, badge] of badges) badge.hidden = !body[name];
             toast(`${title}设置已保存`);
           } catch (error) { toast(error.message, true); }
           finally { save.disabled = false; }
@@ -4804,59 +5090,43 @@
     return cloudViews().page();
   }
   async function settings() {
-    const root = make(
-      "div",
-      {},
-      head("账户与设置", "管理你的账户，以及这个影音空间的成员。"),
+    const root = make("div", { class: "settings-layout" }, head("账户与设置", "管理你的账户，以及这个影音空间的成员。"));
+    const groups = [["个人", [["account", "账户安全"], ["tvbox", "影视仓订阅"]]]];
+    if (admin()) groups.push(
+      ["内容与源", [["sources", "在线影视源"], ["parsers", "解析接口"], ["cloud", "网盘与资源频道"], ["epg", "直播与节目单"]]],
+      ["自动化与系统", [["media", "媒体自动化"], ["notify", "通知与日历"], ["family", "家庭成员"], ["backup", "备份与工具"]]],
     );
-    const tabs = [
-      ["account", "账户安全"],
-      ...(admin()
-        ? [
-            ["family", "家庭成员"],
-            ["sources", "在线影视源"],
-            ["parsers", "解析接口"],
-            ["cloud", "网盘与资源频道"],
-            ["media", "媒体自动化"],
-            ["epg", "直播与节目单"],
-            ["notify", "通知与日历"],
-            ["backup", "备份与工具"],
-          ]
-        : []),
-      ["tvbox", "影视仓订阅"],
-    ];
-    const active = tabs.some(([key]) => key === state.settingsTab)
-      ? state.settingsTab
-      : "account";
+    const active = groups.some(([, tabs]) => tabs.some(([key]) => key === state.settingsTab)) ? state.settingsTab : "account";
     state.settingsTab = active;
-    root.append(
-      make(
-        "div",
-        { class: "settings-tabs" },
-        tabs.map(([key, label]) =>
-          make("button", {
-            type: "button",
-            class: `filter-chip${key === active ? " active" : ""}`,
-            "aria-pressed": String(key === active),
-            text: label,
-            on: {
-              click: () => {
-                state.settingsTab = key;
-                render();
-              },
-            },
-          }),
-        ),
-      ),
-    );
-    const body = make("div", { class: "settings-panel" });
+    const nav = make("nav", { class: "settings-tabs", "aria-label": "设置分类" });
+    for (const [category, tabs] of groups) {
+      nav.append(make("span", { class: "settings-category", text: category }));
+      for (const [key, label] of tabs) {
+        nav.append(make("button", {
+          id: `settings-tab-${key}`, type: "button", text: label,
+          class: `filter-chip${key === active ? " active" : ""}`,
+          "aria-pressed": String(key === active), "aria-controls": "settings-content",
+          on: { click: async () => {
+            if (key === state.settingsTab) return;
+            state.settingsTab = key;
+            await render();
+            if (state.settingsTab !== key || state.page !== "settings") return;
+            const tab = $(`settings-tab-${key}`);
+            tab?.focus?.({ preventScroll: true });
+            tab?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+          } },
+        }));
+      }
+    }
+    root.append(nav);
+    const body = make("div", { id: "settings-content", class: "settings-panel", role: "region", "aria-labelledby": `settings-tab-${active}` });
     if (active === "account") body.append(accountSettings());
     else if (active === "family") body.append(await familySettings());
     else if (active === "sources") body.append(await sourceSettings());
     else if (active === "parsers") body.append(await globalThis.polyviewParserPanel({ make, button, api, toast }));
     else if (active === "cloud") body.append(await cloudViews().settings());
     else if (active === "media") body.append(...await mediaViews().settings());
-    else if (active === "epg") body.append(...await Promise.all([epgSettings(), liveSubscriptionSettings(), channelAliasSettings()]));
+    else if (active === "epg") body.append(...await Promise.all([epgSettings(), liveMergeSettings(), liveSubscriptionSettings(), channelAliasSettings()]));
     else if (active === "notify") body.append(...await notificationCalendarSettings());
     else if (active === "backup") body.append(...backupSettings());
     else if (active === "tvbox") body.append(await tvboxSettings());
@@ -4933,6 +5203,7 @@
     }
   }
   function authMode(setup) {
+    document.body.dataset.view = "auth";
     const username = $("auth-username"),
       password = $("auth-password");
     username.setAttribute("minlength", setup ? "3" : "1");
@@ -5094,7 +5365,7 @@
     }
   });
   document
-    .querySelectorAll("[data-view]")
+    .querySelectorAll("button[data-view]")
     .forEach((el) =>
       el.addEventListener("click", () => setNav(el.dataset.view)),
     );
@@ -5121,10 +5392,44 @@
       document.documentElement.dataset.theme === "dark" ? "light" : "dark",
     ),
   );
+  function applyTvMode(enabled) {
+    document.documentElement.dataset.tv = enabled ? "1" : "0";
+    $("tv-mode-toggle").setAttribute("aria-pressed", String(enabled));
+  }
+  applyTvMode(storedNumber("polyview-tv-mode", 0) === 1);
+  $("tv-mode-toggle").addEventListener("click", () => {
+    const enabled = document.documentElement.dataset.tv !== "1";
+    applyTvMode(enabled);
+    storeNumber("polyview-tv-mode", Number(enabled));
+  });
+  const motionLabels = { standard: "标准", soft: "柔和", static: "静态" };
+  const motionModes = Object.keys(motionLabels);
+  function applyBackgroundMode(value) {
+    const mode = motionModes.includes(value) ? value : "standard";
+    document.documentElement.dataset.bgMode = mode;
+    const toggle = $("bg-mode-toggle");
+    toggle.title = `3D 背景动效：${motionLabels[mode]}`;
+    toggle.setAttribute("aria-label", toggle.title);
+  }
+  let initialMotion;
+  try { initialMotion = localStorage.getItem("polyview-bg-mode"); } catch (_) {}
+  applyBackgroundMode(initialMotion);
+  $("bg-mode-toggle").addEventListener("click", () => {
+    const index = motionModes.indexOf(document.documentElement.dataset.bgMode);
+    const next = motionModes[(index + 1) % motionModes.length];
+    applyBackgroundMode(next);
+    try { localStorage.setItem("polyview-bg-mode", next); } catch (_) {}
+    toast(`3D 背景动效：${motionLabels[next]}`);
+  });
   const setNavigation = (open) => {
     document.body.classList.toggle("nav-open", open);
     $("nav-toggle").setAttribute("aria-expanded", String(open));
+    $("mobile-more").setAttribute("aria-expanded", String(open));
   };
+  $("mobile-more").addEventListener("click", () => {
+    setNavigation(true);
+    document.querySelector(".sidebar .nav-item.active")?.focus();
+  });
   $("nav-toggle").addEventListener("click", () =>
     setNavigation(!document.body.classList.contains("nav-open")),
   );
@@ -5149,6 +5454,44 @@
   );
   $("help-close").addEventListener("click", () => $("help-dialog").close());
   $("player-close").addEventListener("click", closePlayer);
+  function liveRemoteKey(event) {
+    if (!state.player?.live || event.defaultPrevented || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || (event.shiftKey && event.key !== "M")) return;
+    const target = event.target || document.activeElement;
+    if (target?.isContentEditable || ["INPUT", "SELECT", "TEXTAREA"].includes(target?.tagName)) return;
+    const drawer = $("player-channel-drawer");
+    const interactive = ["BUTTON", "SUMMARY", "A"].includes(target?.tagName) || target?.closest?.("button, a[href], summary, [role=button]");
+    const key = event.key;
+    if (key === "m" || key === "M" || (key === "Enter" && !interactive)) {
+      if (!event.repeat) setChannelDrawer(drawer.hidden);
+    } else if (key === "Escape" && !drawer.hidden) {
+      setChannelDrawer(false);
+    } else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(key)) {
+      if (!drawer.hidden && drawer.contains?.(target)) {
+        const groups = Array.from($("player-channel-groups").children);
+        const rows = Array.from($("player-channel-list").children).filter((el) => el.tagName === "BUTTON");
+        const active = groups.findIndex((el) => el.getAttribute("aria-pressed") === "true");
+        if (key === "ArrowDown" || key === "ArrowUp") {
+          const index = rows.indexOf(target) + (key === "ArrowDown" ? 1 : -1);
+          (index < 0 ? groups[active] : rows[Math.min(index, rows.length - 1)])?.focus();
+        } else {
+          const from = groups.includes(target) ? groups.indexOf(target) : active;
+          groups[(from + (key === "ArrowRight" ? 1 : -1) + groups.length) % groups.length].focus();
+        }
+      } else if (target?.closest?.("#player-guide")) return;
+      else if (key === "ArrowUp" || key === "ArrowDown") playPlaylist(key === "ArrowUp" ? -1 : 1);
+      else switchLiveSource(key === "ArrowLeft" ? -1 : 1);
+    } else return;
+    event.preventDefault();
+    event.stopPropagation();
+    wakeLiveControls();
+  }
+  $("player-channel-toggle").addEventListener("click", () => {
+    if (state.player?.live) setChannelDrawer($("player-channel-drawer").hidden);
+  });
+  $("player-channel-close").addEventListener("click", () => setChannelDrawer(false));
+  $("player-stage").addEventListener("keydown", liveRemoteKey);
+  for (const type of ["pointermove", "pointerdown", "focusin", "keydown"])
+    $("player-stage").addEventListener(type, wakeLiveControls);
   $("player-prev").addEventListener("click", () => playPlaylist(-1));
   $("player-next").addEventListener("click", () => playPlaylist(1));
   $("player-hud-close").addEventListener("click", () => {
@@ -5242,17 +5585,21 @@
     event.preventDefault();
     toggleFullscreen();
   });
-  document.addEventListener("fullscreenchange", () => {
+  function syncPlayerFullscreen() {
     const full = !!(
       document.fullscreenElement || document.webkitFullscreenElement
     );
+    if (full && state.player?.live && $("player-channel-drawer").hidden) $("player-stage").focus?.();
+    wakeLiveControls();
     if (!full) fullscreenExitedAt = Date.now();
     setIcon($("player-fullscreen"), full ? "exitFullscreen" : "fullscreen");
     $("player-fullscreen").setAttribute(
       "aria-label",
       full ? "退出全屏" : "全屏",
     );
-  });
+  }
+  document.addEventListener("fullscreenchange", syncPlayerFullscreen);
+  document.addEventListener("webkitfullscreenchange", syncPlayerFullscreen);
   for (const event of ["play", "pause", "volumechange"])
     $("video-player").addEventListener(event, updatePlayerControls);
 

@@ -291,6 +291,114 @@ fn decode_base58(text: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn scan_subscription_qr(matrix: &Value) -> String {
+    let rows = matrix.as_array().unwrap();
+    assert!((21..=177).contains(&rows.len()) && (rows.len() - 21).is_multiple_of(4));
+    let scale = 4;
+    let quiet = 4;
+    let width = (rows.len() + 2 * quiet) * scale;
+    let mut image = vec![255; width * width];
+    for (y, row) in rows.iter().enumerate() {
+        let row = row.as_str().unwrap();
+        assert_eq!(row.len(), rows.len());
+        for (x, bit) in row.bytes().enumerate() {
+            assert!(matches!(bit, b'0' | b'1'));
+            if bit == b'1' {
+                for dy in 0..scale {
+                    let start = ((y + quiet) * scale + dy) * width + (x + quiet) * scale;
+                    image[start..start + scale].fill(0);
+                }
+            }
+        }
+    }
+    let mut scanner = quircs::Quirc::default();
+    let mut codes = scanner.identify(width, width, &image);
+    let result = codes.next().unwrap().unwrap().decode().unwrap();
+    assert!(codes.next().is_none());
+    String::from_utf8(result.payload).unwrap()
+}
+
+#[tokio::test]
+async fn subscription_qr_scans_to_the_current_members_exact_configuration_url() {
+    let app = TestApp::new();
+    let admin = app.setup().await;
+    app.create_viewer(&admin).await;
+    let viewer = app.login("viewer", PASSWORD).await.cookie();
+    let headers = &[("host", "polyview.test:9000")];
+    let standard = "/api/tvbox/qr?mode=standard";
+    let base58 = "/api/tvbox/qr?mode=base58";
+    let denied = app
+        .request_with_headers("GET", standard, None, None, headers)
+        .await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.headers[header::CACHE_CONTROL], "no-store");
+    let invalid = app
+        .request_with_headers(
+            "GET",
+            "/api/tvbox/qr?mode=other",
+            Some(&admin),
+            None,
+            headers,
+        )
+        .await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+
+    // The QR route can be the first request to provision a member's feed.
+    let first = app
+        .request_with_headers("GET", standard, Some(&viewer), None, headers)
+        .await;
+    assert_eq!(first.status, StatusCode::OK);
+    let old = first.json()["url"].as_str().unwrap().to_owned();
+    for member in [&admin, &viewer] {
+        let feed = app
+            .request("GET", "/api/tvbox", Some(member), None)
+            .await
+            .json();
+        for (route, field) in [(standard, "config_path"), (base58, "config_b58_path")] {
+            let reply = app
+                .request_with_headers("GET", route, Some(member), None, headers)
+                .await;
+            assert_eq!(reply.status, StatusCode::OK);
+            assert_eq!(reply.headers[header::CACHE_CONTROL], "no-store");
+            let body = reply.json();
+            let path = feed[field].as_str().unwrap();
+            let expected = format!("http://polyview.test:9000{path}");
+            assert_eq!(body["url"], expected);
+            assert_eq!(scan_subscription_qr(&body["qr"]), expected);
+            assert_eq!(
+                app.request_with_headers("GET", path, None, None, headers)
+                    .await
+                    .status,
+                StatusCode::OK
+            );
+            if route == standard {
+                assert_eq!(expected == old, member == &viewer);
+            }
+        }
+    }
+    let rotated = app
+        .request("POST", "/api/tvbox/token", Some(&viewer), None)
+        .await
+        .json();
+    let next = app
+        .request_with_headers("GET", standard, Some(&viewer), None, headers)
+        .await
+        .json();
+    let expected = format!(
+        "http://polyview.test:9000{}",
+        rotated["config_path"].as_str().unwrap()
+    );
+    assert_ne!(expected, old);
+    assert_eq!(scan_subscription_qr(&next["qr"]), expected);
+    let old_path = old.strip_prefix("http://polyview.test:9000").unwrap();
+    assert_eq!(
+        app.request_with_headers("GET", old_path, None, None, headers)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
 #[tokio::test]
 async fn base58_subscription_decodes_to_the_exact_standard_configuration() {
     let app = TestApp::new();

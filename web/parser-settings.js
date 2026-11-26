@@ -29,7 +29,7 @@
       const priority = make("input", { name: "priority", type: "number", step: 1, value: parser?.priority ?? 0, required: true });
       const timeout = make("input", { name: "timeout_ms", type: "number", min: 1, max: 120000, step: 1,
         value: parser?.timeout_ms ?? 5000, required: true });
-      const enabled = make("input", { name: "enabled", type: "checkbox", checked: parser?.enabled ?? true });
+      const enabled = make("input", { name: "enabled", type: "checkbox", role: "switch", checked: parser?.enabled ?? true });
       async function save(event) {
         event.preventDefault();
         if (lock.disabled) return;
@@ -58,12 +58,14 @@
         } catch { toast("保存失败，请检查接口配置后重试。", true); }
         finally { lock.disabled = false; }
       }
-      return make("form", { class: "stack", autocomplete: "off", on: { submit: save } }, [
-        make("div", { class: "form-row" }, [label("名称", name), label("接口地址模板", template), label("请求头（JSON）", headers)]),
-        make("p", { class: "hint", text: "模板用 {url} 代表剧集地址，也可用 url= 结尾。地址和请求头仅供写入。" }),
-        make("div", { class: "form-row" }, [label("线路标识（逗号分隔，* 表示全部）", flags), label("优先级", priority),
-          label("超时（毫秒）", timeout), make("label", { class: "checkbox-label" }, [enabled, "启用"]),
-          button(parser ? "保存" : "添加接口", "primary", null, { type: "submit" })]),
+      return make("form", { class: "settings-form-grid", autocomplete: "off", on: { submit: save } }, [
+        label("名称", name),
+        make("label", {}, ["接口地址模板", parser ? make("span", { class: "configured-badge", text: "已配置" }) : null, template]),
+        label("请求头（JSON）", headers),
+        make("p", { class: "hint settings-full-row", text: "模板用 {url} 代表剧集地址，也可用 url= 结尾。地址和请求头仅供写入。" }),
+        label("线路标识（逗号分隔，* 表示全部）", flags), label("优先级", priority), label("超时（毫秒）", timeout),
+        make("label", { class: "checkbox-label" }, [enabled, "启用"]),
+        button(parser ? "保存" : "添加接口", "primary", null, { type: "submit" }),
       ]);
     }
 

@@ -36,11 +36,20 @@
     };
 
     function page() {
-      const search = input("cloud_query", "", { type: "search", required: true, placeholder: "输入片名或剧名" });
-      const filter = select("cloud_provider", [["", "全部网盘"], ...Object.entries(providers)]);
+      const search = input("cloud_query", "", { type: "search", required: true, placeholder: "输入片名或剧名", "aria-label": "片名或剧名" });
+      const filter = make("div", { name: "cloud_provider", class: "cloud-provider-filter", role: "group", "aria-label": "网盘类型" });
+      filter.value = "";
+      for (const [key, title] of [["", "全部"], ["quark", "夸克"], ["115", "115"], ["tianyi", "天翼"], ["ali", "阿里"], ["baidu", "百度"], ["uc", "UC"], ["xunlei", "迅雷"]]) {
+        filter.append(make("button", { type: "button", value: key, text: title, "data-provider": key, class: `filter-chip${key ? "" : " active"}`, "aria-pressed": String(!key), on: { click: () => {
+          filter.value = key;
+          paintFilter();
+        } } }));
+      }
       const results = make("div", { class: "cloud-results" });
       const status = make("div", { "aria-live": "polite" });
-      const trends = make("section", { class: "panel", "aria-label": "热门榜单" });
+      const trendTitle = make("h2", { text: "热门榜单" });
+      const trendBody = make("div");
+      const trends = make("details", { class: "panel cloud-trends", "aria-label": "热门榜单", open: !window.matchMedia?.("(max-width: 800px)").matches }, [make("summary", {}, trendTitle), trendBody]);
       const dialog = make("dialog", { class: "info-dialog cloud-dialog", "aria-labelledby": "cloud-transfer-title" });
       let rows = [], searched = false, request = 0;
       function paintResults() {
@@ -54,9 +63,10 @@
             links.append(make("a", { class: "button subtle small-button", href: link, target: "_blank", rel: "noopener noreferrer", text: "打开分享链接" }));
             if (transferable.includes(row.provider)) links.append(button("校验与转存", "primary small-button", () => openTransfer(dialog, row)));
           }
-          return make("article", { class: "cloud-result" }, [make("div", {}, [
+          const provider = make("span", { class: "drive-badge", "data-provider": row.provider, text: providers[row.provider] || row.provider });
+          return make("article", { class: "cloud-result" }, [make("div", { class: "cloud-result-info" }, [
             make("h3", { text: row.title || row.url }),
-            make("p", { class: "hint", text: [providers[row.provider] || row.provider, row.channel, row.code && `提取码 ${row.code}`].filter(Boolean).join(" · ") }),
+            make("div", { class: "cloud-result-meta" }, [provider, make("span", { text: [row.channel, row.code && `提取码 ${row.code}`].filter(Boolean).join(" · ") })]),
           ]), links]);
         }));
       }
@@ -77,24 +87,33 @@
         }
       }
       async function loadTrends() {
-        trends.replaceChildren(message("正在加载热门榜单…"));
+        trendBody.replaceChildren(message("正在加载热门榜单…"));
         try {
           const data = await api("/api/catalog/recommend");
           const groups = (data.groups || []).filter((group) => group.items?.length);
-          trends.replaceChildren(make("h2", { text: data.origin === "douban" ? "豆瓣热门榜" : "热门片单" }), ...groups.map((group) =>
+          trendTitle.textContent = data.origin === "douban" ? "豆瓣热门榜" : "热门片单";
+          trendBody.replaceChildren(...groups.map((group) =>
             make("details", { class: "cloud-trend", open: groups[0] === group }, [make("summary", { text: group.title }),
               actions(...group.items.map(({ title }) => button(title, "subtle small-button", () => find(title)))),
             ])));
-          if (!groups.length) trends.append(message("暂无热门片单。"));
+          if (!groups.length) trendBody.append(message("暂无热门片单。"));
         } catch {
-          trends.replaceChildren(error("热门榜单加载失败。"), button("重试榜单", "subtle small-button", loadTrends));
+          trendBody.replaceChildren(error("热门榜单加载失败。"), button("重试榜单", "subtle small-button", loadTrends));
         }
       }
-      filter.addEventListener("change", paintResults);
-      const root = make("div", {}, [head("网盘搜片", "搜索资源频道，或从热门榜单选择片名。"),
-        make("form", { class: "panel form-row", on: { submit: (event) => { event.preventDefault(); return find(search.value); } } },
-          [label("片名或剧名", search), label("网盘类型", filter), submit("搜索资源")]),
-        status, results, trends, dialog]);
+      function paintFilter() {
+        for (const chip of filter.children) {
+          const active = chip.value === filter.value;
+          chip.classList.toggle("active", active);
+          chip.setAttribute("aria-pressed", String(active));
+        }
+        paintResults();
+      }
+      filter.addEventListener("change", paintFilter);
+      const form = make("form", { class: "cloud-search", role: "search", on: { submit: (event) => { event.preventDefault(); return find(search.value); } } }, [search, submit("搜索资源")]);
+      const root = make("div", { class: "cloud-page" }, [head("网盘搜片", "搜索资源频道，或从热门榜单选择片名。"),
+        make("div", { class: "cloud-search-tools" }, [form, filter]),
+        make("div", { class: "cloud-columns" }, [make("section", { class: "cloud-matches", "aria-label": "搜索结果" }, [status, results]), trends]), dialog]);
       loadTrends();
       return root;
     }
@@ -133,7 +152,9 @@
         finally { if (version === revision) verify.disabled = false; }
       }
       async function chooseFolder(version) {
-        const trail = [], location = message(), folders = make("div", { class: "cloud-actions" });
+        const trail = [];
+        const location = make("nav", { class: "folder-breadcrumbs", "aria-label": "目标目录" });
+        const folders = make("div", { class: "folder-list" });
         const state = make("div", { "aria-live": "polite" });
         const lock = make("fieldset", { class: "cloud-fields stack" });
         const save = button("确认转存", "primary", transfer);
@@ -150,11 +171,17 @@
             const children = await api(`${base}/folders?${params}`);
             if (version !== revision) return;
             trail.splice(0, trail.length, ...nextTrail);
-            location.textContent = `目标目录：${trail.map((dir) => dir.name).join(" / ")}`;
+            location.replaceChildren();
+            for (const [index, dir] of trail.entries()) {
+              if (index) location.append(make("span", { text: " / ", "aria-hidden": "true" }));
+              location.append(index === trail.length - 1
+                ? make("span", { "aria-current": "location", text: dir.name })
+                : button(dir.name, "subtle small-button", () => browse(trail.slice(0, index + 1))));
+            }
             folders.replaceChildren();
-            if (trail.length > 1) folders.append(button("上一级", "subtle", () => browse(trail.slice(0, -1))));
-            if (trail[0].id !== rootDir.id) folders.append(button("浏览根目录", "subtle", () => browse([rootDir])));
-            for (const dir of children) folders.append(button(dir.name, "subtle", () => browse([...trail, dir])));
+            if (trail.length > 1) folders.append(button("上一级", "subtle small-button", () => browse(trail.slice(0, -1))));
+            if (trail[0].id !== rootDir.id) folders.append(button("浏览根目录", "subtle small-button", () => browse([rootDir])));
+            for (const dir of children) folders.append(button(dir.name, "folder-item", () => browse([...trail, dir])));
             state.replaceChildren(...(children.length ? [] : [message("此目录没有子目录。") ]));
           } catch {
             state.replaceChildren(error("无法读取目录。"), button("重试目录", "subtle", () => browse(nextTrail)));
@@ -213,6 +240,7 @@
       const share = checkbox("允许家庭成员使用此账号转存", "members_allowed", Boolean(row?.members_allowed));
       return {
         fields: [label("账号名称", name), label("网盘类型", provider), label("默认保存目录 ID", dir),
+          row?.credential_configured ? make("span", { class: "configured-badge settings-full-row", text: "凭据已配置" }) : null,
           label("Cookie", cookie), label("Token", token), share.node],
         body: () => ({ name: name.value.trim(), provider: provider.value, default_dir: dir.value.trim(),
           members_allowed: share.control.checked === true, ...(cookie.value.trim() ? { cookie: cookie.value.trim() } : {}), ...(token.value.trim() ? { token: token.value.trim() } : {}) }),
@@ -310,7 +338,7 @@
           const token = secret("bot_token", config.token_configured ? "留空保留已保存的 Token" : "输入 Bot Token");
           const clear = checkbox("清除已保存的 Token", "clear_token", false);
           clear.control.addEventListener("change", () => { token.disabled = clear.control.checked; if (token.disabled) token.value = ""; });
-          const bindings = [], list = make("div", { class: "stack" });
+          const bindings = [], list = make("div", { class: "stack settings-full-row" });
           function add(binding) {
             const sender = input("sender_id", binding?.sender_id, { required: true, inputmode: "numeric", pattern: "[1-9][0-9]*" });
             const chat = input("chat_id", binding?.chat_id, { required: true, pattern: "-?[1-9][0-9]*" });
@@ -324,7 +352,8 @@
             bindings.push(entry); list.append(entry.node);
           }
           for (const binding of config.bindings) add(binding);
-          const lock = make("fieldset", { class: "cloud-fields stack", "aria-label": "Bot 配置" }, [enabled.node, label("Bot Token", token),
+          const lock = make("fieldset", { class: "cloud-fields settings-form-grid", "aria-label": "Bot 配置" }, [enabled.node,
+            make("label", {}, ["Bot Token", config.token_configured ? make("span", { class: "configured-badge", text: "已配置" }) : null, token]),
             ...(config.token_configured ? [clear.node] : []), make("h3", { text: "允许的聊天" }),
             message("私聊的聊天 ID 与发送者 ID 相同。群聊请填写负数聊天 ID，并指定允许发送指令的成员。"),
             list, actions(button("添加聊天授权", "subtle", () => add(null)), submit("保存 Bot 配置"))]);

@@ -16,12 +16,26 @@ import { runBrowserSmoke } from "./e2e-browser.mjs";
 
 const title = "冒烟测试剧集";
 const mediaFile = "Smoke Library.mp4";
+// A 32×24 VP8 WebM, three ten-second frames of solid color. Browser smoke needs no encoder.
+const liveVideo = Buffer.from(
+  "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwH/////////EU2bdKtNu4tTq4QVSalmU6yBoU" +
+  "27i1OrhBZUrmtTrIHGTbuMU6uEElTDZ1OsggEU7AEAAAAAAABoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+  "AAAAAAAAAVSalmoCrXsYMPQkBNgIRMYXZmV0GETGF2ZkSJiEDdTAAAAAAAFlSua8muAQAAAAAAAEDXgQFzxYgAAAAA" +
+  "AAAAAZyBACK1nIN1bmSIgQCGhVZfVlA4g4EBI+ODhQJUC+QA4JCwgSC6gRiagQJVsIRVuYEBElTDZ6xzc6ljwItjxY" +
+  "gAAAAAAAAAAWfImEWjh0VOQ09ERVJEh4tMYXZjIGxpYnZweB9DtnW654EAo7WBAACAcAIAnQEqIAAYAAJHCIWFiJmE" +
+  "iAyCAnTyxmZi2AD++0KD/0JP/+CT//gk/dPxhNJHYB9DtnW154InEKOvgQAAABECAAkQEAAYB2AQP/LmmYCL4gD+/4" +
+  "3k//2eX/7PL/9nl/9nl/9x2Buu8QAfQ7Z1s+eCTiCjrYEAAADRAQAJEBAAGAAeV/QMAEEOAP7/jeT//Z5f/s8v/2eX" +
+  "/2eX/3HYG67xAA==",
+  "base64",
+);
 const binary = process.env.POLYVIEW_BIN ? resolve(process.env.POLYVIEW_BIN)
   : fileURLToPath(new URL("../target/release/polyview", import.meta.url));
 
 function mixedPlaylist(origin) {
   return ["#EXTM3U", '#EXTINF:-1 tvg-id="smoke.news" group-title="Smoke",Smoke News',
-    `${origin}/news.ts`, "Smoke,#genre#", `Smoke Culture,${origin}/culture.ts`, ""].join("\n");
+    `${origin}/news.webm`, '#EXTINF:-1 tvg-id="smoke.news" group-title="Smoke",Smoke News',
+    `${origin}/news.webm?line=2`, "Smoke,#genre#", `Smoke Culture,${origin}/culture.webm`, ""].join("\n");
 }
 
 function xmltvTime(ms) {
@@ -49,8 +63,8 @@ function makeFixture() {
         case "/1.mp4":
         case "/2.mp4": return send("video/mp4", `Fixture episode ${url.pathname[1]}`);
         case "/channels.m3u": return send("audio/x-mpegurl", mixedPlaylist(origin));
-        case "/news.ts":
-        case "/culture.ts": return send("video/mp2t", Buffer.alloc(188, 0x47));
+        case "/news.webm":
+        case "/culture.webm": return send("video/webm", liveVideo);
         case "/guide.xml": {
           const now = Date.now();
           return send("application/xml", `<tv><channel id="smoke.news"><display-name>Smoke News</display-name></channel>` +
@@ -195,15 +209,16 @@ async function catalogAndProgress(api, origin) {
 
 async function liveAndFavorites(api, origin, sourceId) {
   const imported = await api.json("POST", "/api/channels/import", { body: { playlist: mixedPlaylist(origin) } });
-  assert.deepEqual(imported, { imported: 2, new_channels: 2 });
+  assert.deepEqual(imported, { imported: 3, new_channels: 2 });
   const subscription = await api.json("POST", "/api/live-sources", { status: 201, body: { name: "Smoke TV", url: `${origin}/channels.m3u` } });
   assert.equal(subscription.enabled, true);
   assert.deepEqual(await api.json("POST", "/api/live-sources/refresh"), { refreshed: 1, failed: 0 });
   const probe = await api.json("POST", "/api/channels/probe", { body: { group: "Smoke" } });
-  assert.deepEqual(probe, { checked: 2, healthy: 2, failed: 0 });
+  assert.deepEqual(probe, { checked: 3, healthy: 3, failed: 0 });
   const channels = await api.json("GET", "/api/channels");
   assert.deepEqual(channels.map(item => item.name).sort(), ["Smoke Culture", "Smoke News"]);
-  assert.ok(channels.every(item => item.sources.length === 1 && item.sources[0].last_ok_at > 0), "Expected probe results for both M3U and TXT channels");
+  assert.deepEqual(channels.map(channel => channel.sources.length).sort(), [1, 2]);
+  assert.ok(channels.every(channel => channel.sources.every(line => line.last_ok_at > 0)), "Expected probe results for all three lines");
   const news = channels.find(item => item.name === "Smoke News");
   const refresh = await api.json("POST", "/api/epg/refresh");
   assert.ok(refresh.matched_channels === 1 && refresh.programs === 1 && !refresh.errors.length, "Expected a fresh XMLTV match");

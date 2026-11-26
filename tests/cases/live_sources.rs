@@ -29,6 +29,12 @@ async fn subscription_management_validates_urls_and_requires_an_admin() {
         ("POST", REFRESH, None),
         ("GET", ALIASES, None),
         ("PUT", ALIASES, Some(json!([]))),
+        ("GET", "/api/settings/live", None),
+        (
+            "PUT",
+            "/api/settings/live",
+            Some(json!({"live_merge_similar":true})),
+        ),
     ] {
         let reply = app.request(method, path, Some(&viewer), body).await;
         assert_eq!(reply.status, StatusCode::FORBIDDEN, "{method} {path}");

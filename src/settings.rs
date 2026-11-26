@@ -71,6 +71,36 @@ pub fn set_setting_json<T: Serialize>(
     Ok(())
 }
 
+pub(crate) const MERGE_SIMILAR_KEY: &str = "live_merge_similar";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveSettings {
+    live_merge_similar: bool,
+}
+
+async fn read_live(
+    State(state): State<Shared>,
+    user: AuthUser,
+) -> Result<Json<LiveSettings>, AppError> {
+    require_admin(&user)?;
+    let conn = state.conn()?;
+    Ok(Json(LiveSettings {
+        live_merge_similar: get_setting_json(&conn, MERGE_SIMILAR_KEY)?,
+    }))
+}
+
+async fn save_live(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Json(settings): Json<LiveSettings>,
+) -> Result<Json<LiveSettings>, AppError> {
+    require_admin(&user)?;
+    let conn = state.conn()?;
+    set_setting_json(&conn, MERGE_SIMILAR_KEY, &settings.live_merge_similar)?;
+    Ok(Json(settings))
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlaySettings {
@@ -183,5 +213,6 @@ pub fn router() -> Router<Shared> {
     Router::new()
         .merge(backup::router())
         .route("/api/settings/play", get(read_play).put(save_play))
+        .route("/api/settings/live", get(read_live).put(save_live))
         .route("/api/skip", get(read_skip).put(save_skip))
 }

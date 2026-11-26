@@ -109,6 +109,12 @@ struct EpgConfig {
 #[serde(deny_unknown_fields)]
 struct SiteSettings {
     adult_sources_enabled: bool,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    live_merge_similar: Option<bool>,
     epg_aliases: Vec<ChannelAlias>,
     calendar: CalendarSettings,
     notify: NotifySettings,
@@ -175,6 +181,7 @@ async fn export(State(state): State<Shared>, user: AuthUser) -> Result<Json<Back
         },
         app_settings: SiteSettings {
             adult_sources_enabled: adult_sources_enabled(&tx)?,
+            live_merge_similar: Some(get_setting_json(&tx, super::MERGE_SIMILAR_KEY)?),
             epg_aliases: get_setting_json(&tx, epg::ALIASES_KEY)?,
             calendar: get_setting_json(&tx, "calendar")?,
             notify: get_setting_json(&tx, "notify")?,
@@ -370,6 +377,9 @@ impl SiteSettings {
     fn restore(self, conn: &Connection) -> Result<(), AppError> {
         self.calendar.validate()?;
         self.play.validate()?;
+        if let Some(enabled) = self.live_merge_similar {
+            set_setting_json(conn, super::MERGE_SIMILAR_KEY, &enabled)?;
+        }
         if let Some(settings) = &self.downloads {
             settings.validate()?;
             set_setting_json(conn, "downloads", settings)?;

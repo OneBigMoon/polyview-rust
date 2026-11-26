@@ -180,6 +180,18 @@ async function exercise(cdp, { baseUrl, username, password }) {
   await cdp.send('Runtime.addBinding', { name: 'polyviewSmokeCsp' });
   await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source:
     "document.addEventListener('securitypolicyviolation', event => polyviewSmokeCsp(event.effectiveDirective + ' ' + event.blockedURI));" });
+  // Count the real point draws to distinguish a paused renderer from a hidden animation.
+  await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
+    const prototype = window.WebGL2RenderingContext?.prototype;
+    if (!prototype) return;
+    const draw = prototype.drawArrays;
+    window.polyviewSmokeDraws = 0;
+    prototype.drawArrays = function(...args) {
+      const result = Reflect.apply(draw, this, args);
+      if (this.canvas.id === 'bg-canvas') window.polyviewSmokeDraws++;
+      return result;
+    };
+  })()` });
 
   async function evaluate(fn, ...args) {
     const { result, exceptionDetails } = await cdp.send('Runtime.evaluate', {
@@ -213,6 +225,11 @@ async function exercise(cdp, { baseUrl, username, password }) {
       await cdp.send('Input.dispatchMouseEvent', { type, ...point, button: 'left', clickCount: 1 });
     }
   }
+  async function press(key, code, virtualKey) {
+    for (const type of ['rawKeyDown', 'keyUp']) {
+      await cdp.send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode: virtualKey });
+    }
+  }
   async function settle() {
     await until('local requests to finish', () => pending.size === 0 && Date.now() - lastActivity >= 100);
     await evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)))));
@@ -228,6 +245,7 @@ async function exercise(cdp, { baseUrl, username, password }) {
       const problems = [];
       const view = document.querySelector('.sidebar [aria-current="page"]')?.dataset.view;
       if (view !== page) problems.push(`active page ${view}`);
+      if (document.body.dataset.view !== page) problems.push(`background view ${document.body.dataset.view}`);
       if (document.body.classList.contains('nav-open')) problems.push('sidebar is still open');
       const root = tab ? main.querySelector('.settings-panel') : main;
       const headings = root ? Array.from(root.querySelectorAll(tab ? 'h2' : 'h1')).filter(visible).map((el) => el.textContent.trim()) : [];
@@ -262,6 +280,119 @@ async function exercise(cdp, { baseUrl, username, password }) {
       await checkLayout(width, height, theme);
     }
   }
+  const stillBackdrop = () => evaluate(async () => {
+    const frame = () => new Promise(requestAnimationFrame);
+    await frame();
+    const draws = window.polyviewSmokeDraws;
+    await frame(); await frame();
+    return draws === window.polyviewSmokeDraws;
+  });
+  async function checkDisplay(width, height) {
+    const backdrop = await until('mounted cinema canvas or CSS fallback', () => evaluate(() => {
+      const canvas = document.getElementById('bg-canvas');
+      if (!(canvas instanceof HTMLCanvasElement) || canvas.getAttribute('aria-hidden') !== 'true') return;
+      if (canvas.hidden && !canvas.getContext('webgl2')) return 'CSS fallback';
+      if (!canvas.hidden && canvas.dataset.engine && window.polyviewSmokeDraws > 0) return 'WebGL';
+    }));
+    const baseFont = await evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize));
+    await click('#tv-mode-toggle');
+    await until('larger TV typography', () => evaluate(size => document.documentElement.dataset.tv === '1' &&
+      parseFloat(getComputedStyle(document.documentElement).fontSize) >= size * 1.15, baseFont));
+    await press('Tab', 'Tab', 9);
+    assert(await evaluate(() => document.activeElement.matches(':focus-visible') &&
+      parseFloat(getComputedStyle(document.activeElement).outlineWidth) >= 3), 'Missing TV keyboard focus ring');
+    await checkLayout(width, height, 'light');
+    for (const mode of ['soft', 'static']) {
+      await click('#bg-mode-toggle');
+      await until(`${mode} motion setting`, () => evaluate(mode => document.documentElement.dataset.bgMode === mode, mode));
+    }
+    if (backdrop === 'WebGL') assert(await stillBackdrop(), 'Static motion kept drawing');
+    await cdp.send('Page.reload');
+    await until('persisted display controls on discovery', () => evaluate(() =>
+      document.body.dataset.view === 'online' && document.getElementById('tv-mode-toggle')?.getAttribute('aria-pressed') === 'true' &&
+      document.documentElement.dataset.bgMode === 'static'));
+    await rendered('online');
+    await click('#tv-mode-toggle');
+    await click('#bg-mode-toggle');
+    await until('standard layout and motion', () => evaluate(size => document.documentElement.dataset.bgMode === 'standard' &&
+      parseFloat(getComputedStyle(document.documentElement).fontSize) === size, baseFont));
+    if (backdrop === 'WebGL') {
+      await cdp.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+      await until('reduced motion frame to settle', stillBackdrop);
+      await cdp.send('Emulation.setEmulatedMedia', { features: [] });
+      const previous = await evaluate(() => window.polyviewSmokeDraws);
+      await until('background animation to resume', () => evaluate(n => window.polyviewSmokeDraws > n, previous));
+    }
+    return backdrop;
+  }
+  async function checkLive(width) {
+    await click('#content button', '显示全部频道（含 1 个无节目单）');
+    await rendered('live');
+    const program = await evaluate(() => {
+      const button = document.querySelector('.epg-program.current');
+      return button && [button.parentElement.localName, button.getBoundingClientRect().width, button.getBoundingClientRect().height];
+    });
+    assert(program && program[0] === 'foreignObject' && program[1] > 0 && program[2] > 0, 'Current program has no timeline area');
+    await click('.guide-channel-play[aria-label="播放 Smoke News"]');
+    const playing = title => until(`${title} decoding`, () => evaluate(title => {
+      const video = document.getElementById('video-player');
+      return document.getElementById('player-title').textContent === title && video.videoWidth === 32 && video.videoHeight === 24 &&
+        video.readyState >= 2 && !video.paused && document.body.dataset.playing === '1' && document.getElementById('bg-canvas').hidden;
+    }, title));
+    await playing('Smoke News');
+    assert(await stillBackdrop(), 'Background continued drawing during live playback');
+    assert(await evaluate(width => {
+      const video = document.querySelector('#video-player').getBoundingClientRect();
+      const guide = document.querySelector('#player-guide');
+      const rect = guide.getBoundingClientRect();
+      return !guide.hidden && guide.textContent.includes('Local News Hour') && (width === 390 ? rect.top >= video.bottom - 1 : rect.left >= video.right - 1);
+    }, width), 'Guide did not align with the decoded video');
+    const source = await evaluate(() => document.querySelector('#video-player').currentSrc);
+    await press('ArrowRight', 'ArrowRight', 39);
+    await until('second news line', () => evaluate(source => document.querySelector('#player-source').textContent.includes('2/2') &&
+      document.querySelector('#video-player').currentSrc !== source, source));
+    await playing('Smoke News');
+    await press('ArrowLeft', 'ArrowLeft', 37);
+    await until('first news line', () => evaluate(source => document.querySelector('#video-player').currentSrc === source, source));
+    await press('m', 'KeyM', 77);
+    await until('all channels in drawer', () => evaluate(() => !document.querySelector('#player-channel-drawer').hidden &&
+      document.querySelectorAll('.player-channel-row').length === 2 && document.querySelector('.player-channel-row[aria-current] strong')?.textContent === 'Smoke News'));
+    await click('#player-channel-groups button', '★ 收藏');
+    await until('only the favorite station', () => evaluate(() => document.querySelectorAll('.player-channel-row').length === 1 &&
+      document.querySelector('.player-channel-row strong')?.textContent === 'Smoke News'));
+    await press('Escape', 'Escape', 27);
+    const direction = await evaluate(() => document.querySelector('#player-next').hidden ? 'ArrowUp' : 'ArrowDown');
+    await press(direction, direction, direction === 'ArrowUp' ? 38 : 40);
+    await playing('Smoke Culture');
+    await press('Enter', 'Enter', 13);
+    await until('drawer opened with Enter', () => evaluate(() => !document.querySelector('#player-channel-drawer').hidden));
+    await press('Escape', 'Escape', 27);
+    await click('#player-close');
+    await until('player dialog to close', () => evaluate(() => !document.querySelector('#player-dialog').open));
+    await until('background to resume after playback', () => evaluate(() => document.body.dataset.playing === '0' &&
+      (!document.querySelector('#bg-canvas').dataset.engine || !document.querySelector('#bg-canvas').hidden)));
+  }
+  async function checkQr() {
+    for (const mode of ['standard', 'base58']) {
+      if (mode === 'base58') await click('.tvbox-qr [data-mode="base58"]');
+      await until(`${mode} QR canvas`, () => evaluate(mode => document.querySelector(`.tvbox-qr [data-mode="${mode}"]`)?.getAttribute('aria-pressed') === 'true' &&
+        document.querySelector('.tvbox-qr canvas:not([hidden])')?.width > 0, mode));
+      const matches = await evaluate(async mode => {
+        const { qr, url } = await (await fetch(`/api/tvbox/qr?mode=${mode}`)).json();
+        const link = document.querySelectorAll('.tvbox-configs input')[mode === 'standard' ? 0 : 1];
+        const canvas = document.querySelector('.tvbox-qr canvas');
+        const scale = canvas.width / (qr.length + 8);
+        if (!Number.isInteger(scale) || scale < 1 || link.value !== url || canvas.width !== canvas.height) return false;
+        const rgba = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+        for (let y = 0; y < qr.length + 8; y++) for (let x = 0; x < qr.length + 8; x++) {
+          const offset = 4 * ((y * scale + Math.floor(scale / 2)) * canvas.width + x * scale + Math.floor(scale / 2));
+          if (rgba[offset] !== (qr[y - 4]?.[x - 4] === '1' ? 0 : 255) || rgba[offset + 3] !== 255) return false;
+        }
+        return true;
+      }, mode);
+      assert(matches, `${mode} QR pixels differ from the active subscription matrix or its quiet zone`);
+    }
+  }
   try {
     for (const [width, height] of [[1440, 900], [390, 844]]) {
       await cdp.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: width === 390 });
@@ -281,12 +412,20 @@ async function exercise(cdp, { baseUrl, username, password }) {
       await rendered('online');
       const pages = await evaluate((selector) => Array.from(document.querySelectorAll(selector), (el) => el.dataset.view), sidebar);
       assert.deepEqual([...pages].sort(), Object.keys(pageChecks).sort(), `${step}: sidebar inventory`);
+      assert.deepEqual(await evaluate(() => [...document.querySelectorAll('.nav-scroll .nav-label')].map(el => el.textContent)), ['探索与观看', '我的片库', '系统']);
+      const mobile = await evaluate(() => [...document.querySelectorAll('.mobile-tabs button')].filter(el => el.getClientRects().length).map(el => el.textContent.trim()));
+      assert.deepEqual(mobile, width === 390 ? ['发现', '直播', '媒体', '网盘', '更多'] : []);
+      const backdrop = await checkDisplay(width, height);
       for (const page of pages) {
         step = `${width}×${height} ${page}`;
-        if (width === 390) await click('#nav-toggle');
-        await click(`${sidebar}[data-view="${page}"]`);
+        if (width === 390 && ['online', 'live', 'library', 'cloud'].includes(page)) await click(`.mobile-tab[data-view="${page}"]`);
+        else {
+          if (width === 390) await click('#mobile-more');
+          await click(`${sidebar}[data-view="${page}"]`);
+        }
         await rendered(page);
         await checkThemes(width, height);
+        if (page === 'live') await checkLive(width);
         if (page !== 'settings') continue;
         const tabs = await evaluate((selector) => Array.from(document.querySelectorAll(selector), (el) => el.textContent.trim()), settingsTabs);
         assert.deepEqual([...tabs].sort(), Object.keys(tabChecks).sort(), `${step}: admin tab inventory`);
@@ -295,9 +434,10 @@ async function exercise(cdp, { baseUrl, username, password }) {
           await click(settingsTabs, tab);
           await rendered(page, tab);
           await checkThemes(width, height);
+          if (tab === '影视仓订阅') await checkQr();
         }
       }
-      console.log(`Browser ${width}×${height}: ${pages.length} pages, ${Object.keys(tabChecks).length} admin tabs, both themes`);
+      console.log(`Browser ${width}×${height}: ${pages.length} pages, ${Object.keys(tabChecks).length} admin tabs, both themes, ${backdrop}, TV persistence, decoded live switching and both QR canvases`);
     }
     await settle();
   } catch (error) {

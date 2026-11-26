@@ -199,6 +199,138 @@ async fn refresh_replaces_line_settings_without_duplicating_or_resetting_healthy
     assert_eq!(list[0]["sources"].as_array().unwrap().len(), 3);
 }
 
+async fn merge_setting(app: &TestApp, admin: &str, enabled: bool) {
+    let value = json!({"live_merge_similar": enabled});
+    let reply = app
+        .request(
+            "PUT",
+            "/api/settings/live",
+            Some(admin),
+            Some(value.clone()),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json(), value);
+}
+
+#[tokio::test]
+async fn enabled_import_merges_mixed_formats_and_subscription_refresh_idempotently() {
+    let app = TestApp::new();
+    let admin = app.setup().await;
+    assert_eq!(
+        app.request("GET", "/api/settings/live", Some(&admin), None)
+            .await
+            .json(),
+        json!({"live_merge_similar":false})
+    );
+    merge_setting(&app, &admin, true).await;
+    let playlist = "#EXTM3U\n#EXTINF:-1 tvg-id=\"national.1\" group-title=\"国家\" catchup=\"append\" catchup-source=\"?replay={utc}\",CCTV-1高清\nhttps://one.invalid/live|Cookie=one\n全国,#genre#\nCCTV1 4K,https://two.invalid/live|User-Agent=two\nCCTV1综合,https://three.invalid/live\nCCTV5体育,https://five.invalid/live\nCCTV5+体育赛事,https://plus.invalid/live\nCCTV10科教,https://ten.invalid/live";
+    for expected in [4, 0] {
+        assert_eq!(
+            import(&app, &admin, playlist).await.json(),
+            json!({"imported":6,"new_channels":expected})
+        );
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/list", listener.local_addr().unwrap());
+    let router = Router::new().route(
+        "/list",
+        get(|| async { "全国,#genre#\n央視綜合,https://four.invalid/live" }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    assert_eq!(
+        app.request(
+            "POST",
+            "/api/live-sources",
+            Some(&admin),
+            Some(json!({"name":"Subscribed", "url":url}))
+        )
+        .await
+        .status,
+        StatusCode::CREATED
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            app.request("POST", "/api/live-sources/refresh", Some(&admin), None)
+                .await
+                .json()["refreshed"],
+            1
+        );
+    }
+    server.abort();
+    {
+        let conn = app.state.conn().unwrap();
+        let (stations, lines, primary, alternate): (i64, i64, bool, bool) = conn.query_row(
+            "SELECT (SELECT count(*) FROM channels),count(*),
+             max(s.url='https://one.invalid/live' AND json_extract(s.headers_json,'$.Cookie')='one'
+                 AND s.catchup_mode='append' AND s.catchup_source='?replay={utc}'),
+             max(s.url='https://two.invalid/live' AND json_extract(s.headers_json,'$.\"User-Agent\"')='two')
+             FROM channel_sources s JOIN channels c ON c.id=s.channel_id WHERE c.tvg_id='national.1'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!((stations, lines, primary, alternate), (4, 4, true, true));
+    }
+    merge_setting(&app, &admin, false).await;
+    assert_eq!(
+        import(&app, &admin, "CCTV1 HD,https://extra.invalid/live")
+            .await
+            .json()["new_channels"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn reimport_retains_favorites_guide_and_incompatible_line_owners() {
+    let app = TestApp::new();
+    let admin = app.setup().await;
+    let user = app.create_viewer(&admin).await;
+    // The default groups these four spellings independently.
+    let src = "CCTV1,https://one.invalid/a\nCCTV1高清,https://one.invalid/b\nCCTV5,https://five.invalid/a\nCCTV5体育,https://five.invalid/b";
+    assert_eq!(import(&app, &admin, src).await.json()["new_channels"], 4);
+    {
+        let conn = app.state.conn().unwrap();
+        conn.execute(
+            "INSERT INTO channel_favorites SELECT ?,id,123 FROM channels WHERE name='CCTV1高清'",
+            [user],
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO epg_programs SELECT id,123,234,'Evening','' FROM channels WHERE name='CCTV1高清';
+            UPDATE channel_sources SET latency_ms=42,last_ok_at=99 WHERE url='https://one.invalid/b';
+            INSERT INTO channel_sources(channel_id,url,headers_json,catchup_source,position)
+            SELECT id,'https://shared.invalid/live',json_object('Cookie',name),'?owner='||name,1 FROM channels WHERE name LIKE 'CCTV5%';").unwrap();
+    }
+    merge_setting(&app, &admin, true).await;
+    for _ in 0..2 {
+        assert_eq!(import(&app, &admin, src).await.json()["new_channels"], 0);
+    }
+    let conn = app.state.conn().unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM channels", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
+    let preserved: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM channels c JOIN channel_sources s ON s.channel_id=c.id
+        JOIN channel_favorites f ON f.channel_id=c.id JOIN epg_programs p ON p.channel_id=c.id
+        WHERE c.name='CCTV1' AND f.user_id=? AND p.title='Evening' AND f.created_at=123
+        AND s.url='https://one.invalid/b' AND s.latency_ms=42 AND s.last_ok_at=99",
+            [user],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(preserved, 1);
+    let owned: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM channel_sources s JOIN channels c ON c.id=s.channel_id
+        WHERE s.url='https://shared.invalid/live' AND json_extract(s.headers_json,'$.Cookie')=c.name
+        AND s.catchup_source='?owner='||c.name",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owned, 2);
+}
+
 #[tokio::test]
 async fn invalid_headers_or_urls_reject_the_entire_import_without_exposing_input() {
     let app = TestApp::new();

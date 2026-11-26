@@ -269,6 +269,9 @@ pub(crate) fn merge_playlist(
     tx: &Connection,
     channels: &[PlaylistChannel],
 ) -> Result<MergeCounts, AppError> {
+    if crate::settings::get_setting_json(tx, crate::settings::MERGE_SIMILAR_KEY)? {
+        return merge_similar_playlist(tx, channels);
+    }
     let mut groups: BTreeMap<(&str, &str), Vec<&PlaylistChannel>> = BTreeMap::new();
     for channel in channels {
         groups
@@ -282,11 +285,6 @@ pub(crate) fn merge_playlist(
     };
     for ((name, group_name), entries) in groups {
         let first = entries[0];
-        let logo = entries.iter().find(|e| !e.logo.is_empty()).map(|e| &e.logo);
-        let tvg_id = entries
-            .iter()
-            .find(|e| !e.tvg_id.is_empty())
-            .map(|e| &e.tvg_id);
         let mut id = tx
             .query_row(
                 "SELECT id FROM channels WHERE name=?1 AND group_name=?2 ORDER BY id LIMIT 1",
@@ -309,50 +307,239 @@ pub(crate) fn merge_playlist(
                 }
             }
         }
-        let id = if let Some(id) = id {
-            tx.execute(
-                "UPDATE channels SET name=?1,group_name=?2,logo=COALESCE(?3,logo),
-                 tvg_id=COALESCE(?4,tvg_id) WHERE id=?5",
-                params![name, group_name, logo, tvg_id, id],
-            )?;
-            id
-        } else {
-            tx.execute(
-                "INSERT INTO channels(name,group_name,logo,tvg_id,url)
-                 VALUES (?1,?2,COALESCE(?3,''),COALESCE(?4,''),?5)",
-                params![name, group_name, logo, tvg_id, first.url],
-            )?;
-            counts.added += 1;
-            tx.last_insert_rowid()
+        save_channel(tx, id, &entries, &first.url, false)?;
+        counts.added += usize::from(id.is_none());
+    }
+    Ok(counts)
+}
+
+// Unknown local stations can share a generic name (e.g. 新闻综合) across regions.
+// Only known public stations have an identity independent of the playlist group.
+fn similar_key(name: &str, group: &str) -> String {
+    let mut key = crate::epg::canonical(name);
+    if !crate::epg::public_channel_key(&key) {
+        if key.is_empty() {
+            key.push_str(name);
+        }
+        key.push('\0');
+        key.push_str(group);
+    }
+    key
+}
+
+#[derive(Default)]
+struct VariantGroup<'a> {
+    entries: Vec<&'a PlaylistChannel>,
+    ids: Vec<i64>,
+}
+
+fn merge_similar_playlist(
+    tx: &Connection,
+    channels: &[PlaylistChannel],
+) -> Result<MergeCounts, AppError> {
+    let mut groups = BTreeMap::<String, VariantGroup>::new();
+    for line in channels {
+        groups
+            .entry(similar_key(&line.name, &line.group_name))
+            .or_default()
+            .entries
+            .push(line);
+    }
+    {
+        let mut query = tx.prepare("SELECT id,name,group_name FROM channels ORDER BY id")?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            let name = row
+                .get_ref(1)?
+                .as_str()
+                .map_err(|_| AppError::internal("Invalid stored live channel name"))?;
+            let group = row
+                .get_ref(2)?
+                .as_str()
+                .map_err(|_| AppError::internal("Invalid stored live channel group"))?;
+            if let Some(variants) = groups.get_mut(&similar_key(name, group)) {
+                variants.ids.push(row.get(0)?);
+            }
+        }
+    }
+    let mut counts = MergeCounts {
+        channels: 0,
+        added: 0,
+    };
+    for VariantGroup { entries, ids } in groups.into_values() {
+        let Some((&first, others)) = ids.split_first() else {
+            // A shared alternate can belong to multiple channels, but a legacy
+            // primary URL is unique. Never rename its unrelated existing owner.
+            let mut taken = tx.prepare_cached("SELECT id FROM channels WHERE url=?")?;
+            let mut primary = None;
+            let mut owners = BTreeMap::<i64, Vec<&PlaylistChannel>>::new();
+            for line in &entries {
+                if let Some(id) = taken.query_row([&line.url], |r| r.get(0)).optional()? {
+                    owners.entry(id).or_default().push(line);
+                } else {
+                    primary = Some(&line.url);
+                    break;
+                }
+            }
+            if let Some(url) = primary {
+                save_channel(tx, None, &entries, url, true)?;
+                counts.added += 1;
+                counts.channels += 1;
+            } else {
+                // A feed renamed an existing primary URL. Updating its own line
+                // retains the established channel identity and favorites.
+                counts.channels += owners.len();
+                for (id, lines) in owners {
+                    save_channel(tx, Some(id), &lines, &lines[0].url, true)?;
+                }
+            }
+            continue;
         };
-        let next_position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position),-1)+1 FROM channel_sources WHERE channel_id=?1",
-            [id],
-            |row| row.get(0),
+        let mut owners = vec![first];
+        for &other in others {
+            if !combine_channels(tx, first, other)? {
+                owners.push(other);
+            }
+        }
+        if owners.len() == 1 {
+            save_channel(tx, Some(first), &entries, &entries[0].url, true)?;
+            counts.channels += 1;
+            continue;
+        }
+        // Historic channels with incompatible versions of the same URL retain
+        // their own lines. Prefer the named owner, then the exact line identity.
+        let mut by_owner: BTreeMap<i64, Vec<&PlaylistChannel>> = BTreeMap::new();
+        let mut score = tx.prepare_cached(
+            "SELECT (c.name=?2 AND c.group_name=?3)*4 + (s.id IS NOT NULL) +
+             COALESCE((s.headers_json=?5 AND s.catchup_mode=?6 AND s.catchup_source=?7)*2,0)
+             FROM channels c LEFT JOIN channel_sources s ON s.channel_id=c.id AND s.url=?4 WHERE c.id=?1",
         )?;
-        let mut upsert = tx.prepare_cached(
-            "INSERT INTO channel_sources(channel_id,url,position,headers_json,catchup_mode,catchup_source)
-             VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(channel_id,url) DO UPDATE SET
-             latency_ms=CASE WHEN headers_json=excluded.headers_json THEN latency_ms END,
-             last_ok_at=CASE WHEN headers_json=excluded.headers_json THEN last_ok_at END,
-             fail_count=CASE WHEN headers_json=excluded.headers_json THEN fail_count ELSE 0 END,
-             headers_json=excluded.headers_json,catchup_mode=excluded.catchup_mode,
-             catchup_source=excluded.catchup_source
-             WHERE headers_json!=excluded.headers_json OR catchup_mode!=excluded.catchup_mode
-                OR catchup_source!=excluded.catchup_source",
-        )?;
-        for (offset, entry) in entries.into_iter().enumerate() {
-            upsert.execute(params![
-                id,
-                entry.url,
-                next_position + offset as i64,
-                entry.headers_json,
-                entry.catchup_mode,
-                entry.catchup_source
-            ])?;
+        for entry in entries {
+            let mut best = (first, -1);
+            for &owner in &owners {
+                let rank: i64 = score.query_row(
+                    params![
+                        owner,
+                        entry.name,
+                        entry.group_name,
+                        entry.url,
+                        entry.headers_json,
+                        entry.catchup_mode,
+                        entry.catchup_source
+                    ],
+                    |r| r.get(0),
+                )?;
+                if rank > best.1 {
+                    best = (owner, rank);
+                }
+            }
+            by_owner.entry(best.0).or_default().push(entry);
+        }
+        counts.channels += by_owner.len();
+        for (owner, lines) in by_owner {
+            save_channel(tx, Some(owner), &lines, &lines[0].url, true)?;
         }
     }
     Ok(counts)
+}
+
+fn combine_channels(tx: &Connection, keep: i64, other: i64) -> Result<bool, AppError> {
+    // SQL-only legacy channels can lack their initial line until startup.
+    tx.execute(
+        "INSERT INTO channel_sources(channel_id,url) SELECT id,url FROM channels c
+         WHERE id IN (?1,?2) AND NOT EXISTS (SELECT 1 FROM channel_sources WHERE channel_id=c.id)",
+        params![keep, other],
+    )?;
+    let conflict: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM channel_sources a JOIN channel_sources b ON a.url=b.url
+         WHERE a.channel_id=?1 AND b.channel_id=?2 AND (a.headers_json!=b.headers_json OR
+         a.catchup_mode!=b.catchup_mode OR a.catchup_source!=b.catchup_source OR a.label!=b.label OR
+         a.latency_ms IS NOT b.latency_ms OR a.last_ok_at IS NOT b.last_ok_at OR a.fail_count!=b.fail_count))
+         OR EXISTS(SELECT 1 FROM epg_programs a JOIN epg_programs b ON a.start=b.start AND a.title=b.title
+         WHERE a.channel_id=?1 AND b.channel_id=?2 AND (a.stop!=b.stop OR a.description!=b.description))",
+        params![keep, other], |r| r.get(0),
+    )?;
+    if conflict {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE OR IGNORE channel_sources SET channel_id=?1,
+         position=position+(SELECT COALESCE(MAX(position),-1)+1 FROM channel_sources WHERE channel_id=?1)
+         WHERE channel_id=?2", params![keep, other],
+    )?;
+    tx.execute(
+        "UPDATE OR IGNORE channel_favorites SET channel_id=?1 WHERE channel_id=?2",
+        params![keep, other],
+    )?;
+    tx.execute(
+        "UPDATE OR IGNORE epg_programs SET channel_id=?1 WHERE channel_id=?2",
+        params![keep, other],
+    )?;
+    tx.execute(
+        "UPDATE channels AS a SET logo=COALESCE(NULLIF(a.logo,''),b.logo),
+         tvg_id=COALESCE(NULLIF(a.tvg_id,''),b.tvg_id) FROM channels b WHERE a.id=?1 AND b.id=?2",
+        params![keep, other],
+    )?;
+    tx.execute("DELETE FROM channels WHERE id=?", [other])?;
+    Ok(true)
+}
+
+fn save_channel(
+    tx: &Connection,
+    id: Option<i64>,
+    entries: &[&PlaylistChannel],
+    primary_url: &str,
+    preserve_identity: bool,
+) -> Result<(), AppError> {
+    let first = entries[0];
+    let logo = entries.iter().find(|e| !e.logo.is_empty()).map(|e| &e.logo);
+    let tvg_id = entries
+        .iter()
+        .find(|e| !e.tvg_id.is_empty())
+        .map(|e| &e.tvg_id);
+    let id = if let Some(id) = id {
+        tx.execute(
+            "UPDATE channels SET name=CASE WHEN ?6 THEN name ELSE ?1 END,
+             group_name=CASE WHEN ?6 THEN group_name ELSE ?2 END,
+             logo=CASE WHEN ?6 AND logo!='' THEN logo ELSE COALESCE(?3,logo) END,
+             tvg_id=CASE WHEN ?6 AND tvg_id!='' THEN tvg_id ELSE COALESCE(?4,tvg_id) END WHERE id=?5",
+            params![first.name, first.group_name, logo, tvg_id, id, preserve_identity],
+        )?;
+        id
+    } else {
+        tx.execute(
+            "INSERT INTO channels(name,group_name,logo,tvg_id,url) VALUES (?1,?2,COALESCE(?3,''),COALESCE(?4,''),?5)",
+            params![first.name, first.group_name, logo, tvg_id, primary_url],
+        )?;
+        tx.last_insert_rowid()
+    };
+    let next_position: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(position),-1)+1 FROM channel_sources WHERE channel_id=?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    let mut upsert = tx.prepare_cached(
+        "INSERT INTO channel_sources(channel_id,url,position,headers_json,catchup_mode,catchup_source)
+         VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(channel_id,url) DO UPDATE SET
+         latency_ms=CASE WHEN headers_json=excluded.headers_json THEN latency_ms END,
+         last_ok_at=CASE WHEN headers_json=excluded.headers_json THEN last_ok_at END,
+         fail_count=CASE WHEN headers_json=excluded.headers_json THEN fail_count ELSE 0 END,
+         headers_json=excluded.headers_json,catchup_mode=excluded.catchup_mode,
+         catchup_source=excluded.catchup_source
+         WHERE headers_json!=excluded.headers_json OR catchup_mode!=excluded.catchup_mode
+            OR catchup_source!=excluded.catchup_source",
+    )?;
+    for (offset, entry) in entries.iter().enumerate() {
+        upsert.execute(params![
+            id,
+            entry.url,
+            next_position + offset as i64,
+            entry.headers_json,
+            entry.catchup_mode,
+            entry.catchup_source
+        ])?;
+    }
+    Ok(())
 }
 
 async fn delete_channel(

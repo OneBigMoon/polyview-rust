@@ -58,6 +58,10 @@ export function registerCloudPageTests({ environment, pageNodes, pageButton }) {
     filter.value = "quark";
     filter.dispatchEvent("change");
     assert.doesNotMatch(root.textContent, /山海 · 高清/);
+    await click(filter, "百度");
+    assert.equal(pageButton(filter, "百度").getAttribute("aria-pressed"), "true");
+    assert.match(root.textContent, /山海 · 高清/);
+    await click(filter, "夸克");
     assert.match(root.textContent, /电影频道 · 提取码 1234/);
     await click(root, "校验与转存");
     const dialog = find(root, (node) => node.tagName === "DIALOG");
@@ -66,6 +70,9 @@ export function registerCloudPageTests({ environment, pageNodes, pageButton }) {
     assert.doesNotMatch(dialog.textContent, /STRM/);
     await click(dialog, "科幻");
     assert.match(dialog.textContent, /默认目录（8） \/ 科幻/);
+    await click(dialog, "默认目录（8）");
+    assert.ok(calls.at(-1).path.endsWith("dir=8"));
+    await click(dialog, "科幻");
     await click(dialog, "上一级");
     await click(dialog, "科幻");
     await click(dialog, "确认转存");

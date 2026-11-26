@@ -54,6 +54,7 @@ fn sample(backup: &mut Value) {
     downloads["concurrency"] = json!(3);
     backup["app_settings"] = json!({
         "adult_sources_enabled":true,"epg_aliases":[{"from":"News HD","to":"News"}],
+        "live_merge_similar":true,
         "downloads":downloads,
         "telegram_native":{"api_id":1234,"api_hash":"0123456789abcdef0123456789abcdef"},
         "calendar":{"enabled":false,"api_url":"https://calendar.invalid/feed"},
@@ -678,12 +679,17 @@ async fn live_backup_keeps_line_owners_favorites_and_destination_health() {
 
     // Before M9 the backup had no live channel section. Restoring it can still change aliases.
     backup.as_object_mut().unwrap().remove("live_channels");
+    backup["app_settings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("live_merge_similar");
     backup["app_settings"]["epg_aliases"] = json!([{"from":"Old TV","to":"News HD"}]);
     assert_eq!(
         restore(&target, &admin, backup.clone()).await.status,
         StatusCode::OK
     );
     let legacy = export(&target, &admin).await;
+    assert_eq!(legacy["app_settings"]["live_merge_similar"], true);
     assert_eq!(
         legacy["app_settings"]["epg_aliases"],
         backup["app_settings"]["epg_aliases"]

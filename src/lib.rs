@@ -258,7 +258,17 @@ async fn media_settings_script() -> impl IntoResponse {
 async fn styles() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../web/style.css"),
+        concat!(
+            include_str!("../web/style.css"),
+            "\n",
+            include_str!("../web/settings-layout.css"),
+            "\n",
+            include_str!("../web/cinema.css"),
+            "\n",
+            include_str!("../web/tvbox-qr.css"),
+            "\n",
+            include_str!("../web/live-theater.css"),
+        ),
     )
 }
 async fn hls_script() -> impl IntoResponse {

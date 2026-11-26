@@ -120,7 +120,9 @@ For episodes, use names such as `三体.S01E02.mp4`, or put videos under `三体
 Import a UTF-8 M3U playlist or a grouped TXT list (`Group,#genre#`). Separate alternative stream URLs with `#`. Each line can carry VLC options, pipe-delimited HTTP headers and a catch-up template. Administrators can probe one group or all groups, see first-byte latency and remove lines after three consecutive failures. The guide retains seven days of history. Click a past program marked **回看** to play its original time window. Web and TVBox clients receive scoped relay URLs for protected streams and artwork.
 The all-channels toggle includes channels without XMLTV data. Group chips filter the guide, and the time controls move along the programme grid. Configure XMLTV feeds and channel-name aliases under **直播与节目单**.
 When channels exist, the server checks the XMLTV cache 30 seconds after startup and then every six hours. A failed refresh leaves the previous guide available.
-The live player uses compact controls without a playback timeline and shows the channel's current and upcoming programmes on the right; the fullscreen button fills the screen with both the stream and the programme list.
+During live playback, press **M** to open the channel drawer. With the drawer closed and the video stage focused, **↑ / ↓** change channel and **← / →** switch stream lines. The guide shows the current and upcoming programmes beside the video on wide screens and below it on portrait phones. The controls fade after three idle seconds in fullscreen.
+
+The top-bar **TV 大屏模式** button enlarges text, posters and keyboard focus rings. The adjacent background control cycles through standard, soft and static motion. The browser remembers both preferences. Video playback pauses the background, and the system’s reduced-motion preference displays a still frame.
 
 PolyView serves original local media without transcoding. MP4 with H.264/AAC and supported WebM codecs work in common browsers; MKV, AVI, and other codecs depend on the browser or TV client.
 
@@ -136,7 +138,7 @@ On the tracking page, set quality and include/exclude terms before enabling auto
 
 ## TVBox / 影视仓 feed
 
-Open the TV feed section while signed in, copy the configuration URL, and enter it in the TV client's configuration/subscription field. The configuration contains a local-library site, a site for each enabled online source, and the live-channel playlist. Local series are grouped into episode lists, and local video endpoints support Range and HEAD requests. Online play lines whose episodes are direct media URLs are listed before share/parser pages, so the client's default line is the one PolyView can actually play.
+Open **账户与设置 → 影视仓订阅** while signed in. Choose standard or Base58 and scan the QR code with the TV client, or paste the matching URL into its subscription field. PolyView generates the code locally for the signed-in member. The configuration contains a local-library site, a site for each enabled online source, and the live-channel playlist. Local series are grouped into episode lists, and local video endpoints support Range and HEAD requests. Online play lines whose episodes are direct media URLs are listed before share/parser pages, so the client's default line is the one PolyView can actually play.
 
 The link grants access to the shared catalogs, media, and channels without a browser login. Keep it private. Rotating the token revokes previous configuration, catalog, and media links; removing the account also revokes its token. After rotation, update the TV client's subscription URL. Existing original-service URLs are not automatically redirected to the new service.
 
@@ -145,6 +147,8 @@ The server-side feed and token playback are integration-tested. Actual 影视仓
 ## Live subscriptions, accounts and configuration backups
 
 Administrators can subscribe to remote M3U playlists under **直播与节目单**, refresh enabled subscriptions immediately or let the server refresh them every twelve hours. Each source shows its imported channel count or last error. Channel aliases map an imported name to its XMLTV equivalent. In the guide, use the all-channels toggle for channels without programme data. The live player can collapse the guide, change channel, race its available sources and request a stream from 5, 15 or 30 minutes ago when the upstream supports the start parameter.
+
+The guide recognizes 131 public channel aliases. Administrators can enable `live_merge_similar` under **直播与节目单** to group variants such as `CCTV-1高清` and `CCTV1 4K` as alternate lines on the next playlist import or refresh. The setting defaults to off and is included in configuration backups.
 
 The TVBox settings supply both a standard configuration URL and a Bitcoin Base58-encoded configuration URL for older clients. Both contain the private feed token. Under **家庭成员**, an administrator can change another member’s role, disable the account or reset its password. Disabling revokes browser sessions and blocks the TV feed. Role and disable controls protect the current account and the last active administrator.
 

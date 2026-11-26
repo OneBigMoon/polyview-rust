@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use qrcodegen::{QrCode, QrCodeEcc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,6 +29,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
 pub fn router() -> Router<Shared> {
     Router::new()
         .route("/api/tvbox", get(account_feed))
+        .route("/api/tvbox/qr", get(account_qr))
         .route("/api/tvbox/token", post(rotate_token))
         .route("/tvbox/{token}/config.json", get(config))
         .route("/tvbox/{token}/vod", get(catalog))
@@ -53,31 +55,89 @@ fn new_token() -> String {
     )
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum QrMode {
+    Standard,
+    Base58,
+}
+
+fn config_path(token: &str, mode: QrMode) -> String {
+    let query = match mode {
+        QrMode::Standard => "",
+        QrMode::Base58 => "?encode=base58",
+    };
+    format!("/tvbox/{token}/config.json{query}")
+}
+
 fn feed_paths(token: &str) -> Value {
     json!({
         "token": token,
-        "config_path": format!("/tvbox/{token}/config.json"),
-        "config_b58_path": format!("/tvbox/{token}/config.json?encode=base58"),
+        "config_path": config_path(token, QrMode::Standard),
+        "config_b58_path": config_path(token, QrMode::Base58),
         "catalog_path": format!("/tvbox/{token}/vod"),
         "live_path": format!("/tvbox/{token}/live.m3u"),
     })
+}
+
+fn account_token(state: &Shared, user_id: i64) -> Result<String, AppError> {
+    let conn = state.conn()?;
+    if let Some(token) = conn
+        .query_row(
+            "SELECT token FROM tvbox_tokens WHERE user_id=?1",
+            [user_id],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        return Ok(token);
+    }
+    Ok(conn.query_row(
+        "INSERT INTO tvbox_tokens(user_id,token) VALUES(?1,?2)
+         ON CONFLICT(user_id) DO UPDATE SET user_id=excluded.user_id RETURNING token",
+        params![user_id, new_token()],
+        |row| row.get(0),
+    )?)
 }
 
 async fn account_feed(
     State(state): State<Shared>,
     user: AuthUser,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state.conn()?;
-    conn.execute(
-        "INSERT INTO tvbox_tokens(user_id,token) VALUES(?1,?2) ON CONFLICT(user_id) DO NOTHING",
-        params![user.id, new_token()],
-    )?;
-    let token: String = conn.query_row(
-        "SELECT token FROM tvbox_tokens WHERE user_id=?1",
-        [user.id],
-        |row| row.get(0),
-    )?;
-    Ok(Json(feed_paths(&token)))
+    Ok(Json(feed_paths(&account_token(&state, user.id)?)))
+}
+
+#[derive(Deserialize)]
+struct QrQuery {
+    mode: QrMode,
+}
+
+#[derive(Serialize)]
+struct FeedQr {
+    url: String,
+    qr: Vec<String>,
+}
+
+async fn account_qr(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Query(query): Query<QrQuery>,
+    headers: HeaderMap,
+) -> Result<Json<FeedQr>, AppError> {
+    let base = origin(&state, &headers)?;
+    let token = account_token(&state, user.id)?;
+    let url = format!("{base}{}", config_path(&token, query.mode));
+    let code = QrCode::encode_text(&url, QrCodeEcc::Medium)
+        .map_err(|_| AppError::bad_request("Configuration URL is too long for a QR code"))?;
+    let size = code.size();
+    let qr = (0..size)
+        .map(|y| {
+            (0..size)
+                .map(|x| if code.get_module(x, y) { '1' } else { '0' })
+                .collect()
+        })
+        .collect();
+    Ok(Json(FeedQr { url, qr }))
 }
 
 async fn rotate_token(
