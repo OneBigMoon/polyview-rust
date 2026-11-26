@@ -73,7 +73,7 @@ pub(crate) struct Channel {
 }
 
 #[derive(Debug)]
-struct PlaylistChannel {
+pub(crate) struct PlaylistChannel {
     name: String,
     group_name: String,
     logo: String,
@@ -148,14 +148,33 @@ async fn import_channels(
     let channels = parse_playlist(&input.playlist)?;
     let mut conn = state.conn()?;
     let tx = conn.transaction()?;
-    let mut groups: BTreeMap<(String, String), Vec<&PlaylistChannel>> = BTreeMap::new();
-    for channel in &channels {
+    let counts = merge_playlist(&tx, &channels)?;
+    tx.commit()?;
+    Ok(Json(
+        json!({"imported": channels.len(), "new_channels": counts.added}),
+    ))
+}
+
+pub(crate) struct MergeCounts {
+    pub channels: usize,
+    pub added: usize,
+}
+
+pub(crate) fn merge_playlist(
+    tx: &Connection,
+    channels: &[PlaylistChannel],
+) -> Result<MergeCounts, AppError> {
+    let mut groups: BTreeMap<(&str, &str), Vec<&PlaylistChannel>> = BTreeMap::new();
+    for channel in channels {
         groups
-            .entry((channel.name.clone(), channel.group_name.clone()))
+            .entry((&channel.name, &channel.group_name))
             .or_default()
             .push(channel);
     }
-    let mut new_channels = 0;
+    let mut counts = MergeCounts {
+        channels: groups.len(),
+        added: 0,
+    };
     for ((name, group_name), entries) in groups {
         let first = entries[0];
         let mut id = tx
@@ -200,7 +219,7 @@ async fn import_channels(
                 "INSERT INTO channels(name,group_name,logo,url) VALUES (?1,?2,?3,?4)",
                 params![name, group_name, first.logo, first.url],
             )?;
-            new_channels += 1;
+            counts.added += 1;
             tx.last_insert_rowid()
         };
         let mut position: i64 = tx.query_row(
@@ -218,10 +237,7 @@ async fn import_channels(
             }
         }
     }
-    tx.commit()?;
-    Ok(Json(
-        json!({"imported": channels.len(), "new_channels": new_channels}),
-    ))
+    Ok(counts)
 }
 
 async fn delete_channel(
@@ -240,7 +256,7 @@ async fn delete_channel(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn http_url(raw: &str) -> Result<Url, AppError> {
+pub(crate) fn http_url(raw: &str) -> Result<Url, AppError> {
     let parsed =
         Url::parse(raw).map_err(|_| AppError::bad_request("Enter a valid HTTP or HTTPS URL"))?;
     if !matches!(parsed.scheme(), "http" | "https")
@@ -267,7 +283,7 @@ fn attribute(info: &str, key: &str) -> String {
     String::new()
 }
 
-fn parse_playlist(text: &str) -> Result<Vec<PlaylistChannel>, AppError> {
+pub(crate) fn parse_playlist(text: &str) -> Result<Vec<PlaylistChannel>, AppError> {
     let mut channels = Vec::new();
     let mut pending: Option<(String, String, String)> = None;
     let mut saw_header = false;

@@ -1409,6 +1409,28 @@ textarea {
   flex-direction: column;
   gap: 16px;
 }
+.tvbox-configs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+  gap: 0 18px;
+}
+.tvbox-configs .feed-row label {
+  min-width: min(160px, 100%);
+}
+.backup-import,
+.resource-links .stack {
+  margin-top: 16px;
+}
+.resource-links summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.member-settings-row {
+  flex-wrap: wrap;
+}
+.member-settings-row select {
+  width: auto;
+}
 .user-list {
   display: flex;
   flex-direction: column;
@@ -2077,6 +2099,11 @@ textarea {
   grid-template-columns: minmax(0, 1fr) 300px;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 18px;
+}
+#player-timeshift {
+  grid-column: 1 / -1;
+  align-items: center;
+  margin: 0;
 }
 .player-dialog.live-mode .dialog-top {
   grid-column: 1 / -1;

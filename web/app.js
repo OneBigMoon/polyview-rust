@@ -637,6 +637,59 @@
       .filter(Boolean);
     return sources.length ? sources : item.url ? [item.url] : [];
   }
+  function liveUrl(player, index) {
+    const source = player.sources[index];
+    if (!player.shiftSeconds || !source) return source;
+    const url = new URL(source);
+    url.searchParams.set("start", String(-player.shiftSeconds));
+    return url.href;
+  }
+  function paintTimeshift(player) {
+    const bar = $("player-timeshift");
+    bar.replaceChildren(...[0, 5, 15, 30].map((minutes) => {
+      const active = player.shiftSeconds === minutes * 60;
+      return button(minutes ? `-${minutes}分` : "直播", `filter-chip${active ? " active" : ""}`, () => {
+        if (active || state.player !== player) return;
+        player.shiftSeconds = minutes * 60;
+        player.failed.clear();
+        paintTimeshift(player);
+        attachPlayerSource();
+      }, { "aria-pressed": String(active) });
+    }), make("span", { class: "hint", text: "时移回看依赖上游支持" }));
+  }
+  async function probeLiveSources() {
+    const player = state.player;
+    if (!player?.live || player.sources.length < 2 || player.probing) return;
+    const attempt = player.attempt;
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = controller && setTimeout(() => controller.abort(), 10000);
+    player.probing = true;
+    const control = $("player-best-source");
+    control.disabled = true;
+    try {
+      const index = await Promise.any(player.sources.map(async (_, i) => {
+        const url = `/api/playback?url=${encodeURIComponent(liveUrl(player, i))}`;
+        const response = await fetch(url, { method: "GET", cache: "no-store", signal: controller?.signal });
+        response.body?.cancel().catch(() => {});
+        if (!response.ok) throw new Error();
+        return i;
+      }));
+      if (state.player !== player || player.attempt !== attempt) return;
+      player.failed.clear();
+      if (player.sourceIndex !== index) {
+        player.sourceIndex = index;
+        attachPlayerSource();
+      }
+      toast(`已选择线路 ${index + 1}`);
+    } catch (_) {
+      if (state.player === player && player.attempt === attempt) toast("没有可用线路", true);
+    } finally {
+      clearTimeout(timer);
+      controller?.abort();
+      player.probing = false;
+      if (state.player === player) control.disabled = false;
+    }
+  }
   function updateSourceButton() {
     const player = state.player;
     const button = $("player-source");
@@ -666,6 +719,9 @@
     const player = state.player;
     const video = $("video-player");
     const live = Boolean(player?.live);
+    $("player-timeshift").hidden = !live;
+    $("player-best-source").hidden = !live || player.sources.length < 2;
+    $("player-best-source").disabled = Boolean(player?.probing);
     for (const id of ["player-toggle", "player-mute", "player-fullscreen"])
       $(id).hidden = !live;
     const playlistSize = player?.playlist?.length || 0;
@@ -847,7 +903,7 @@
         : "直播由服务器转发，请确认服务器能访问频道地址。"
       : "使用播放器控制开始播放。按 Esc 关闭。";
     const upstream = player.live
-      ? player.sources[player.sourceIndex]
+      ? liveUrl(player, player.sourceIndex)
       : player.item.remote_url;
     const source = upstream
       ? `/api/playback?url=${encodeURIComponent(upstream)}`
@@ -992,6 +1048,7 @@
       playlist,
       playlistIndex,
       sourceIndex: 0,
+      shiftSeconds: 0,
       failed: new Set(),
       attempt: 0,
       lastSaved: 0,
@@ -1015,6 +1072,7 @@
     video.playbackRate = video.defaultPlaybackRate;
     video.volume = Math.min(1, Math.max(0, storedNumber("polyview-volume", 1)));
     video.muted = storedNumber("polyview-muted", 0) === 1;
+    if (live) paintTimeshift(state.player);
     playerGuide(item);
     updatePlayerControls();
     $("player-hud-title").textContent = $("player-title").textContent;
@@ -3146,6 +3204,88 @@
     );
     return root;
   }
+  async function liveSubscriptionSettings() {
+    const path = "/api/live-sources";
+    const name = make("input", { name: "name", required: true });
+    const url = make("input", { name: "url", type: "url", required: true });
+    const rows = make("div", { class: "source-list" });
+    const message = make("p", { class: "hint", role: "status" });
+    const add = button("添加直播源", "primary", null, { type: "submit" });
+    let busy = false;
+    async function change(action) {
+      if (busy) return;
+      busy = true;
+      try {
+        await action();
+        await load();
+      } catch (error) { message.textContent = error.message; }
+      finally { busy = false; }
+    }
+    async function load() {
+      const sources = await api(path);
+      rows.replaceChildren(...sources.map((source) => {
+        const endpoint = `${path}/${source.id}`;
+        return make("div", { class: "form-row" }, [
+          make("strong", { text: source.name }), make("span", { text: source.url }),
+          make("span", { class: "hint", text: `${source.enabled ? "已启用" : "已停用"} · ${source.channel_count} 个频道` }),
+          source.error && make("span", { class: "form-error", text: source.error }),
+          button(source.enabled ? "停用" : "启用", "subtle", () => change(() => api(endpoint, {
+            method: "PUT", body: { name: source.name, url: source.url, enabled: !source.enabled },
+          }))),
+          button("删除", "subtle", () => {
+            if (window.confirm(`删除直播源“${source.name}”？`)) return change(() => api(endpoint, { method: "DELETE" }));
+          }),
+        ]);
+      }));
+    }
+    const form = make("form", { class: "form-row", on: { submit: (event) => {
+      event.preventDefault();
+      return change(async () => {
+        await api(path, { method: "POST", body: { name: name.value.trim(), url: url.value.trim(), enabled: true } });
+        name.value = "";
+        url.value = "";
+        message.textContent = "直播源已添加";
+      });
+    } } }, [make("label", {}, ["直播源名称", name]), make("label", {}, ["M3U 地址", url]), add]);
+    const refresh = button("刷新已启用直播源", "subtle", () => change(async () => {
+      const result = await api(path + "/refresh", { method: "POST" });
+      message.textContent = `已刷新 ${result.refreshed} 个直播源，${result.failed} 个失败`;
+    }));
+    try { await load(); } catch (error) { message.textContent = error.message; }
+    return make("section", { class: "panel source-settings" }, [make("h2", { text: "远程 M3U 直播源管理" }), form, refresh, rows, message]);
+  }
+  async function channelAliasSettings() {
+    const path = "/api/epg/aliases";
+    const panel = make("section", { class: "panel source-settings" }, make("h2", { text: "频道别名映射" }));
+    try {
+      const aliases = await api(path);
+      const rows = make("div");
+      const fields = new Map();
+      function appendAlias(alias) {
+        const from = make("input", { name: "from", required: true, value: alias.from });
+        const to = make("input", { name: "to", required: true, value: alias.to });
+        const row = make("div", { class: "form-row" }, [make("label", {}, ["直播频道名", from]), make("label", {}, ["节目单频道名", to]),
+          button("移除映射", "subtle", () => { fields.delete(row); rows.replaceChildren(...fields.keys()); }),
+        ]);
+        fields.set(row, { from, to });
+        rows.append(row);
+      }
+      aliases.forEach(appendAlias);
+      const save = button("保存频道别名", "primary", null, { type: "submit" });
+      panel.append(make("form", { on: { submit: async (event) => {
+        event.preventDefault();
+        if (save.disabled) return;
+        save.disabled = true;
+        try {
+          const body = Array.from(fields.values(), ({ from, to }) => ({ from: from.value.trim(), to: to.value.trim() }));
+          await api(path, { method: "PUT", body });
+          toast("频道别名已保存");
+        } catch (error) { toast(error.message, true); }
+        finally { save.disabled = false; }
+      } } }, [rows, button("添加映射", "subtle", () => appendAlias({ from: "", to: "" })), save]));
+    } catch (error) { panel.append(make("p", { class: "form-error", text: error.message })); }
+    return panel;
+  }
   async function epgSettings() {
     const panel = make("section", { class: "panel source-settings" }, [
       make("h2", { text: "电视节目单" }),
@@ -3521,6 +3661,21 @@
     panel.append(await networkSettings());
     return panel;
   }
+  function copyField(label, field, caption = "复制") {
+    const copy = button(caption, "subtle small-button", async () => {
+      try {
+        await navigator.clipboard.writeText(field.value);
+        copy.textContent = "✓ 已复制";
+        setTimeout(() => { copy.textContent = caption; }, 1500);
+        toast(`${label}已复制`);
+      } catch (_) {
+        field.focus();
+        field.select();
+        toast("已选中，请按 Ctrl+C（Mac 为 ⌘C）复制。");
+      }
+    });
+    return copy;
+  }
   async function tvboxSettings() {
     const panel = make("section", { class: "panel" }, [
       make("h2", { text: "影视仓 / TVBox 订阅" }),
@@ -3531,11 +3686,15 @@
     ]);
     try {
       const feed = await api("/api/tvbox");
+      const configs = make("div", { class: "tvbox-configs" });
+      panel.append(configs);
       [
-        ["影视仓配置", feed.config_path],
-        ["媒体库接口", feed.catalog_path],
-        ["直播 M3U", feed.live_path],
-      ].forEach(([label, path]) => {
+        ["标准配置地址", feed.config_path, configs],
+        ["Base58 配置地址（旧版影视仓兼容）", feed.config_b58_path, configs],
+        ["媒体库接口", feed.catalog_path, panel],
+        ["直播 M3U", feed.live_path, panel],
+      ].forEach(([label, path, container]) => {
+        if (!path) return;
         const url = new URL(path, location.origin).href;
         const input = make("input", {
           value: url,
@@ -3543,27 +3702,9 @@
           "aria-label": label,
           spellcheck: "false",
         });
-        const row = make("div", { class: "feed-row" }, [
-          make("label", {}, [label, input]),
-        ]);
-        const copy = button("复制", "subtle small-button", async () => {
-          try {
-            if (typeof navigator === "undefined" || !navigator.clipboard?.writeText)
-              throw new Error("剪贴板不可用");
-            await navigator.clipboard.writeText(url);
-            copy.textContent = "✓ 已复制";
-            setTimeout(() => {
-              copy.textContent = "复制";
-            }, 1500);
-            toast(`${label}已复制`);
-          } catch (_) {
-            input.focus();
-            input.select();
-            toast("地址已选中，请按 Ctrl+C（Mac 为 ⌘C）复制。");
-          }
-        });
-        row.append(copy);
-        panel.append(row);
+        container.append(make("div", { class: "feed-row" }, [
+          make("label", {}, [label, input]), copyField(label, input),
+        ]));
       });
       panel.append(
         make("p", {
@@ -3648,6 +3789,169 @@
     );
     return panel;
   }
+  function extractResourceLinks(text) {
+    const links = new Set();
+    const matches = text.match(/https?:\/\/[^\s<>"'`，。；、【】（）“”‘’|]+/gi) || [];
+    for (const match of matches) {
+      const link = match.replace(/[.,;]+$/, "").replace(/\)+$/, (end, index) => {
+        const prefix = match.slice(0, index);
+        const open = (prefix.match(/\(/g) || []).length - (prefix.match(/\)/g) || []).length;
+        return end.slice(0, Math.max(0, open));
+      });
+      try {
+        if (new URL(link).hostname) links.add(link);
+      } catch (_) { /* Ignore malformed links in pasted text. */ }
+    }
+    return [...links];
+  }
+  function resourceLinkTool() {
+    const text = make("textarea", { rows: 4, "aria-label": "待提取文本" });
+    const result = make("textarea", { rows: 4, spellcheck: "false", "aria-label": "提取结果" });
+    const destination = make("select", { "aria-label": "导入位置" }, [
+      make("option", { value: "channels", text: "播放链接 → 直播频道" }),
+      make("option", { value: "sources", text: "CMS 接口 → 在线影视源" }),
+    ]);
+    const copy = copyField("资源链接", result, "复制链接");
+    const importLinks = button("导入链接", "primary", async () => {
+      if (importLinks.disabled) return;
+      const links = extractResourceLinks(result.value);
+      if (!links.length) return toast("请先提取资源链接", true);
+      importLinks.disabled = true;
+      try {
+        const rows = links.map((url) => {
+          const parsed = new URL(url);
+          return { name: `${parsed.host}${parsed.pathname}`.slice(0, 100), url };
+        });
+        if (destination.value === "sources") {
+          const applied = await api("/api/sources/batch", { method: "POST", body: rows });
+          toast(`已导入 ${applied.imported} 个影视源，跳过 ${applied.skipped} 个`);
+        } else {
+          const playlist = ["#EXTM3U", ...rows.map(({ name, url }) => `#EXTINF:-1,${name}\n${url}`)].join("\n");
+          const applied = await api("/api/channels/import", { method: "POST", body: { playlist } });
+          toast(`已导入 ${applied.imported} 个频道`);
+        }
+      } catch (error) { toast(error.message, true); }
+      finally { importLinks.disabled = false; }
+    });
+    return make("details", { class: "panel resource-links" }, [
+      make("summary", { text: "从文本提取资源链接" }),
+      make("div", { class: "stack" }, [
+        make("label", {}, ["粘贴含有 HTTP(S) 资源链接的文本", text]),
+        button("提取链接", "subtle", () => {
+          const links = extractResourceLinks(text.value);
+          result.value = links.join("\n");
+          toast(`已提取 ${links.length} 个不同的链接`);
+        }),
+        make("label", {}, ["提取结果（每行一个链接，导入时请保留同一类型）", result]),
+        make("div", { class: "form-row" }, [make("label", {}, ["导入位置", destination]), copy, importLinks]),
+      ]),
+    ]);
+  }
+  function backupSettings() {
+    const file = make("input", { type: "file", accept: ".json,application/json", "aria-label": "选择配置备份文件" });
+    const restore = button("导入备份", "primary", async () => {
+      if (restore.disabled) return;
+      const selected = file.files?.[0];
+      if (!selected) return toast("请选择 JSON 备份文件", true);
+      restore.disabled = true;
+      try {
+        const backup = JSON.parse(await selected.text());
+        if (!backup || typeof backup !== "object" || Array.isArray(backup)) throw new Error("请选择整站配置备份 JSON 文件");
+        if (!window.confirm(`导入 ${selected.name}？将按地址合并影视源和直播源，并替换站点设置和节目单配置。账户与登录会话将保留。`)) return;
+        await api("/api/settings/import", { method: "POST", body: backup });
+        file.value = "";
+        toast("整站配置已导入");
+      } catch (error) { toast(error.message, true); }
+      finally { restore.disabled = false; }
+    });
+    return [make("section", { class: "panel" }, [
+      make("h2", { text: "配置导出 / 导入" }),
+      make("p", { class: "panel-description", text: "完整配置备份含私密配置，包括影视源凭据、代理和通知设置。请妥善保管 JSON 文件。" }),
+      make("a", { class: "button subtle", href: "/api/settings/export", download: "polyview-config.json", text: "导出完整配置备份" }),
+      make("div", { class: "form-row backup-import" }, [make("label", {}, ["选择配置备份文件", file]), restore]),
+    ]), resourceLinkTool()];
+  }
+  function memberPasswordDialog() {
+    const title = make("h3", { id: "member-password-title" });
+    const dialog = make("dialog", { class: "info-dialog", "aria-labelledby": "member-password-title" });
+    const field = make("input", { type: "password", autocomplete: "new-password", required: true });
+    const submit = button("确认重置", "primary", null, { type: "submit" });
+    let target;
+    dialog.addEventListener("close", () => { field.value = ""; });
+    dialog.append(title, make("form", { class: "stack", on: { submit: async (event) => {
+      event.preventDefault();
+      if (!target || target.id === state.user.id || submit.disabled) return;
+      const length = Array.from(field.value).length;
+      if (length < 10 || length > 128) return toast("密码需要 10–128 个字符", true);
+      submit.disabled = true;
+      try {
+        await api(`/api/users/${encodeURIComponent(target.id)}/password`, {
+          method: "POST", body: { password: field.value },
+        });
+        field.value = "";
+        dialog.close();
+        toast("密码已重置，该成员需要重新登录");
+      } catch (error) { toast(error.message, true); }
+      finally { submit.disabled = false; }
+    } } }, [
+      make("label", {}, ["新密码（10–128 个字符）", field]),
+      make("p", { class: "hint", text: "重置后，该成员的登录会话将立即失效。" }),
+      make("div", { class: "head-actions" }, [submit, button("取消", "subtle", () => dialog.close())]),
+    ]));
+    return { dialog, open(member) {
+      if (submit.disabled || member.id === state.user.id) return;
+      target = member;
+      title.textContent = `重置 ${member.username} 的密码`;
+      field.value = "";
+      dialog.showModal();
+    } };
+  }
+  function memberRow(member, resetPassword) {
+    const self = member.id === state.user.id;
+    const path = `/api/users/${encodeURIComponent(member.id)}`;
+    const role = make("select", { "aria-label": `${member.username} 的角色`, disabled: self }, [
+      make("option", { value: "user", text: "家庭成员" }),
+      make("option", { value: "admin", text: "管理员" }),
+    ]);
+    role.value = member.role;
+    const toggle = make("button", {
+      type: "button", class: "switch", role: "switch", disabled: self,
+      "aria-label": `启用 ${member.username}`, "aria-checked": String(!member.disabled),
+    });
+    const status = make("small", { text: member.disabled ? "已禁用" : "已启用" });
+    async function update(nextRole, disabled) {
+      if (self || role.disabled) return;
+      role.disabled = toggle.disabled = true;
+      try {
+        await api(path, { method: "PUT", body: { role: nextRole, disabled } });
+        member.role = nextRole;
+        member.disabled = disabled;
+        toggle.setAttribute("aria-checked", String(!disabled));
+        status.textContent = disabled ? "已禁用" : "已启用";
+        toast("成员设置已更新");
+      } catch (error) { toast(error.message, true); }
+      finally {
+        role.value = member.role;
+        role.disabled = toggle.disabled = false;
+      }
+    }
+    role.addEventListener("change", () => update(role.value, Boolean(member.disabled)));
+    toggle.addEventListener("click", () => update(member.role, !member.disabled));
+    return make("div", { class: "user-row member-settings-row" }, [
+      make("span", { class: "avatar", text: member.username.slice(0, 1).toUpperCase() }),
+      make("div", {}, [make("strong", { text: member.username }), status]), role, toggle,
+      self ? make("span", { class: "small muted", text: "当前账户" })
+        : button("重置密码", "subtle small-button", () => resetPassword(member)),
+      self ? null : button("移除", "danger small-button", async () => {
+        if (!window.confirm(`确定移除 ${member.username}？`)) return;
+        try {
+          await api(path, { method: "DELETE" });
+          toast("成员已移除");
+          render();
+        } catch (error) { toast(error.message, true); }
+      }),
+    ]);
+  }
   async function familySettings() {
     const users = make("section", { class: "panel" }, [
       make("h2", { text: "家庭成员" }),
@@ -3715,39 +4019,8 @@
     try {
       const result = await api("/api/users");
       const members = Array.isArray(result) ? result : result?.users || [];
-      const list = make("div", { class: "user-list" });
-      members.forEach((member) =>
-        list.append(
-          make("div", { class: "user-row" }, [
-            make("span", {
-              class: "avatar",
-              text: member.username.slice(0, 1).toUpperCase(),
-            }),
-            make("div", {}, [
-              make("strong", { text: member.username }),
-              make("small", {
-                text: member.role === "admin" ? "管理员" : "家庭成员",
-              }),
-            ]),
-            member.id === state.user.id
-              ? make("span", { class: "small muted", text: "当前账户" })
-              : button("移除", "danger small-button", async () => {
-                  if (!window.confirm(`确定移除 ${member.username}？`))
-                    return;
-                  try {
-                    await api(`/api/users/${encodeURIComponent(member.id)}`, {
-                      method: "DELETE",
-                    });
-                    toast("成员已移除");
-                    render();
-                  } catch (e) {
-                    toast(e.message, true);
-                  }
-                }),
-          ]),
-        ),
-      );
-      users.append(list);
+      const reset = memberPasswordDialog();
+      users.append(make("div", { class: "user-list" }, members.map((member) => memberRow(member, reset.open))), reset.dialog);
     } catch (e) {
       users.append(make("p", { class: "form-error", text: e.message }));
     }
@@ -3808,8 +4081,9 @@
         ? [
             ["family", "家庭成员"],
             ["sources", "在线影视源"],
-            ["epg", "电视节目单"],
+            ["epg", "直播与节目单"],
             ["notify", "通知与日历"],
+            ["backup", "备份与工具"],
           ]
         : []),
       ["tvbox", "影视仓订阅"],
@@ -3842,8 +4116,9 @@
     if (active === "account") body.append(accountSettings());
     else if (active === "family") body.append(await familySettings());
     else if (active === "sources") body.append(await sourceSettings());
-    else if (active === "epg") body.append(await epgSettings());
+    else if (active === "epg") body.append(...await Promise.all([epgSettings(), liveSubscriptionSettings(), channelAliasSettings()]));
     else if (active === "notify") body.append(...await notificationCalendarSettings());
+    else if (active === "backup") body.append(...backupSettings());
     else if (active === "tvbox") body.append(await tvboxSettings());
     root.append(body);
     return root;
@@ -4138,6 +4413,7 @@
     closePlayer();
   });
   $("player-source").addEventListener("click", () => switchLiveSource(1));
+  $("player-best-source").addEventListener("click", probeLiveSources);
   $("player-favorite")?.addEventListener("click", () => {
     if (state.player?.live) return changeChannelFavorite(state.player.item, $("player-favorite"), () => {
       if (["live", "favorites"].includes(state.page)) render();

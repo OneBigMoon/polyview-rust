@@ -1,5 +1,11 @@
+#[path = "cases/backup.rs"]
+mod backup;
 #[path = "cases/calendar.rs"]
 mod calendar;
+#[path = "cases/live_sources.rs"]
+mod live_sources;
+#[path = "cases/member_feeds.rs"]
+mod member_feeds;
 #[path = "cases/notify.rs"]
 mod notify;
 #[path = "cases/play_settings.rs"]

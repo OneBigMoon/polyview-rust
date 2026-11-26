@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod epg;
 pub mod legacy;
 pub mod library;
+pub mod live_sources;
 pub mod network;
 pub mod notify;
 pub mod playback;
@@ -136,6 +137,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     epg::init_schema(conn)?;
     user_data::init_schema(conn)?;
     settings::init_schema(conn)?;
+    live_sources::init_schema(conn)?;
     Ok(())
 }
 
@@ -160,6 +162,7 @@ pub fn router(state: Shared) -> Router {
         .merge(settings::router())
         .merge(calendar::router())
         .merge(notify::router())
+        .merge(live_sources::router())
         .fallback(|| async { AppError::not_found("Not found") })
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(security_headers))

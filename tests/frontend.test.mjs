@@ -126,6 +126,8 @@ function environment(routes = {}, { canPlayType = () => "" } = {}) {
     "auth-password",
     "auth-reveal",
     "connection-banner",
+    "player-best-source",
+    "player-timeshift",
     "player-skip",
     "auth-title",
     "auth-description",
@@ -1708,7 +1710,7 @@ test("settings tabs render one panel at a time", async () => {
   app.state.user = { id: 1, username: "root", role: "admin" };
   const page = await app.settings();
   assert.deepEqual(pageClass(page, "filter-chip").map((chip) => chip.textContent),
-    ["账户安全", "家庭成员", "在线影视源", "电视节目单", "通知与日历", "影视仓订阅"]);
+    ["账户安全", "家庭成员", "在线影视源", "直播与节目单", "通知与日历", "备份与工具", "影视仓订阅"]);
   const panelTitles = (view) => pageNodes(pageClass(view, "settings-panel")[0])
     .filter((node) => node.tagName === "H2").map((node) => node.textContent);
   assert.deepEqual(panelTitles(page), ["修改密码"]);
@@ -2521,4 +2523,255 @@ test("empty and disabled calendar responses are usable without sources", async (
   const disabledPage = await disabled.calendar();
   assert.equal(pageClass(disabledPage, "filter-chip").length, 0);
   assert.match(disabledPage.textContent, /放送日历已关闭/);
+});
+
+test("live timeshift replaces upstream start without losing credentials and restores the live URL", () => {
+  const app = environment();
+  const original = "https://a.example/live.m3u8?token=A%2BB&quality=hd#stream";
+  app.play({ name: "频道", sources: [original, "https://b.example/live.m3u8?start=old"] }, true);
+  const bar = app.elements.get("player-timeshift");
+  const upstream = () => new URL(new URL(app.hlsInstances.at(-1).source, "https://polyview.test").searchParams.get("url"));
+  assert.match(bar.textContent, /依赖上游支持/);
+  for (const minutes of [5, 15, 30]) {
+    pageButton(bar, `-${minutes}分`).dispatchEvent("click");
+    assert.equal(upstream().searchParams.get("start"), String(-minutes * 60));
+    assert.equal(upstream().searchParams.get("token"), "A+B");
+    assert.equal(upstream().hash, "#stream");
+    assert.equal(pageButton(bar, `-${minutes}分`).getAttribute("aria-pressed"), "true");
+  }
+  app.switchLiveSource(1);
+  assert.deepEqual(upstream().searchParams.getAll("start"), ["-1800"]);
+  app.switchLiveSource(1);
+  pageButton(bar, "直播").dispatchEvent("click");
+  assert.equal(upstream().href, original);
+  app.closePlayer();
+  assert.equal(bar.hidden, true);
+});
+
+test("live probes race the proxied sources and play the first successful response", async () => {
+  const app = environment();
+  const urls = ["slow", "failed", "fast"].map((name) => `https://${name}.example/live.m3u8`);
+  app.play({ name: "频道", sources: urls }, true);
+  const pending = new Map();
+  app.context.fetch = (url) => new Promise((resolve) => pending.set(new URL(url, "https://polyview.test").searchParams.get("url"), resolve));
+  const probe = app.elements.get("player-best-source");
+  assert.equal(probe.hidden, false);
+  const done = probe.listeners.click[0]();
+  assert.deepEqual([...pending.keys()], urls);
+  pending.get(urls[1])({ ok: false });
+  pending.get(urls[2])({ ok: true });
+  await done;
+  assert.equal(app.state.player.sourceIndex, 2);
+  assert.equal(app.hlsInstances.at(-1).source, `/api/playback?url=${encodeURIComponent(urls[2])}`);
+  pending.get(urls[0])({ ok: true });
+  app.play({ name: "单线路", url: urls[0] }, true);
+  assert.equal(probe.hidden, true);
+});
+
+test("admin live settings add, disable, enable, refresh and delete M3U subscriptions", async () => {
+  const path = "/api/live-sources";
+  const rows = [];
+  const app = environment({ [path]: rows, "/api/epg/aliases": [], [path + "/refresh"]: { refreshed: 1, failed: 0 } });
+  app.state.user = { id: 1, role: "admin" };
+  app.state.settingsTab = "epg";
+  const originalFetch = app.context.fetch;
+  app.context.fetch = (url, options) => {
+    if (url === path && options.method === "POST") rows.push({ ...JSON.parse(options.body), id: 7, channel_count: 2 });
+    if (url === path + "/7" && options.method === "PUT") Object.assign(rows[0], JSON.parse(options.body));
+    if (url === path + "/7" && options.method === "DELETE") rows.pop();
+    return originalFetch(url, options);
+  };
+  const panel = pageNodes(await app.settings()).find((node) => node.tagName === "SECTION" && node.textContent.startsWith("远程 M3U 直播源管理"));
+  const form = pageNodes(panel).find((node) => node.tagName === "FORM");
+  const input = (name) => pageNodes(form).find((node) => node.attributes?.name === name);
+  input("name").value = "家庭电视";
+  input("url").value = "https://feeds.example/live.m3u";
+  await form.listeners.submit[0]({ preventDefault() {} });
+  assert.deepEqual(rows[0], { id: 7, channel_count: 2, name: "家庭电视", url: "https://feeds.example/live.m3u", enabled: true });
+  await pageButton(panel, "停用").listeners.click[0]();
+  assert.equal(rows[0].enabled, false);
+  await pageButton(panel, "启用").listeners.click[0]();
+  assert.equal(rows[0].enabled, true);
+  await pageButton(panel, "刷新已启用直播源").listeners.click[0]();
+  assert.match(panel.textContent, /已刷新 1 个直播源，0 个失败/);
+  await pageButton(panel, "删除").listeners.click[0]();
+  assert.equal(rows.length, 0);
+  assert.doesNotMatch(panel.textContent, /家庭电视/);
+  const writes = app.calls.filter(({ options }) => options.method && options.method !== "GET");
+  assert.deepEqual(writes.map(({ options }) => options.method), ["POST", "PUT", "PUT", "POST", "DELETE"]);
+  assert.ok(writes.every(({ options }) => options.headers["X-PolyView-Request"] === "1"));
+});
+
+test("admin edits, adds and removes channel alias pairs", async () => {
+  const path = "/api/epg/aliases";
+  const app = environment({ [path]: [{ from: "CCTV1", to: "一套" }], "/api/live-sources": [] });
+  app.state.user = { id: 1, role: "admin" };
+  app.state.settingsTab = "epg";
+  const panel = pageNodes(await app.settings()).find((node) => node.tagName === "SECTION" && node.textContent.startsWith("频道别名映射"));
+  const form = pageNodes(panel).find((node) => node.tagName === "FORM");
+  const fields = (name) => pageNodes(form).filter((node) => node.attributes?.name === name);
+  assert.equal(fields("from")[0].value, "CCTV1");
+  fields("to")[0].value = "综合";
+  pageButton(panel, "添加映射").dispatchEvent("click");
+  fields("from")[1].value = " 本地 ";
+  fields("to")[1].value = "新闻";
+  const save = async () => {
+    await form.listeners.submit[0]({ preventDefault() {} });
+    const call = app.calls.at(-1);
+    assert.equal(call.url, path);
+    assert.equal(call.options.method, "PUT");
+    assert.equal(call.options.headers["X-PolyView-Request"], "1");
+    return JSON.parse(call.options.body);
+  };
+  assert.deepEqual(await save(), [{ from: "CCTV1", to: "综合" }, { from: "本地", to: "新闻" }]);
+  pageButton(panel, "移除映射").dispatchEvent("click");
+  assert.deepEqual(await save(), [{ from: "本地", to: "新闻" }]);
+  pageButton(panel, "移除映射").dispatchEvent("click");
+  assert.deepEqual(await save(), []);
+});
+
+test("TVBox presents both configuration formats and copies the selected address", async () => {
+  const app = environment({ "/api/tvbox": { ...tvboxPaths, config_b58_path: "/feeds/config?encode=base58" } });
+  app.state.settingsTab = "tvbox";
+  const group = pageClass(await app.settings(), "tvbox-configs")[0];
+  const rows = pageClass(group, "feed-row");
+  assert.equal(rows.length, 2);
+  const copied = [];
+  app.context.navigator.clipboard.writeText = async (value) => { copied.push(value); };
+  for (const [index, label] of ["标准配置地址", "Base58 配置地址（旧版影视仓兼容）"].entries()) {
+    const input = pageNodes(rows[index]).find((node) => node.tagName === "INPUT");
+    assert.equal(input.getAttribute("aria-label"), label);
+    await pageButton(rows[index], "复制").listeners.click[0]();
+  }
+  assert.deepEqual(copied, ["https://polyview.test/feeds/config", "https://polyview.test/feeds/config?encode=base58"]);
+});
+
+test("admins change member roles, disable and enable accounts, and reset another member's password", async () => {
+  const admin = { id: 1, username: "root", role: "admin", disabled: false };
+  const app = environment({ "/api/users": [admin, { id: 7, username: "viewer", role: "user", disabled: false }] });
+  app.state.settingsTab = "family";
+  app.state.user = admin;
+  const panel = await app.settings();
+  const [self, member] = pageClass(panel, "member-settings-row");
+  const role = (row) => pageNodes(row).find((node) => node.tagName === "SELECT");
+  const toggle = (row) => pageNodes(row).find((node) => node.getAttribute?.("role") === "switch");
+  assert.equal(role(self).disabled, true);
+  assert.equal(toggle(self).disabled, true);
+  assert.doesNotMatch(self.textContent, /重置密码|移除/);
+  assert.equal(role(member).value, "user");
+  role(member).value = "admin";
+  await role(member).listeners.change[0]();
+  assert.equal(role(member).value, "admin");
+  await toggle(member).listeners.click[0]();
+  assert.equal(toggle(member).getAttribute("aria-checked"), "false");
+  assert.match(member.textContent, /已禁用/);
+  await toggle(member).listeners.click[0]();
+  assert.equal(toggle(member).getAttribute("aria-checked"), "true");
+  assert.deepEqual(app.calls.filter(({ options }) => options.method === "PUT").map(({ url, options }) =>
+    [url, JSON.parse(options.body)]), [false, true, false].map((disabled) => ["/api/users/7", { role: "admin", disabled }]));
+  const dialog = pageNodes(panel).find((node) => node.tagName === "DIALOG");
+  pageButton(member, "重置密码").dispatchEvent("click");
+  assert.equal(dialog.open, true);
+  assert.match(dialog.textContent, /viewer/);
+  const password = pageNodes(dialog).find((node) => node.tagName === "INPUT");
+  const form = pageNodes(dialog).find((node) => node.tagName === "FORM");
+  const submit = () => form.listeners.submit[0]({ preventDefault() {} });
+  for (const invalid of ["too short", "x".repeat(129)]) {
+    password.value = invalid;
+    await submit();
+    assert.equal(dialog.open, true);
+    assert.equal(app.calls.some(({ url }) => url.endsWith("/password")), false);
+  }
+  password.value = "new-password-123";
+  await submit();
+  const last = app.calls.at(-1);
+  assert.equal(last.url, "/api/users/7/password");
+  assert.equal(last.options.method, "POST");
+  assert.deepEqual(JSON.parse(last.options.body), { password: "new-password-123" });
+  assert.equal(dialog.open, false);
+  assert.equal(password.value, "");
+  for (const { options } of app.calls.filter(({ options }) => options.method)) {
+    assert.equal(options.headers["X-PolyView-Request"], "1");
+  }
+});
+
+test("a rejected member update restores the stored role and leaves the switch enabled", async () => {
+  const app = environment({ "/api/users": [{ id: 7, username: "viewer", role: "user", disabled: false }] });
+  app.state.user = { id: 1, role: "admin" };
+  app.state.settingsTab = "family";
+  const row = pageClass(await app.settings(), "member-settings-row")[0];
+  const role = pageNodes(row).find((node) => node.tagName === "SELECT");
+  const toggle = pageClass(row, "switch")[0];
+  app.context.fetch = async () => ({ ok: false, status: 400, text: async () => JSON.stringify({ error: "role rejected" }) });
+  role.value = "admin";
+  await role.listeners.change[0]();
+  assert.equal(role.value, "user");
+  assert.equal(role.disabled, false);
+  assert.equal(toggle.disabled, false);
+  assert.equal(toggle.getAttribute("aria-checked"), "true");
+  assert.match(app.elements.get("toast").textContent, /role rejected/);
+});
+
+test("backup tools are admin-only, label private exports and only restore a confirmed JSON file", async () => {
+  const app = environment();
+  app.state.user = { id: 2, role: "user" };
+  app.state.settingsTab = "backup";
+  assert.doesNotMatch((await app.settings()).textContent, /配置导出|备份与工具/);
+  assert.equal(app.state.settingsTab, "account");
+  app.state.user = { id: 1, role: "admin" };
+  app.state.settingsTab = "backup";
+  const page = await app.settings();
+  assert.match(page.textContent, /完整配置备份含私密配置/);
+  const download = pageNodes(page).find((node) => node.tagName === "A" && node.getAttribute("download"));
+  assert.equal(download.getAttribute("href"), "/api/settings/export");
+  assert.equal(download.getAttribute("download"), "polyview-config.json");
+  const file = pageNodes(page).find((node) => node.getAttribute?.("type") === "file");
+  const backup = { version: 1, exported_at: 1, catalog_sources: [], live_sources: [], epg_config: {}, app_settings: { private: "value" } };
+  const restore = pageButton(page, "导入备份");
+  file.files = [{ name: "broken.json", text: async () => "{broken" }];
+  await restore.listeners.click[0]();
+  assert.equal(app.calls.length, 0);
+  file.files = [{ name: "backup.json", text: async () => JSON.stringify(backup) }];
+  app.context.window.confirm = () => false;
+  await restore.listeners.click[0]();
+  assert.equal(app.calls.length, 0);
+  app.context.window.confirm = () => true;
+  await restore.listeners.click[0]();
+  assert.equal(app.calls.length, 1);
+  const { url, options } = app.calls[0];
+  assert.equal(url, "/api/settings/import");
+  assert.equal(options.method, "POST");
+  assert.equal(options.headers["X-PolyView-Request"], "1");
+  assert.deepEqual(JSON.parse(options.body), backup);
+});
+
+test("the resource tool extracts unique HTTP links, copies them, and imports the edited results", async () => {
+  const app = environment({ "/api/sources/batch": { imported: 1, skipped: 0 }, "/api/channels/import": { imported: 2 } });
+  app.state.user = { id: 1, role: "admin" };
+  app.state.settingsTab = "backup";
+  const tool = pageNodes(await app.settings()).find((node) => node.tagName === "DETAILS" && node.textContent.includes("从文本提取资源链接"));
+  const [input, result] = pageNodes(tool).filter((node) => node.tagName === "TEXTAREA");
+  const destination = pageNodes(tool).find((node) => node.tagName === "SELECT");
+  const video = "https://media.test/film(2).mp4", live = "http://live.test/s.m3u8?key=a%2Bb&v=2", cms = "https://cms.test/api.php/provide/vod/";
+  input.value = `视频 (${video}) ${video}，直播 ${live}。\n接口 <${cms}> ftp://invalid.test/x.mp4 javascript:alert(1)`;
+  pageButton(tool, "提取链接").dispatchEvent("click");
+  assert.equal(result.value, [video, live, cms].join("\n"));
+  let copied;
+  app.context.navigator.clipboard.writeText = async (value) => { copied = value; };
+  await pageButton(tool, "复制链接").listeners.click[0]();
+  assert.equal(copied, result.value);
+  const submit = pageButton(tool, "导入链接");
+  result.value = [video, live].join("\n");
+  await submit.listeners.click[0]();
+  assert.equal(app.calls[0].url, "/api/channels/import");
+  assert.deepEqual(JSON.parse(app.calls[0].options.body).playlist.split("\n"), ["#EXTM3U", "#EXTINF:-1,media.test/film(2).mp4", video, "#EXTINF:-1,live.test/s.m3u8", live]);
+  destination.value = "sources";
+  result.value = cms;
+  await submit.listeners.click[0]();
+  assert.equal(app.calls[1].url, "/api/sources/batch");
+  assert.deepEqual(JSON.parse(app.calls[1].options.body), [{ name: "cms.test/api.php/provide/vod/", url: cms }]);
+  for (const { options } of app.calls) {
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers["X-PolyView-Request"], "1");
+  }
 });

@@ -248,21 +248,21 @@ async fn save_settings_handler(
     }))
 }
 
-#[derive(Default, Deserialize)]
-struct SourceInput {
-    name: String,
-    url: String,
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct SourceInput {
+    pub(crate) name: String,
+    pub(crate) url: String,
     #[serde(default = "enabled_by_default")]
-    enabled: bool,
+    pub(crate) enabled: bool,
     #[serde(default)]
-    adult: bool,
-    priority: Option<i64>,
-    searchable: Option<bool>,
-    custom_ua: Option<String>,
-    custom_referer: Option<String>,
-    custom_cookie: Option<String>,
-    proxy_url: Option<String>,
-    timeout_secs: Option<u64>,
+    pub(crate) adult: bool,
+    pub(crate) priority: Option<i64>,
+    pub(crate) searchable: Option<bool>,
+    pub(crate) custom_ua: Option<String>,
+    pub(crate) custom_referer: Option<String>,
+    pub(crate) custom_cookie: Option<String>,
+    pub(crate) proxy_url: Option<String>,
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 fn enabled_by_default() -> bool {
@@ -289,7 +289,7 @@ fn http_url(raw: &str) -> Result<Url, AppError> {
     Ok(url)
 }
 
-fn validate_source(input: &SourceInput) -> Result<(String, String), AppError> {
+pub(crate) fn validate_source(input: &SourceInput) -> Result<(String, String), AppError> {
     let name = input.name.trim();
     if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
         return Err(AppError::bad_request(

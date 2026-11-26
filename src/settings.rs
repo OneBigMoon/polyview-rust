@@ -1,3 +1,5 @@
+mod backup;
+
 use crate::{
     AppError, Shared,
     auth::{AuthUser, require_admin},
@@ -179,6 +181,7 @@ async fn save_skip(
 
 pub fn router() -> Router<Shared> {
     Router::new()
+        .merge(backup::router())
         .route("/api/settings/play", get(read_play).put(save_play))
         .route("/api/skip", get(read_skip).put(save_skip))
 }

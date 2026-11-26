@@ -98,11 +98,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(address = %listener.local_addr()?, "PolyView is ready");
     let worker = network::start_worker(state.clone());
     let tracking_worker = polyview::tracking::start_worker(state.clone());
-    axum::serve(listener, router(state))
+    let live_worker = polyview::live_sources::start_worker(state.clone());
+    let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
     worker.abort();
     tracking_worker.abort();
+    live_worker.abort();
+    result?;
     Ok(())
 }
 

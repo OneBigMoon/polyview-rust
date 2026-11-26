@@ -46,6 +46,7 @@ const CHANNEL_ALIASES: &[(&str, &str)] = &[
     ("法国24", "France 24"),
 ];
 const EPG_STALE_SECONDS: i64 = 6 * 60 * 60;
+pub(crate) const ALIASES_KEY: &str = "epg_aliases";
 
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
@@ -75,6 +76,7 @@ pub fn router() -> Router<Shared> {
         .route("/api/epg", get(guide))
         .route("/api/epg/refresh", post(refresh))
         .route("/api/epg/config", get(config).put(save_config))
+        .route("/api/epg/aliases", get(read_aliases).put(save_aliases))
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,8 +165,13 @@ async fn save_config(
     Json(input): Json<ConfigInput>,
 ) -> Result<Json<Value>, AppError> {
     require_admin(&user)?;
-    let urls: Vec<&str> = input
-        .url
+    let conn = state.conn()?;
+    let value = store_config(&conn, &input.url)?;
+    Ok(Json(json!({"url": value})))
+}
+
+pub(crate) fn store_config(conn: &Connection, url: &str) -> Result<String, AppError> {
+    let urls: Vec<&str> = url
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -175,18 +182,68 @@ async fn save_config(
     for url in &urls {
         let parsed = url::Url::parse(url)
             .map_err(|_| AppError::bad_request("Enter a valid XMLTV HTTP(S) URL"))?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || url.chars().any(char::is_control)
+        {
             return Err(AppError::bad_request("Enter a valid XMLTV HTTP(S) URL"));
         }
     }
     let value = urls.join("\n");
-    let conn = state.conn()?;
     conn.execute(
         "INSERT INTO settings(key,value) VALUES ('epg_url',?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [&value],
     )?;
-    Ok(Json(json!({"url": value})))
+    Ok(value)
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ChannelAlias {
+    pub from: String,
+    pub to: String,
+}
+
+async fn read_aliases(
+    State(state): State<Shared>,
+    user: AuthUser,
+) -> Result<Json<Vec<ChannelAlias>>, AppError> {
+    require_admin(&user)?;
+    let conn = state.conn()?;
+    Ok(Json(crate::settings::get_setting_json(&conn, ALIASES_KEY)?))
+}
+
+async fn save_aliases(
+    State(state): State<Shared>,
+    user: AuthUser,
+    Json(aliases): Json<Vec<ChannelAlias>>,
+) -> Result<axum::http::StatusCode, AppError> {
+    require_admin(&user)?;
+    let conn = state.conn()?;
+    store_aliases(&conn, aliases)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+pub(crate) fn store_aliases(
+    conn: &Connection,
+    mut aliases: Vec<ChannelAlias>,
+) -> Result<(), AppError> {
+    let mut seen = HashSet::new();
+    for alias in &mut aliases {
+        for name in [&mut alias.from, &mut alias.to] {
+            *name = name.trim().to_owned();
+            if name.len() > 300 || name.chars().any(char::is_control) || normalize(name).is_empty()
+            {
+                return Err(AppError::bad_request(
+                    "Enter a valid channel name for each alias",
+                ));
+            }
+        }
+        if !seen.insert(normalize(&alias.from)) {
+            return Err(AppError::bad_request("Duplicate channel alias"));
+        }
+    }
+    crate::settings::set_setting_json(conn, ALIASES_KEY, &aliases)
 }
 
 async fn refresh(State(state): State<Shared>, user: AuthUser) -> Result<Json<Value>, AppError> {
@@ -223,11 +280,16 @@ async fn refresh_epg(state: &Shared) -> Result<Value, AppError> {
         ));
     }
     let conn = state.conn()?;
+    let custom = crate::settings::get_setting_json::<Vec<ChannelAlias>>(&conn, ALIASES_KEY)?
+        .into_iter()
+        .map(|alias| (normalize(&alias.from), normalize(&alias.to)))
+        .collect::<HashMap<_, _>>();
     let channels = {
         let mut statement = conn.prepare("SELECT id,name FROM channels ORDER BY id")?;
         statement
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                let name: String = row.get(1)?;
+                Ok((row.get::<_, i64>(0)?, channel_key(&name, &custom)))
             })?
             .collect::<Result<Vec<_>, _>>()?
     };
@@ -237,11 +299,11 @@ async fn refresh_epg(state: &Shared) -> Result<Value, AppError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM epg_programs", [])?;
     for parsed in &feeds {
-        for (channel_id, name) in &channels {
-            let Some(xml_id) = find_channel(name, &parsed.aliases, &parsed.canonical) else {
+        for (channel_id, key) in &channels {
+            let Some(xml_id) = find_channel(key, &parsed.aliases, &parsed.canonical) else {
                 continue;
             };
-            let Some(items) = parsed.programs.get(&xml_id) else {
+            let Some(items) = parsed.programs.get(xml_id) else {
                 continue;
             };
             matched.insert(*channel_id);
@@ -433,21 +495,26 @@ fn parse_xmltv(body: &str) -> Result<ParsedEpg, AppError> {
     })
 }
 
-fn find_channel(
-    name: &str,
-    aliases: &HashMap<String, String>,
-    canonical_aliases: &HashMap<String, String>,
-) -> Option<String> {
+fn channel_key(name: &str, custom: &HashMap<String, String>) -> String {
     let key = normalize(name);
-    let key = CHANNEL_ALIASES
+    if let Some(target) = custom.get(&key) {
+        return target.clone();
+    }
+    CHANNEL_ALIASES
         .iter()
         .find(|(local, _)| *local == key)
         .map(|(_, target)| normalize(target))
-        .unwrap_or(key);
+        .unwrap_or(key)
+}
+
+fn find_channel<'a>(
+    key: &str,
+    aliases: &'a HashMap<String, String>,
+    canonical_aliases: &'a HashMap<String, String>,
+) -> Option<&'a String> {
     aliases
-        .get(&key)
-        .or_else(|| canonical_aliases.get(&canonical(&key)))
-        .cloned()
+        .get(key)
+        .or_else(|| canonical_aliases.get(&canonical(key)))
 }
 
 fn normalize(value: &str) -> String {
@@ -538,6 +605,10 @@ mod tests {
     use flate2::write::GzEncoder;
     use std::io::Write;
 
+    fn default_key(name: &str) -> String {
+        channel_key(name, &HashMap::new())
+    }
+
     #[test]
     fn xmltv_times_convert_to_utc() {
         assert_eq!(parse_xmltv_time("19700101000000 +0000"), Some(0));
@@ -565,12 +636,12 @@ mod tests {
             (canonical("东方卫视"), "2".to_string()),
         ]);
         assert_eq!(
-            find_channel("CCTV-1 综合", &aliases, &canonical),
-            Some("1".into())
+            find_channel(&default_key("CCTV-1 综合"), &aliases, &canonical).map(String::as_str),
+            Some("1")
         );
         assert_eq!(
-            find_channel("东方卫视 4K", &aliases, &canonical),
-            Some("2".into())
+            find_channel(&default_key("东方卫视 4K"), &aliases, &canonical).map(String::as_str),
+            Some("2")
         );
     }
     #[test]
@@ -583,16 +654,31 @@ mod tests {
 </tv>"#;
         let parsed = parse_xmltv(body).unwrap();
         assert_eq!(
-            find_channel("CCTV 世界地理", &parsed.aliases, &parsed.canonical),
-            Some("1649".into())
+            find_channel(
+                &default_key("CCTV 世界地理"),
+                &parsed.aliases,
+                &parsed.canonical
+            )
+            .map(String::as_str),
+            Some("1649")
         );
         assert_eq!(
-            find_channel("青岛 QTV-2", &parsed.aliases, &parsed.canonical),
-            Some("青岛tv2".into())
+            find_channel(
+                &default_key("青岛 QTV-2"),
+                &parsed.aliases,
+                &parsed.canonical
+            )
+            .map(String::as_str),
+            Some("青岛tv2")
         );
         assert_eq!(
-            find_channel("CGTN 西语", &parsed.aliases, &parsed.canonical),
-            Some("CGTN西班牙语".into())
+            find_channel(
+                &default_key("CGTN 西语"),
+                &parsed.aliases,
+                &parsed.canonical
+            )
+            .map(String::as_str),
+            Some("CGTN西班牙语")
         );
     }
     #[test]

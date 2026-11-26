@@ -48,6 +48,7 @@ fn feed_paths(token: &str) -> Value {
     json!({
         "token": token,
         "config_path": format!("/tvbox/{token}/config.json"),
+        "config_b58_path": format!("/tvbox/{token}/config.json?encode=base58"),
         "catalog_path": format!("/tvbox/{token}/vod"),
         "live_path": format!("/tvbox/{token}/live.m3u"),
     })
@@ -90,7 +91,7 @@ fn require_token(state: &Shared, token: &str) -> Result<i64, AppError> {
     state
         .conn()?
         .query_row(
-            "SELECT t.user_id FROM tvbox_tokens t JOIN users u ON u.id=t.user_id WHERE t.token=?1",
+            "SELECT t.user_id FROM tvbox_tokens t JOIN users u ON u.id=t.user_id WHERE t.token=?1 AND u.disabled=0",
             [token],
             |row| row.get(0),
         )
@@ -132,11 +133,45 @@ fn origin(state: &Shared, headers: &HeaderMap) -> Result<String, AppError> {
     ))
 }
 
+#[derive(Deserialize)]
+struct ConfigQuery {
+    encode: Option<String>,
+}
+
+fn base58(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let zeros = input.iter().take_while(|&&byte| byte == 0).count();
+    let mut digits = Vec::<u8>::with_capacity(input.len() * 138 / 100 + 1);
+    // Accumulate big-endian input four bytes at a time in little-endian Base58 digits.
+    for chunk in input[zeros..].chunks(4) {
+        let bits = chunk.len() * 8;
+        let mut carry = chunk
+            .iter()
+            .fold(0u64, |n, &byte| (n << 8) | u64::from(byte));
+        for digit in &mut digits {
+            carry += u64::from(*digit) << bits;
+            *digit = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry != 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    digits.resize(digits.len() + zeros, 0);
+    digits.reverse();
+    for digit in &mut digits {
+        *digit = ALPHABET[usize::from(*digit)];
+    }
+    String::from_utf8(digits).expect("Base58 alphabet is ASCII")
+}
+
 async fn config(
     State(state): State<Shared>,
     Path(token): Path<String>,
+    Query(query): Query<ConfigQuery>,
     headers: HeaderMap,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     require_token(&state, &token)?;
     let origin = origin(&state, &headers)?;
     let mut sites = vec![json!({
@@ -156,11 +191,17 @@ async fn config(
                 })
             }),
     );
-    Ok(Json(json!({
+    let config = json!({
         "sites": sites,
         "lives": [{"name":"PolyView 直播", "type":0, "url":format!("{origin}/tvbox/{token}/live.m3u")}],
         "wallpaper": ""
-    })))
+    });
+    if query.encode.as_deref() == Some("base58") {
+        let bytes = serde_json::to_vec(&config).map_err(|e| AppError::internal(e.to_string()))?;
+        Ok(base58(&bytes).into_response())
+    } else {
+        Ok(Json(config).into_response())
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -597,6 +638,14 @@ mod tests {
             .unwrap();
         assert!(require_token(&state, token).is_err());
         assert_eq!(require_token(&state, second_token).unwrap(), 2);
+    }
+
+    #[test]
+    fn base58_matches_bitcoin_vectors_and_preserves_leading_zeros() {
+        assert_eq!(base58(b""), "");
+        assert_eq!(base58(&[0, 0]), "11");
+        assert_eq!(base58(&[0, 0, 1]), "112");
+        assert_eq!(base58(b"Hello World"), "JxF12TrwUP45BMd");
     }
 
     #[test]
