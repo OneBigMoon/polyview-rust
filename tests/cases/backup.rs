@@ -271,6 +271,11 @@ async fn backup_rejects_unknown_keys_invalid_values_and_rolls_back_partial_impor
         bad["app_settings"][key] = json!({"role":"admin"});
         invalid.push(bad);
     }
+    for invalid_section in [Value::Null, json!({}), json!([{"private_binding": true}])] {
+        let mut bad = backup.clone();
+        bad["source_subscriptions"] = invalid_section;
+        invalid.push(bad);
+    }
     let mut bad = backup.clone();
     bad["users"] = json!([]);
     invalid.push(bad);
@@ -310,6 +315,208 @@ async fn backup_rejects_unknown_keys_invalid_values_and_rolls_back_partial_impor
         cache_keys(&app),
         ["calendar", "catalog_recommend_douban", "unrelated"]
     );
+}
+
+#[tokio::test]
+async fn feed_backup_restores_selection_ownership_and_parser_configuration() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let cms = format!("{base}/api.php/provide/vod/");
+    let live = format!("{base}/channels.m3u");
+    let parser = format!("{base}/parse?url=");
+    let ignored = format!("{base}/ignored/api.php/provide/vod/");
+    let feed = Arc::new(Mutex::new(json!({
+        "sites": [
+            {"key":"cms","name":"Films","type":1,"api":cms},
+            {"key":"ignored","name":"Unselected","type":1,"api":ignored}
+        ],
+        "lives":[{"name":"TV","type":0,"url":live}],
+        "parses":[{"name":"Fixture parser","type":1,"url":parser}]
+    })));
+    let routes = Router::new().route(
+        "/config",
+        axum::routing::get({
+            let feed = feed.clone();
+            move || std::future::ready(axum::Json(feed.lock().unwrap().clone()))
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    let origin = TestApp::new();
+    let admin = origin.setup().await;
+    let selection = json!([
+        format!("cms:{cms}"),
+        format!("live:{live}"),
+        format!("parser:{parser}")
+    ]);
+    let created = origin
+        .request(
+            "POST",
+            "/api/source-subscriptions",
+            Some(&admin),
+            Some(json!({
+                "name":"Cinema", "url":format!("{base}/config?token=feed-secret"),
+                "enabled":true, "selected":selection
+            })),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let sync = "/api/source-subscriptions/sync";
+    let reply = origin
+        .request("POST", sync, Some(&admin), Some(json!({})))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let mut backup = export(&origin, &admin).await;
+    assert_eq!(backup["catalog_sources"].as_array().unwrap().len(), 1);
+    assert_eq!(backup["catalog_sources"][0]["url"], cms);
+    assert_eq!(backup["live_sources"][0]["url"], live);
+    let sources = backup["source_subscriptions"]["sources"]
+        .as_array_mut()
+        .unwrap();
+    let parser_index = sources
+        .iter()
+        .position(|source| source["kind"] == "parser" && source["url"] == parser)
+        .unwrap();
+    let declaration = &mut sources[parser_index]["parser"];
+    assert_eq!(declaration["name"], "Fixture parser");
+    declaration["headers_json"] = json!(r#"{"X-Fixture":"header-secret"}"#);
+    declaration["flags"] = json!("qq,youku");
+    declaration["priority"] = json!(73);
+    declaration["timeout_ms"] = json!(3500);
+    let config = &backup["source_subscriptions"];
+    let subscriptions = config["subscriptions"].as_array().unwrap();
+    assert_eq!(subscriptions.len(), 1);
+    let saved = subscriptions[0]["selected"].as_array().unwrap();
+    assert_eq!(saved.len(), 3);
+    assert!(
+        selection
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|key| saved.contains(key))
+    );
+    assert_eq!(subscriptions[0]["items"].as_array().unwrap().len(), 3);
+
+    let target = TestApp::new();
+    let target_admin = target.setup().await;
+    let reply = restore(&target, &target_admin, backup.clone()).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let expected = without_timestamp(backup.clone());
+    assert_eq!(
+        without_timestamp(export(&target, &target_admin).await),
+        expected
+    );
+
+    // Legacy backups omit subscriptions entirely. Their ordinary settings still apply.
+    for includes_downloads in [false, true] {
+        let mut legacy = backup.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("source_subscriptions");
+        if !includes_downloads {
+            legacy["app_settings"]
+                .as_object_mut()
+                .unwrap()
+                .remove("downloads");
+        }
+        legacy["app_settings"]["adult_sources_enabled"] = json!(true);
+        assert_eq!(
+            restore(&target, &target_admin, legacy).await.status,
+            StatusCode::OK
+        );
+        let actual = export(&target, &target_admin).await;
+        assert_eq!(actual["source_subscriptions"], *config);
+        assert_eq!(actual["app_settings"]["adult_sources_enabled"], true);
+    }
+
+    // Invalid feed metadata must roll back earlier source and global-setting writes.
+    let before = without_timestamp(export(&target, &target_admin).await);
+    for (field, invalid) in [
+        (
+            "/subscriptions/0/items/0/url".to_string(),
+            json!(format!("{base}/missing?token=bad-secret")),
+        ),
+        (
+            "/subscriptions/0/url".to_string(),
+            json!("file:///tmp/bad-secret"),
+        ),
+        (
+            format!("/sources/{parser_index}/parser/timeout_ms"),
+            json!(0),
+        ),
+        (
+            format!("/sources/{parser_index}/parser/headers_json"),
+            json!("bad-secret"),
+        ),
+    ] {
+        let mut bad = backup.clone();
+        bad["catalog_sources"][0]["name"] = json!("Should roll back");
+        *bad["source_subscriptions"].pointer_mut(&field).unwrap() = invalid;
+        let reply = restore(&target, &target_admin, bad).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{field}");
+        assert!(!String::from_utf8_lossy(&reply.body).contains("bad-secret"));
+    }
+    assert_eq!(
+        without_timestamp(export(&target, &target_admin).await),
+        before
+    );
+
+    target.create_viewer(&target_admin).await;
+    let viewer = target.login("viewer", PASSWORD).await.cookie();
+    for (method, route, body) in [
+        ("GET", EXPORT, None),
+        ("POST", IMPORT, Some(backup.clone())),
+    ] {
+        let reply = target.request(method, route, Some(&viewer), body).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        let body = String::from_utf8_lossy(&reply.body);
+        assert!(!body.contains("feed-secret"));
+        assert!(!body.contains("header-secret"));
+    }
+
+    let manual = TestApp::new();
+    let manual_admin = manual.setup().await;
+    {
+        let conn = manual.state.conn().unwrap();
+        conn.execute(
+            "INSERT INTO catalog_sources(id,name,url) VALUES(91,'manual',?)",
+            [&cms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO live_sources(id,name,url) VALUES(92,'manual',?)",
+            [&live],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        restore(&manual, &manual_admin, backup).await.status,
+        StatusCode::OK
+    );
+    // The same incoming URLs now identify different rows. Only sources actually
+    // managed by the subscription may be disabled when the feed drops them.
+    {
+        let mut updated = feed.lock().unwrap();
+        updated["sites"] = json!([{"key":"ignored","name":"Unselected","type":1,"api":ignored}]);
+        updated["lives"] = json!([]);
+    }
+    for (app, cookie, managed) in [
+        (&target, &target_admin, true),
+        (&manual, &manual_admin, false),
+    ] {
+        let reply = app
+            .request("POST", sync, Some(cookie), Some(json!({})))
+            .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let actual = export(app, cookie).await;
+        assert_eq!(actual["catalog_sources"][0]["enabled"], !managed);
+        assert_eq!(actual["live_sources"][0]["enabled"], !managed);
+        if !managed {
+            assert_eq!(actual["catalog_sources"][0]["id"], 91);
+            assert_eq!(actual["live_sources"][0]["id"], 92);
+        }
+    }
+    server.abort();
 }
 
 #[tokio::test]

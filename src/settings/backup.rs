@@ -7,6 +7,7 @@ use crate::{
     epg::{self, ChannelAlias},
     live_sources::SourceConfig,
     notify::NotifySettings,
+    source_subscriptions::{self, SubscriptionBackup},
 };
 use axum::{
     Json, Router,
@@ -30,6 +31,12 @@ struct Backup {
     exported_at: i64,
     catalog_sources: Vec<SourceEntry<SourceInput>>,
     live_sources: Vec<SourceEntry<SourceConfig>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    source_subscriptions: Option<SubscriptionBackup>,
     epg_config: EpgConfig,
     app_settings: SiteSettings,
 }
@@ -61,19 +68,21 @@ struct SiteSettings {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "mirror"
+        deserialize_with = "present"
     )]
     douban_movie_url: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "mirror"
+        deserialize_with = "present"
     )]
     douban_series_url: Option<String>,
 }
 
-fn mirror<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
-    String::deserialize(deserializer).map(Some)
+fn present<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
 }
 
 pub(super) fn router() -> Router<Shared> {
@@ -94,6 +103,7 @@ async fn export(State(state): State<Shared>, user: AuthUser) -> Result<Json<Back
         exported_at: crate::now(),
         catalog_sources: export_catalog(&tx)?,
         live_sources: export_live(&tx)?,
+        source_subscriptions: Some(source_subscriptions::export_config(&tx)?),
         epg_config: EpgConfig {
             url: tx.query_row("SELECT value FROM settings WHERE key='epg_url'", [], |r| {
                 r.get(0)
@@ -175,8 +185,16 @@ async fn import(
     let tx = conn.transaction()?;
     backup.app_settings.restore(&tx)?;
     epg::store_config(&tx, &backup.epg_config.url)?;
+    // Preexisting manual sources keep their ownership if a backup contains the same URL.
+    let subscriptions = match backup.source_subscriptions {
+        Some(config) => Some((config, source_subscriptions::existing_manual_urls(&tx)?)),
+        None => None,
+    };
     restore_catalog(&tx, backup.catalog_sources)?;
     restore_live(&tx, backup.live_sources)?;
+    if let Some((config, manual_urls)) = subscriptions {
+        source_subscriptions::restore_config(&tx, config, &manual_urls)?;
+    }
     tx.commit()?;
     Ok(Json(json!({"ok": true})))
 }

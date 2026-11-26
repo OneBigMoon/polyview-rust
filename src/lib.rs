@@ -10,6 +10,7 @@ pub mod network;
 pub mod notify;
 pub mod playback;
 pub mod settings;
+pub mod source_subscriptions;
 pub mod telegram;
 pub mod tracking;
 pub mod tvbox;
@@ -142,6 +143,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     user_data::init_schema(conn)?;
     settings::init_schema(conn)?;
     live_sources::init_schema(conn)?;
+    source_subscriptions::init_schema(conn)?;
     Ok(())
 }
 
@@ -169,6 +171,7 @@ pub fn router(state: Shared) -> Router {
         .merge(calendar::router())
         .merge(notify::router())
         .merge(live_sources::router())
+        .merge(source_subscriptions::router())
         .fallback(|| async { AppError::not_found("Not found") })
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(security_headers))

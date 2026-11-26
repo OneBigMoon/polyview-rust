@@ -106,12 +106,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = network::start_worker(state.clone());
     let tracking_worker = polyview::tracking::start_worker(state.clone());
     let live_worker = polyview::live_sources::start_worker(state.clone());
+    let source_worker = polyview::source_subscriptions::start_worker(state.clone());
+    let health_worker = polyview::catalog::start_health_worker(state.clone());
     let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await;
     worker.abort();
     tracking_worker.abort();
     live_worker.abort();
+    source_worker.abort();
+    health_worker.abort();
     result?;
     Ok(())
 }

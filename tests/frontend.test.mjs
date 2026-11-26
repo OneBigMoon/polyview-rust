@@ -2125,6 +2125,204 @@ test("admin saves advanced fields, exports configuration, imports JSON and reord
   assert.deepEqual(JSON.parse(app.calls.find((call) => call.url === "/api/sources/reorder").options.body), { ids: [7, 4, 9] });
 });
 
+test("admin source metrics show real zeroes, unknown rates and probe updates", async () => {
+  const { app, sources } = await adminSourcePage();
+  Object.assign(sources[0], { health_score: 0, success_rate: 0, fail_streak: 5 });
+  Object.assign(sources[1], { health_score: 100, success_rate: null, fail_streak: 0, last_latency_ms: null, last_probe_ok: null });
+  const page = await app.settings();
+  assert.deepEqual(pageClass(page, "source-score").map((badge) => badge.textContent), [
+    "健康度 0/100 · 成功率 0% · 连续失败 5 次", "健康度 100/100 · 成功率 暂无记录 · 连续失败 0 次",
+  ]);
+  assert.equal(pageClass(page, "source-health")[1].textContent, "未测速");
+  Object.assign(sources[0], { health_score: 72, success_rate: 0.625, fail_streak: 0, last_latency_ms: 112 });
+  await pageButton(page, "测速").listeners.click[0]();
+  assert.equal(pageClass(page, "source-score")[0].textContent, "健康度 72/100 · 成功率 63% · 连续失败 0 次");
+  assert.equal(pageClass(page, "source-health")[0].textContent, "112 ms");
+});
+
+test("catalog detail chooses the healthiest source, then the higher priority, then quality", async () => {
+  const results = [[40, 1, "4K"], [90, 2, "4K"], [90, 1, "HD"], [90, 1, "1080P"]].map(([health_score, source_priority, remark], index) => ({
+    title: "同一部电影", source_name: `源${index}`, source_id: index + 1, id: `m${index}`, health_score, source_priority, remark,
+  }));
+  const path = "/api/catalog/4/detail?id=m3";
+  const app = environment({ ...pageDiscoveryRoutes(results), "/api/tracking": [], [path]: { ...results[3], groups: [] } });
+  const page = await app.online();
+  await pageButton(page, "查看片源").listeners.click[0]();
+  assert.ok(app.calls.some(({ url }) => url === path));
+  const bar = pageClass(app.elements.get("catalog-dialog"), "catalog-source-switch")[0];
+  assert.deepEqual(pageClass(bar, "filter-chip").map((chip) => chip.getAttribute("aria-label")), ["源3 1080P", "源2 HD", "源1 4K", "源0 4K"]);
+});
+
+const subscriptionPath = "/api/source-subscriptions";
+async function openSourceSubscriptions(rows, items, intercept) {
+  const app = environment({ [subscriptionPath]: rows, [`${subscriptionPath}/preview`]: { items },
+    [`${subscriptionPath}/sync`]: { synced: 1, failed: 0 }, "/api/sources": [], "/api/catalog/settings": {}, "/api/settings/play": {} });
+  app.state.page = "settings";
+  app.state.settingsTab = "sources";
+  app.state.user = { role: "admin" };
+  const fetch = app.context.fetch;
+  app.context.fetch = (url, options) => {
+    const override = intercept?.(url, options);
+    if (override) return override;
+    const body = options.body && JSON.parse(options.body);
+    if (url === subscriptionPath && options.method === "POST") rows.push({ ...body, id: 7 });
+    if (url === `${subscriptionPath}/7` && options.method === "PUT") Object.assign(rows[0], body);
+    if (url === `${subscriptionPath}/7` && options.method === "DELETE") rows.splice(0, 1);
+    return fetch(url, options);
+  };
+  const page = await app.settings();
+  assert.ok(app.calls.every(({ url }) => url !== subscriptionPath));
+  await pageButton(page, "订阅导入 / 远程配置").listeners.click[0]();
+  const panel = pageClass(app.elements.get("content"), "subscription-controls")[0];
+  const field = (name) => pageNodes(panel).find((node) => node.getAttribute?.("name") === name);
+  const click = (label) => pageButton(panel, label).listeners.click[0]();
+  const submit = () => pageNodes(panel).find((node) => node.tagName === "FORM").listeners.submit[0]({ preventDefault() {} });
+  const checks = () => pageNodes(pageClass(panel, "subscription-choices")[0]).filter((node) => node.tagName === "INPUT");
+  return { app, panel, field, click, submit, checks };
+}
+
+test("source subscriptions preview, select by kind and URL, edit, toggle, sync and delete", async () => {
+  const rows = [], url = "https://feeds.test/list?token=private";
+  const shared = "https://media.test/api?key=private";
+  const items = [{ kind: "cms", name: "电影", url: shared }, { kind: "parser", name: "解析", url: shared },
+    { kind: "live", name: "https://tv.test/list?token=private", url: "https://tv.test/list?token=private" }];
+  const { app, panel, field, click, submit, checks } = await openSourceSubscriptions(rows, items);
+  assert.match(panel.textContent, /尚未添加远程订阅/);
+  assert.equal(pageButton(panel, "同步已启用订阅").disabled, true);
+  field("name").value = "家庭仓";
+  field("url").value = url;
+  await click("预览配置");
+  assert.deepEqual(JSON.parse(app.calls.at(-1).options.body), { url });
+  assert.equal(checks().length, 3);
+  assert.ok(checks().every((check) => check.checked));
+  assert.match(panel.textContent, /影视源 · 电影/);
+  assert.match(panel.textContent, /解析器 · 解析/);
+  assert.match(panel.textContent, /直播源 · 项目 3/);
+  checks()[1].checked = false;
+  checks()[1].dispatchEvent("change");
+  assert.equal(field("all").checked, false);
+  await submit();
+  const selected = [`cms:${shared}`, `live:${items[2].url}`];
+  assert.deepEqual(rows, [{ id: 7, name: "家庭仓", enabled: true, url, selected }]);
+  assert.equal(field("url").value, "");
+  await click("编辑");
+  assert.equal(field("url").value, "");
+  await click("预览配置");
+  assert.deepEqual(checks().map((check) => Boolean(check.checked)), [true, false, true]);
+  field("name").value = "改名";
+  await submit();
+  assert.equal(rows[0].name, "改名");
+  await click("停用");
+  assert.equal(rows[0].enabled, false);
+  assert.equal(pageButton(panel, "同步").disabled, true);
+  await click("启用");
+  assert.deepEqual(rows[0], { id: 7, name: "改名", enabled: true, url, selected });
+  await click("同步");
+  await click("同步已启用订阅");
+  assert.deepEqual(app.calls.filter(({ url }) => url === `${subscriptionPath}/sync`).map(({ options }) => JSON.parse(options.body)), [{ id: 7 }, {}]);
+  assert.match(panel.textContent, /已同步 1 个订阅，0 个失败/);
+  await click("编辑");
+  await click("取消编辑");
+  assert.equal(field("name").value, "");
+  app.context.window.confirm = () => false;
+  await click("删除");
+  assert.equal(rows.length, 1);
+  app.context.window.confirm = () => true;
+  await click("删除");
+  assert.match(panel.textContent, /尚未添加远程订阅/);
+  assert.equal(rows.length, 0);
+  assert.doesNotMatch(panel.textContent, /private/);
+  assert.ok(app.calls.filter(({ options }) => options.method && options.method !== "GET").every(({ options }) => options.headers["X-PolyView-Request"] === "1"));
+  await pageButton(app.elements.get("content"), "影视源管理").listeners.click[0]();
+  assert.equal(pageClass(app.elements.get("content"), "subscription-controls").length, 0);
+});
+
+test("subscription selection preserves automatic import, explicit none and a changed Base58 address", async () => {
+  const rows = [];
+  const items = [{ kind: "live", name: "直播", url: "https://media.test/live" }];
+  const { panel, field, click, submit, checks } = await openSourceSubscriptions(rows, items);
+  field("name").value = "仓库";
+  field("url").value = "https://feeds.test/a";
+  await submit();
+  assert.equal(rows[0].selected, null);
+  await click("编辑");
+  await click("预览配置");
+  checks()[0].checked = false;
+  checks()[0].dispatchEvent("change");
+  await submit();
+  assert.deepEqual(rows[0].selected, []);
+  await click("编辑");
+  await click("预览配置");
+  assert.equal(Boolean(checks()[0].checked), false);
+  checks()[0].checked = true;
+  checks()[0].dispatchEvent("change");
+  field("url").value = "3mJr7AoUXx2Wqd";
+  field("url").dispatchEvent("input");
+  assert.equal(checks().length, 0);
+  assert.match(panel.textContent, /已勾选 0 项/);
+  field("all").checked = true;
+  field("all").dispatchEvent("change");
+  await submit();
+  assert.deepEqual(rows[0], { id: 7, name: "仓库", enabled: true, url: "3mJr7AoUXx2Wqd", selected: null });
+});
+
+test("subscription errors keep the draft, allow retry and omit backend credentials", async () => {
+  const rows = [];
+  let failing = subscriptionPath;
+  const failure = { ok: false, status: 502, text: async () => JSON.stringify({ error: "https://feed.test/?key=private" }) };
+  const { panel, field, click, submit } = await openSourceSubscriptions(rows, [], (url) => {
+    if (url === failing) return failure;
+    if (url === `${subscriptionPath}/sync`) return { ok: true, text: async () => JSON.stringify({ synced: 0, failed: 1 }) };
+  });
+  assert.match(panel.textContent, /订阅列表加载失败/);
+  failing = "";
+  await click("重新加载");
+  assert.match(panel.textContent, /尚未添加远程订阅/);
+  await click("预览配置");
+  assert.match(panel.textContent, /请先填写订阅地址/);
+  field("name").value = "订阅";
+  field("url").value = "https://feed.test/?key=private";
+  failing = `${subscriptionPath}/preview`;
+  await click("预览配置");
+  assert.match(panel.textContent, /预览失败/);
+  assert.doesNotMatch(panel.textContent, /private/);
+  failing = "";
+  await click("预览配置");
+  assert.match(panel.textContent, /没有可导入的项目/);
+  failing = subscriptionPath;
+  await submit();
+  assert.match(panel.textContent, /保存订阅失败/);
+  assert.equal(field("name").value, "订阅");
+  failing = "";
+  await submit();
+  rows[0].error = "https://feed.test/?key=private";
+  failing = `${subscriptionPath}/7`;
+  await click("停用");
+  assert.match(panel.textContent, /更改订阅状态失败/);
+  await click("删除");
+  assert.match(panel.textContent, /删除订阅失败/);
+  assert.equal(rows.length, 1);
+  failing = `${subscriptionPath}/sync`;
+  await click("同步");
+  assert.match(panel.textContent, /同步请求失败/);
+  failing = "";
+  await click("同步");
+  assert.match(panel.textContent, /已同步 0 个订阅，1 个失败/);
+  assert.match(panel.textContent, /上次同步失败/);
+  assert.doesNotMatch(panel.textContent, /private/);
+});
+
+test("members cannot open remote subscriptions through stale admin settings", async () => {
+  const app = environment();
+  app.state.settingsTab = "sources";
+  app.state.sourceSettingsTab = "subscriptions";
+  app.state.user = { role: "member" };
+  const page = await app.settings();
+  assert.equal(app.state.settingsTab, "account");
+  assert.doesNotMatch(page.textContent, /远程配置/);
+  assert.ok(app.calls.every(({ url }) => !url.startsWith(subscriptionPath)));
+});
+
 const flushSkipEvents = () => new Promise((resolve) => setImmediate(resolve));
 
 function skipInputs(root) {

@@ -18,6 +18,8 @@ mod play_settings;
 mod recommend;
 #[path = "cases/source_ops.rs"]
 mod source_ops;
+#[path = "cases/source_subscriptions.rs"]
+mod source_subscriptions;
 #[path = "cases/suggest.rs"]
 mod suggest;
 #[path = "cases/telegram_media.rs"]

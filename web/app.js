@@ -27,6 +27,7 @@
     liveGroup: "all",
     epgOnlyCurrent: false,
     settingsTab: "account",
+    sourceSettingsTab: "sources",
     showAllChannels: false,
     downloadFilter: "all",
     expandedSeries: new Set(),
@@ -1630,6 +1631,8 @@
         source_id: item.source_id,
         id: item.id ?? item.media_id,
         source_name: item.source_name,
+        health_score: item.health_score,
+        source_priority: item.source_priority,
         remark: item.remark,
         lang: item.lang,
       };
@@ -1651,6 +1654,8 @@
       }
       group.sources.sort(
         (left, right) =>
+          (right.health_score ?? -1) - (left.health_score ?? -1) ||
+          (left.source_priority ?? Number.MAX_SAFE_INTEGER) - (right.source_priority ?? Number.MAX_SAFE_INTEGER) ||
           sourceRank(right) - sourceRank(left) ||
           String(left.source_name).localeCompare(String(right.source_name), "zh-CN"),
       );
@@ -3501,10 +3506,17 @@
   }
   function sourceHealth(source) {
     const ok = source.last_probe_ok, ms = source.last_latency_ms;
-    const color = ok == null ? "unknown" : !ok ? "failed" : ms == null ? "unknown" : ms < 500 ? "fast" : ms < 1500 ? "medium" : "slow";
-    const text = ok == null ? "未测速" : !ok ? "测速失败" : ms == null ? "可用" : `${ms} ms`;
-    return make("span", { class: `source-health ${color}`, text:
-      source.cooldown_until > Date.now() / 1000 ? `${text} · 冷却中` : text });
+    const color = ok === false ? "failed" : ms == null ? "unknown" : ms < 500 ? "fast" : ms < 1500 ? "medium" : "slow";
+    const latency = ms == null ? "" : `${ms} ms`;
+    const text = ok === false ? ["测速失败", latency].filter(Boolean).join(" · ") : latency || (ok ? "可用" : "未测速");
+    const badges = [make("span", { class: `source-health ${color}`, text:
+      source.cooldown_until > Date.now() / 1000 ? `${text} · 冷却中` : text })];
+    if (source.health_score != null) {
+      const rate = source.success_rate == null ? "暂无记录" : `${Math.round(source.success_rate * 100)}%`;
+      badges.push(make("span", { class: "source-score", text:
+        `健康度 ${source.health_score}/100 · 成功率 ${rate} · 连续失败 ${source.fail_streak} 次` }));
+    }
+    return make("span", { class: "source-metrics" }, badges);
   }
   function sourceBatchDialog(sources) {
     const data = make("textarea", { rows: 10, "aria-label": "影视源 JSON", spellcheck: "false" });
@@ -3536,14 +3548,179 @@
     }
     return [button("导入 JSON", "subtle", () => open(false)), button("导出 JSON", "subtle", () => open(true)), dialog];
   }
+  async function sourceSubscriptionSettings() {
+    const endpoint = "/api/source-subscriptions";
+    const name = make("input", { name: "name", required: true, maxlength: 100 });
+    const url = make("input", { name: "url", type: "password", required: true, autocomplete: "off", spellcheck: "false" });
+    const enabled = make("input", { type: "checkbox", name: "enabled", checked: true });
+    const all = make("input", { type: "checkbox", name: "all", checked: true });
+    const choices = make("div", { class: "subscription-choices" });
+    const selectionCount = make("span", { class: "hint" });
+    const message = make("p", { class: "hint", role: "status" });
+    const rows = make("div");
+    const controls = make("fieldset", { class: "subscription-controls", "aria-label": "远程配置订阅" });
+    const save = button("添加订阅", "primary", null, { type: "submit" });
+    const cancel = button("取消编辑", "subtle", () => edit(null));
+    let editing = null;
+    let selected = null;
+    let items = null;
+
+    function report(text, error = false) {
+      message.className = error ? "form-error" : "hint";
+      message.textContent = text;
+    }
+    async function run(failure, action) {
+      if (controls.disabled) return;
+      controls.disabled = true;
+      controls.setAttribute("aria-busy", "true");
+      try { await action(); }
+      catch (_) { report(failure, true); }
+      finally {
+        controls.disabled = false;
+        controls.setAttribute("aria-busy", "false");
+      }
+    }
+    const key = (item) => `${item.kind}:${item.url}`;
+    function summarize() {
+      all.checked = selected === null;
+      selectionCount.textContent = selected === null ? "" : `已勾选 ${selected.size} 项`;
+    }
+    function paintChoices() {
+      summarize();
+      choices.replaceChildren();
+      if (!items) return;
+      if (!items.length) {
+        choices.append(make("p", { class: "hint", text: "此配置中没有可导入的项目。" }));
+        return;
+      }
+      const kinds = { cms: "影视源", parser: "解析器", live: "直播源" };
+      items.forEach((item, index) => {
+        const itemKey = key(item);
+        const check = make("input", { type: "checkbox", checked: selected === null || selected.has(itemKey) });
+        check.addEventListener("change", () => {
+          if (selected === null) selected = new Set(items.map(key));
+          if (check.checked) selected.add(itemKey);
+          else selected.delete(itemKey);
+          summarize();
+        });
+        const title = item.name && item.name !== item.url && !/:\/\/|\?/.test(item.name) ? item.name : `项目 ${index + 1}`;
+        choices.append(make("label", { class: "checkbox-label" }, [check, `${kinds[item.kind]} · ${title}`]));
+      });
+    }
+    all.addEventListener("change", () => {
+      selected = all.checked ? null : new Set();
+      paintChoices();
+    });
+    function edit(row) {
+      editing = row;
+      name.value = row?.name || "";
+      url.value = "";
+      url.required = !row;
+      url.placeholder = row ? "留空保留原地址" : "LunaTV / TVBox 地址或 Base58 配置";
+      enabled.checked = row?.enabled ?? true;
+      selected = row?.selected == null ? null : new Set(row.selected);
+      items = null;
+      save.textContent = row ? "保存订阅" : "添加订阅";
+      cancel.hidden = !row;
+      report("");
+      paintChoices();
+    }
+    const feedUrl = () => url.value.trim() || editing?.url || "";
+    url.addEventListener("input", () => {
+      items = null;
+      report("");
+      if (selected !== null) selected = new Set(feedUrl() === editing?.url ? editing.selected : []);
+      paintChoices();
+    });
+    const preview = button("预览配置", "subtle", () => run("预览失败，请检查订阅地址后重试。", async () => {
+      if (!feedUrl()) { report("请先填写订阅地址。", true); return; }
+      const result = await api(`${endpoint}/preview`, { method: "POST", body: { url: feedUrl() } });
+      items = result.items;
+      paintChoices();
+      report(`预览完成，共 ${items.length} 项。`);
+    }));
+    const form = make("form", { class: "subscription-editor", on: { submit: (event) => {
+      event.preventDefault();
+      return run("保存订阅失败，请检查名称和地址后重试。", async () => {
+        const body = { name: name.value.trim(), url: feedUrl(), enabled: enabled.checked, selected: selected && [...selected] };
+        await api(editing ? `${endpoint}/${editing.id}` : endpoint, { method: editing ? "PUT" : "POST", body });
+        edit(null);
+        report("订阅已保存");
+        await load();
+      });
+    } } }, [
+      make("div", { class: "form-row" }, [make("label", {}, ["订阅名称", name]), make("label", {}, ["订阅地址", url]), preview]),
+      make("div", { class: "subscription-options" }, [make("label", { class: "checkbox-label" }, [enabled, "启用订阅"]),
+        make("label", { class: "checkbox-label" }, [all, "自动导入全部项目（含新增）"]), selectionCount]),
+      choices, make("div", { class: "form-row" }, [save, cancel]),
+    ]);
+    function sync(id) {
+      return run("同步请求失败，请重试。", async () => {
+        const result = await api(`${endpoint}/sync`, { method: "POST", body: id == null ? {} : { id } });
+        report(`已同步 ${result.synced} 个订阅，${result.failed} 个失败。`, result.failed > 0);
+        await load();
+      });
+    }
+    const syncAll = button("同步已启用订阅", "subtle", () => sync());
+    function subscriptionRow(row) {
+      const path = `${endpoint}/${row.id}`;
+      return make("div", { class: "source-row" }, [make("strong", { text: row.name }),
+        make("span", { class: "hint", text: `${row.enabled ? "已启用" : "已停用"} · ${row.selected == null ? "导入全部" : `已勾选 ${row.selected.length} 项`}` }),
+        row.error ? make("span", { class: "form-error", text: "上次同步失败" }) : null,
+        button("编辑", "subtle small-button", () => { edit(row); name.focus?.(); }),
+        button(row.enabled ? "停用" : "启用", "subtle small-button", () => run("更改订阅状态失败，请重试。", async () => {
+          await api(path, { method: "PUT", body: { name: row.name, url: row.url, enabled: !row.enabled, selected: row.selected ?? null } });
+          if (editing?.id === row.id) enabled.checked = !row.enabled;
+          report(row.enabled ? "订阅已停用" : "订阅已启用");
+          await load();
+        })),
+        button("同步", "subtle small-button", () => sync(row.id), { disabled: !row.enabled }),
+        button("删除", "danger small-button", () => {
+          if (!window.confirm(`删除订阅“${row.name}”？`)) return;
+          return run("删除订阅失败，请重试。", async () => {
+            await api(path, { method: "DELETE" });
+            if (editing?.id === row.id) edit(null);
+            report("订阅已删除");
+            await load();
+          });
+        }),
+      ]);
+    }
+    async function load() {
+      try {
+        const subscriptions = await api(endpoint);
+        syncAll.disabled = !subscriptions.some((row) => row.enabled);
+        rows.replaceChildren(...subscriptions.map(subscriptionRow));
+        if (!subscriptions.length) rows.append(make("p", { class: "hint", text: "尚未添加远程订阅。" }));
+      } catch (_) {
+        syncAll.disabled = true;
+        rows.replaceChildren(make("p", { class: "form-error", text: "订阅列表加载失败。" }),
+          button("重新加载", "subtle", () => run("加载失败，请重试。", load)));
+      }
+    }
+    edit(null);
+    controls.append(form, message, syncAll, rows);
+    await load();
+    return controls;
+  }
   async function sourceSettings() {
     const panel = make("section", { class: "panel source-settings" }, [
       make("h2", { text: "在线影视源" }),
-      make("p", {
-        class: "panel-description",
-        text: "配置 MacCMS JSON 接口，供网页搜索、追剧和影视仓使用。配置变更对所有成员生效。",
-      }),
+      make("div", { class: "settings-tabs", role: "group", "aria-label": "影视源管理" },
+        [["sources", "影视源管理"], ["subscriptions", "订阅导入 / 远程配置"]].map(([key, label]) =>
+          make("button", { type: "button", class: `filter-chip${state.sourceSettingsTab === key ? " active" : ""}`,
+            "aria-pressed": String(state.sourceSettingsTab === key), text: label,
+            on: { click: () => { state.sourceSettingsTab = key; return render(); } },
+          }))),
     ]);
+    if (state.sourceSettingsTab === "subscriptions") {
+      panel.append(await sourceSubscriptionSettings());
+      return panel;
+    }
+    panel.append(make("p", {
+      class: "panel-description",
+      text: "配置 MacCMS JSON 接口，供网页搜索、追剧和影视仓使用。配置变更对所有成员生效。",
+    }));
     try {
       const [sources, catalogSettings] = await Promise.all([
         api("/api/sources"),

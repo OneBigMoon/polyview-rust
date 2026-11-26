@@ -10,18 +10,24 @@ use axum::{
     http::StatusCode,
     routing::{delete, get, post},
 };
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 use url::Url;
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const PROBE_CONCURRENCY: usize = 8;
+const HEALTH_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+const HEALTHY_PROBE_SECS: i64 = 15 * 60;
+const FAILED_PROBE_SECS: i64 = 120;
 const SOURCE_SELECT: &str = "SELECT id,name,url,enabled,adult,priority,searchable,custom_ua,
     custom_referer,custom_cookie,proxy_url,timeout_secs,last_latency_ms,last_probe_ok,last_probe_at,
-    fail_streak,cooldown_until FROM catalog_sources";
+    fail_streak,cooldown_until,health_score,
+    1.0 * successful_probes / NULLIF(total_probes,0) FROM catalog_sources";
 
 pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
@@ -55,11 +61,22 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
         ("last_probe_at", "INTEGER"),
         ("fail_streak", "INTEGER NOT NULL DEFAULT 0"),
         ("cooldown_until", "INTEGER NOT NULL DEFAULT 0"),
+        ("health_score", "INTEGER NOT NULL DEFAULT 100"),
+        ("successful_probes", "INTEGER NOT NULL DEFAULT 0"),
+        ("total_probes", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         crate::ensure_column(conn, "catalog_sources", column, definition)?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO settings(key,value) VALUES ('adult_sources_enabled','0')",
+        [],
+    )?;
+    // An older database retained only the last probe. Count that known observation once.
+    conn.execute(
+        "UPDATE catalog_sources SET total_probes=1,successful_probes=last_probe_ok,
+         health_score=CASE WHEN last_probe_ok THEN 100-MIN(30,COALESCE(last_latency_ms,0)/250)
+                           ELSE 50 END
+         WHERE total_probes=0 AND last_probe_ok IS NOT NULL",
         [],
     )?;
     conn.execute_batch(
@@ -69,7 +86,13 @@ pub fn init_schema(conn: &Connection) -> Result<(), AppError> {
             type_name TEXT NOT NULL,
             PRIMARY KEY(source_id, type_id)
         );
-        CREATE INDEX IF NOT EXISTS catalog_types_name ON catalog_types(type_name);",
+        CREATE INDEX IF NOT EXISTS catalog_types_name ON catalog_types(type_name);
+        CREATE TRIGGER IF NOT EXISTS catalog_reset_endpoint_health AFTER UPDATE OF url ON catalog_sources
+        WHEN OLD.url <> NEW.url BEGIN
+            UPDATE catalog_sources SET health_score=100,successful_probes=0,total_probes=0,
+                last_latency_ms=NULL,last_probe_at=NULL,last_probe_ok=NULL,fail_streak=0,cooldown_until=0
+                WHERE id=NEW.id;
+        END;",
     )?;
     Ok(())
 }
@@ -115,6 +138,8 @@ pub struct Source {
     last_probe_at: Option<i64>,
     fail_streak: i64,
     cooldown_until: i64,
+    health_score: i64,
+    success_rate: Option<f64>,
 }
 
 impl std::fmt::Debug for Source {
@@ -144,6 +169,8 @@ fn source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
         last_probe_at: row.get(14)?,
         fail_streak: row.get(15)?,
         cooldown_until: row.get(16)?,
+        health_score: row.get(17)?,
+        success_rate: row.get(18)?,
     })
 }
 
@@ -172,14 +199,14 @@ pub fn adult_sources_enabled(conn: &Connection) -> Result<bool, AppError> {
 }
 
 pub fn active_sources(state: &Shared) -> Result<Vec<Source>, AppError> {
-    let show_adult = {
-        let conn = state.conn()?;
-        adult_sources_enabled(&conn)?
-    };
-    Ok(sources(state)?
-        .into_iter()
-        .filter(|source| source.enabled && source.searchable && (show_adult || !source.adult))
-        .collect())
+    let conn = state.conn()?;
+    let mut stmt = conn.prepare(&format!(
+        "{SOURCE_SELECT} WHERE enabled=1 AND searchable=1 AND (adult=0 OR ?1)
+         ORDER BY health_score DESC,priority,id"
+    ))?;
+    Ok(stmt
+        .query_map([adult_sources_enabled(&conn)?], source_row)?
+        .collect::<Result<_, _>>()?)
 }
 
 fn ensure_source_visible(conn: &Connection, source: &Source) -> Result<(), AppError> {
@@ -464,11 +491,71 @@ struct ProbeInput {
     source_id: Option<i64>,
 }
 
+#[derive(Serialize)]
+struct ProbeResult {
+    source_id: i64,
+    ok: bool,
+    latency_ms: i64,
+    error: Option<String>,
+}
+
+async fn probe_source(state: &Shared, source: Source) -> Result<ProbeResult, AppError> {
+    let start = Instant::now();
+    let result = request_cms(state, &source, &[("ac", "list")]).await;
+    let latency_ms = start.elapsed().as_millis() as i64;
+    let ok = result.is_ok();
+    record_health(state, &source, ok, Some(latency_ms))?;
+    Ok(ProbeResult {
+        source_id: source.id,
+        ok,
+        latency_ms,
+        error: result.err(),
+    })
+}
+
+async fn inspect_due_sources(state: &Shared) -> Result<(), AppError> {
+    let due = {
+        let conn = state.conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{SOURCE_SELECT} WHERE enabled=1 AND (adult=0 OR ?1) AND
+             (last_probe_at IS NULL OR last_probe_at <= CASE WHEN fail_streak>0 THEN ?2 ELSE ?3 END)
+             ORDER BY last_probe_at,id"
+        ))?;
+        let now = crate::now();
+        stmt.query_map(
+            params![
+                adult_sources_enabled(&conn)?,
+                now - FAILED_PROBE_SECS,
+                now - HEALTHY_PROBE_SECS
+            ],
+            source_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut probes = stream::iter(due.into_iter().map(|source| probe_source(state, source)))
+        .buffer_unordered(PROBE_CONCURRENCY);
+    while let Some(result) = probes.next().await {
+        result?;
+    }
+    Ok(())
+}
+
+pub fn start_health_worker(state: Shared) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = inspect_due_sources(&state).await {
+                tracing::error!(message = %error.1, "Could not inspect catalog sources");
+            }
+            tokio::time::sleep(HEALTH_SCAN_INTERVAL).await;
+        }
+    })
+}
+
 async fn probe_sources(
     State(state): State<Shared>,
     user: AuthUser,
     Json(input): Json<ProbeInput>,
-) -> Result<Json<Vec<Value>>, AppError> {
+) -> Result<Json<Vec<ProbeResult>>, AppError> {
     require_admin(&user)?;
     let selected = if let Some(id) = input.source_id {
         let conn = state.conn()?;
@@ -476,15 +563,15 @@ async fn probe_sources(
     } else {
         sources(&state)?.into_iter().filter(|s| s.enabled).collect()
     };
-    let state = &state;
-    let results = stream::iter(selected.into_iter().map(|source| async move {
-        let start = Instant::now();
-        let result = request_cms(state, &source, &[("ac", "list")]).await;
-        let latency = start.elapsed().as_millis() as i64;
-        record_health(state, &source, result.is_ok(), Some(latency))?;
-        Ok::<_, AppError>(serde_json::json!({"source_id":source.id,"ok":result.is_ok(),"latency_ms":latency,"error":result.err()}))
-    })).buffered(8).collect::<Vec<_>>().await;
-    Ok(Json(results.into_iter().collect::<Result<_, _>>()?))
+    let probes = selected
+        .into_iter()
+        .map(|source| probe_source(&state, source));
+    Ok(Json(
+        stream::iter(probes)
+            .buffered(PROBE_CONCURRENCY)
+            .try_collect()
+            .await?,
+    ))
 }
 
 async fn delete_source(
@@ -519,6 +606,8 @@ pub struct CatalogSummary {
     pub id: String,
     pub source_id: i64,
     pub source_name: String,
+    pub health_score: i64,
+    pub source_priority: i64,
     pub title: String,
     pub cover: String,
     pub year: String,
@@ -973,17 +1062,7 @@ pub async fn discover(
             (source, result)
         }
     }))
-    .buffer_unordered(32);
-    let mut fetched = Vec::new();
-    while let Some((source, result)) = responses.next().await {
-        if let Ok(listing) = &result
-            && let Ok(conn) = state.conn()
-        {
-            let _ = remember_types(&conn, source.id, &listing.items);
-        }
-        fetched.push((source, result));
-    }
-    fetched.sort_by_key(|(source, _)| (source.priority, source.id));
+    .buffered(32);
     let mut seen = BTreeSet::new();
     let mut result = DiscoverResponse {
         results: Vec::new(),
@@ -993,7 +1072,12 @@ pub async fn discover(
         page_count: 0,
         total: 0,
     };
-    for (source, fetch) in fetched {
+    while let Some((source, fetch)) = responses.next().await {
+        if let Ok(listing) = &fetch
+            && let Ok(conn) = state.conn()
+        {
+            let _ = remember_types(&conn, source.id, &listing.items);
+        }
         match fetch {
             Ok(listing) => {
                 for item in listing
@@ -1126,6 +1210,8 @@ fn summary(source: &Source, item: &Value) -> Option<CatalogSummary> {
         id,
         source_id: source.id,
         source_name: source.name.clone(),
+        health_score: source.health_score,
+        source_priority: source.priority,
         title,
         cover,
         year: text(item, "vod_year"),
@@ -1271,12 +1357,20 @@ fn record_health(
     ok: bool,
     probe_latency: Option<i64>,
 ) -> Result<(), AppError> {
+    // Give the latest observation half the score. A failure halves the score immediately,
+    // while fast successes can restore it even after a long outage.
     state.conn()?.execute(
         "UPDATE catalog_sources SET fail_streak=CASE WHEN ?1 THEN 0 ELSE fail_streak+1 END,
         cooldown_until=CASE WHEN ?1 THEN 0 WHEN fail_streak>=2 THEN ?2+120 ELSE 0 END,
         last_latency_ms=COALESCE(?3,last_latency_ms),
         last_probe_at=CASE WHEN ?3 IS NULL THEN last_probe_at ELSE ?2 END,
-        last_probe_ok=CASE WHEN ?3 IS NULL THEN last_probe_ok ELSE ?1 END WHERE id=?4 AND url=?5",
+        last_probe_ok=CASE WHEN ?3 IS NULL THEN last_probe_ok ELSE ?1 END,
+        total_probes=total_probes+(?3 IS NOT NULL),
+        successful_probes=successful_probes+(?1 AND ?3 IS NOT NULL),
+        health_score=CASE WHEN ?1 THEN
+          (health_score + 100 - MIN(30,COALESCE(?3,last_latency_ms,0)/250) + 1)/2
+          ELSE health_score/2 END
+        WHERE id=?4 AND url=?5",
         params![ok, crate::now(), probe_latency, source.id, source.url],
     )?;
     Ok(())

@@ -216,6 +216,8 @@ async fn probe_search_and_tv_use_source_overrides_and_recover_from_cooldown() {
     assert!(health[0]["last_probe_at"].is_i64());
     assert_eq!(health[0]["last_latency_ms"], probe[0]["latency_ms"]);
     assert_eq!(health[0]["fail_streak"], 0);
+    assert_eq!(health[0]["success_rate"], 0.5);
+    assert!(health[0]["health_score"].as_i64().unwrap() > 25);
     assert_eq!(health[0]["cooldown_until"], 0);
     let feed = app
         .request("GET", "/api/tvbox", Some(&admin), None)
@@ -271,6 +273,21 @@ fn source_migration_preserves_legacy_rows_and_applies_defaults_once() {
     init_schema(&conn).unwrap();
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM catalog_sources WHERE id=9 AND name='legacy' AND enabled=0 AND priority=7 AND searchable=1 AND timeout_secs=12 AND custom_ua='' AND custom_referer='' AND custom_cookie='' AND proxy_url='' AND last_latency_ms IS NULL AND last_probe_ok IS NULL AND last_probe_at IS NULL AND fail_streak=0 AND cooldown_until=0",[],|row|row.get(0)).unwrap();
     assert_eq!(count, 1);
+    conn.execute(
+        "UPDATE catalog_sources SET last_probe_ok=1,last_latency_ms=500 WHERE id=9",
+        [],
+    )
+    .unwrap();
+    init_schema(&conn).unwrap();
+    init_schema(&conn).unwrap();
+    let seeded: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT total_probes,successful_probes,health_score FROM catalog_sources WHERE id=9",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(seeded, (1, 1, 98));
 }
 
 #[tokio::test]
@@ -395,5 +412,156 @@ async fn probes_overlap_and_ordinary_queries_retry_after_expiry() {
         .json();
     assert_eq!(health[2]["fail_streak"], 0);
     assert_eq!(health[2]["cooldown_until"], 0);
+    server.abort();
+}
+
+async fn run_health_scan(app: &TestApp, expected_probes: i64) {
+    use std::time::Duration;
+
+    let worker = polyview::catalog::start_health_worker(app.state.clone());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let total: i64 = app
+                .state
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT COALESCE(SUM(total_probes),0) FROM catalog_sources",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if total >= expected_probes {
+                assert_eq!(total, expected_probes);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("scheduled catalog inspection finished");
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn scheduled_health_ranks_sources_and_recovers_a_cooling_endpoint() {
+    let app = TestApp::new();
+    let admin = app.setup().await;
+    let broken = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let cms = Router::new().fallback(get({
+        let broken = broken.clone();
+        let calls = calls.clone();
+        move |uri: Uri| {
+            let path = uri.path().to_owned();
+            let probing = uri.query() == Some("ac=list");
+            let failing = broken.load(Ordering::Relaxed);
+            calls.lock().unwrap().push((path.clone(), probing));
+            async move {
+                if probing && path == "/timeout" {
+                    std::future::pending::<()>().await;
+                }
+                if probing && path == "/broken" && failing {
+                    return (StatusCode::BAD_GATEWAY, Json(json!({})));
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({"list":[{"vod_id":1,"vod_name":"Same film"}]})),
+                )
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, cms).await.unwrap() });
+    for (priority, name) in ["broken", "timeout", "healthy", "disabled"]
+        .into_iter()
+        .enumerate()
+    {
+        let source = json!({"name":name,"url":format!("http://{addr}/{name}"),"priority":priority,
+            "enabled":name!="disabled","timeout_secs":3});
+        let created = app
+            .request("POST", "/api/sources", Some(&admin), Some(source))
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED);
+        assert_eq!(created.json()["success_rate"], Value::Null);
+    }
+    run_health_scan(&app, 3).await;
+    let health = app
+        .request("GET", "/api/sources", Some(&admin), None)
+        .await
+        .json();
+    for source in [&health[0], &health[1]] {
+        assert_eq!(source["success_rate"], 0.0);
+        assert_eq!(source["fail_streak"], 1);
+        assert!(source["health_score"].as_i64() < health[2]["health_score"].as_i64());
+    }
+    assert!(health[1]["last_latency_ms"].as_i64().unwrap() >= 2900);
+    assert_eq!(health[2]["success_rate"], 1.0);
+    assert!(health[3]["last_probe_at"].is_null());
+    for route in ["/api/catalog/search?q=Same", "/api/catalog/discover"] {
+        let reply = app.request("GET", route, Some(&admin), None).await.json();
+        let items = reply["results"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["source_name"], "healthy");
+        assert_eq!(items[0]["source_priority"], 2);
+        assert!(items[0]["health_score"].as_i64() > items[1]["health_score"].as_i64());
+    }
+    for _ in 0..3 {
+        let reply = app
+            .request(
+                "POST",
+                "/api/sources/probe",
+                Some(&admin),
+                Some(json!({"source_id":1})),
+            )
+            .await;
+        assert_eq!(reply.json()[0]["ok"], false);
+    }
+    let route = "/api/catalog/1/detail?id=1";
+    let before = calls.lock().unwrap().len();
+    assert_eq!(
+        app.request("GET", route, Some(&admin), None).await.status,
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(calls.lock().unwrap().len(), before);
+    broken.store(false, Ordering::Relaxed);
+    app.state
+        .conn()
+        .unwrap()
+        .execute("UPDATE catalog_sources SET last_probe_at=0 WHERE id=1", [])
+        .unwrap();
+    run_health_scan(&app, 7).await;
+    let health = app
+        .request("GET", "/api/sources", Some(&admin), None)
+        .await
+        .json();
+    assert_eq!(health[0]["success_rate"], 0.2);
+    assert_eq!(health[0]["fail_streak"], 0);
+    assert_eq!(health[0]["cooldown_until"], 0);
+    assert_eq!(
+        app.request("GET", route, Some(&admin), None).await.json()["title"],
+        "Same film"
+    );
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(path, _)| path != "/disabled")
+    );
+    let moved = app
+        .request(
+            "PUT",
+            "/api/sources/1",
+            Some(&admin),
+            Some(json!({"name":"Moved", "url":format!("http://{addr}/replacement")})),
+        )
+        .await
+        .json();
+    assert_eq!(moved["health_score"], 100);
+    assert!(moved["success_rate"].is_null());
+    assert!(moved["last_probe_at"].is_null());
     server.abort();
 }
